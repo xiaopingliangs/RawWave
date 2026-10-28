@@ -1,0 +1,10 @@
+.gradle/
+.kotlin/
+.kotlin-daemon/
+**/build/
+local.properties
+.local-signing/
+*.jks
+*.keystore
+dist/
+evidence/private/
