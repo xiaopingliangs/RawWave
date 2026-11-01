@@ -5,9 +5,10 @@ import com.rawwave.core.SensorPort
 
 /** Only composition point knows the concrete vendor adapter. No global mutable factory. */
 object CaptureAssembly {
-    fun sensors(context: Context, dispatch: (() -> Unit) -> Unit, needsSamsung: Boolean = true, profile: com.rawwave.core.BiaProfile? = null): SensorPort =
+    fun sensors(context: Context, dispatch: (() -> Unit) -> Unit, needsSamsung: Boolean = true, profile: com.rawwave.core.BiaProfile? = null,
+                dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null): SensorPort =
         if (!needsSamsung) PlatformSensors(context, dispatch) else
-        CombinedSensors(SensorPort.requireCompatible(SamsungSensorAdapter(context, dispatch, profile)),
+        CombinedSensors(SensorPort.requireCompatible(SamsungSensorAdapter(context, dispatch, profile, dispatchRows)),
             PlatformSensors(context, dispatch))
 }
 

@@ -1,0 +1,549 @@
+{
+  "runId": "core-audit-20261101-r01",
+  "startedAt": "2026-11-01T15:36:53.8702875+08:00",
+  "completedAt": "2026-11-01T15:38:27.6211645+08:00",
+  "stage": "BIA_SHORT_MEASUREMENT_PRESSURE_CONTINUOUS",
+  "developerResult": "PASS",
+  "deviceResult": "NOT_RUN_COMBINED_CHECK_PENDING",
+  "tasks": [
+    ":shared:test",
+    ":mobile:testDebugUnitTest",
+    ":wear:testDebugUnitTest",
+    ":wear:assembleRelease",
+    ":mobile:assembleRelease",
+    ":wear:lintRelease",
+    ":mobile:lintRelease"
+  ],
+  "tests": 305,
+  "toolchain": {
+    "buildTools": "36.0.0",
+    "compileSdk": 36,
+    "gradle": "9.3.1",
+    "agp": "9.1.1"
+  },
+  "signing": "LOCAL_ANDROID_TEST_CERTIFICATE_NOT_PUBLIC_RELEASE",
+  "artifacts": [
+    {
+      "role": "wear",
+      "file": "RawWave-wear-core-audit-20261101-r01.apk",
+      "sha256": "0EB9FD683E572CF56160091D46E6D3AC6C8E9C3D6D91AB6F39100B6063964FF7",
+      "certificateSha256": "3078614c42158d1608e1ba7f97e4e0a4e4a6ad8f9e89daa91e073cdf34844b61",
+      "definedEntrypointsVerified": true,
+      "debuggable": false
+    },
+    {
+      "role": "mobile",
+      "file": "RawWave-mobile-core-audit-20261101-r01.apk",
+      "sha256": "C22BAB7BD4D6B414E4C0FB2AB9F90B13725CCBA5019180D55BCE3A0A2C778DE2",
+      "certificateSha256": "3078614c42158d1608e1ba7f97e4e0a4e4a6ad8f9e89daa91e073cdf34844b61",
+      "definedEntrypointsVerified": true,
+      "debuggable": false
+    }
+  ],
+  "sourceInputs": [
+    {
+      "path": "app-common/java/com/rawwave/shell/ActivityPhoneReceiveSession.kt",
+      "sha256": "A6352FF32057A9A02FDE70A2B939EAADBF577FDDEACD14E6275F74BFB94366B7"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/ActivityTransferWindow.kt",
+      "sha256": "FC2C188037B746BAD7E13C964A256348BEAD19176E6E3B14082F10B6B2450ECE"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/ConnectionEnvironment.kt",
+      "sha256": "BFEE190EBCDF21C8DF35AD9B87459D272FBB737018353800158BE5C9218D7844"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/DeadlineRuntime.kt",
+      "sha256": "0C9D8A191C7E0CE31ED9F7AED5C5B3BB48B5A647F0F2BB96D48064A83318B053"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/DiagnosticSummaryTransport.kt",
+      "sha256": "FEB501B3C326670BC6A3D4F0D15E72ADE4ECFBA6C085E584766565907019B20C"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/DiagnosticViewer.kt",
+      "sha256": "67B51BB56B9DE18085A6DDF5C8DFD99941DD6B45D2DFA92817894DCCDEF649C8"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/DownloadsExportDestination.kt",
+      "sha256": "5F73588A7D3B39CAB24CE6BEC42BEF21E1322AEE843EA255E422B0748E6C604D"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/GoogleTransport.kt",
+      "sha256": "59299A7EF36854684BE8AFAE206D1FDC24428F6DE787E9908C07DA9F7EF76080"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/PhoneReceiveSession.kt",
+      "sha256": "8A4A0F915819C00926CA9A47A74EBBE463100214876F210917E42B08450D5260"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/PhoneWakeService.kt",
+      "sha256": "63F8803CAFB6207A2BF3DF9511A038DE5CCF3898627C13A4265E2EE65911F585"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/ProbeActivity.kt",
+      "sha256": "94D44102C64F3FA5696957F4E2F2C6CE0BF2F2830B8BAFA8C21ACC33B7A775BB"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/ProbeApplication.kt",
+      "sha256": "2027C845616D6E383AC01C2044D3580F745F3D2FAEE69D7021FAA04B3E4797AD"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/SyncGuardService.kt",
+      "sha256": "658D9E30781ACE3595A8936E9D9A2585B3D1B92F0A7C515556C078884E0F9DCB"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/TransferResourceOwner.kt",
+      "sha256": "A7A1F5E403761E77B523EE08EC4C174C78CE92AEE6A3ED8986FA679345325DF2"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/TransferWindow.kt",
+      "sha256": "634DEAFCDB8BCFDB179DD105C33340DDDFD6B8206E07E968D1DAB734259DFBAA"
+    },
+    {
+      "path": "app-common/java/com/rawwave/shell/WatchActivitySyncSession.kt",
+      "sha256": "0D20301760F7B026688079CBCDFBAF9BBA1EC1B780624D97853201CAD917052B"
+    },
+    {
+      "path": "app-common/res/drawable/ic_rawwave.xml",
+      "sha256": "474F46DE889CCEFB1077B5D97C8602F3D4A194CDE0FBE20CDEBD7087EE2B8AAE"
+    },
+    {
+      "path": "app-common/res/values-zh/strings.xml",
+      "sha256": "327542922C6D1BA6C2E1CBE568519B6507AB1A5F02061E58B501486AF086C5D6"
+    },
+    {
+      "path": "app-common/res/values/strings.xml",
+      "sha256": "5B0AEA79E61C1753502BFE9CFC33E5C9C87CA2FC5F21F7AFA8675F73BC6ED2E6"
+    },
+    {
+      "path": "app-common/res/xml/data_extraction_rules.xml",
+      "sha256": "906F9BC42A2E6396A399209BA344EE6253F6BD66B89B221CA910DB2B26C845EE"
+    },
+    {
+      "path": "build.gradle.kts",
+      "sha256": "62C55C6B701BF45C63988CFB83D176674897C2E7396023A88C8B5B6B3211E44E"
+    },
+    {
+      "path": "gradle.properties",
+      "sha256": "BBF5B2B196C0F8F492D21530B01D19C37D5ADA4666FAD0AC039FD45B7C70A8E6"
+    },
+    {
+      "path": "mobile/build.gradle.kts",
+      "sha256": "0E5AEC81E97606D478DBCC6B2B47CF10EEB5882B523337834C98F47F91ECE93B"
+    },
+    {
+      "path": "mobile/src/main/AndroidManifest.xml",
+      "sha256": "56094D8AF103FCBBC3B29AAF0A496866759A75C9A7EA5A3C40A12E5FAA218B75"
+    },
+    {
+      "path": "mobile/src/test/java/com/rawwave/shell/ActivityCoordinatorTest.kt",
+      "sha256": "75FA2456A0F2C2A036DFFF64520D1210393E637DB6ACC4E1FCEE157AB11CA11F"
+    },
+    {
+      "path": "settings.gradle.kts",
+      "sha256": "F969CD523445A4F02BBF49FD280048552A6722223552D7EEB213011FFB6B14F5"
+    },
+    {
+      "path": "shared/build.gradle.kts",
+      "sha256": "38982260AFB66C9999FDD061120A4831B1DF73E6DA32FC2AFDD2BA3025718290"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ActivityArchive.java",
+      "sha256": "54E3A7191478D7318309968C1E537866E1FD33BD719831F8A06C0EED85ABF59D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ActivityDataExporter.java",
+      "sha256": "8202BD33FF574758BC6D9F3B3AA410EB021E9598D70AC3B9827AD476E735841D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ActivityExportName.java",
+      "sha256": "3F9B9F5350D86BC9F2C953FDBCC8E4005C9CD3F26CACE3145A725319E31F5F7C"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ActivityStore.java",
+      "sha256": "F5AF0725DEC595C476842B5B1AD4B04C238FE4C26EF7BDA613E67B462AE63E90"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ActivitySyncAttemptGuard.java",
+      "sha256": "A50244565C62C04B2FA8053F0CF19254F12ECD2E229AEDF7A2D6DB4FFCB33F0F"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ActivitySyncPolicy.java",
+      "sha256": "8B5AC4DED54933C027396EF499FEB4CB63AE68030598919469EFB8C66B0A17DA"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ActivityTransferFiles.java",
+      "sha256": "F7DBEDF81CE35FE4E63B6686F1FB40E4EE288EE4CF790E331AE70381257CC27D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/AutoSyncGate.java",
+      "sha256": "C739FB280103E90AFF68E080692BDE796A95B6F82F733D6C10F8E297DD897496"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/BiaProfile.java",
+      "sha256": "FCD243D94E768E8FBAB9951B3B76C32F7200188841F93717A9AC66F6B6F3DD89"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/BiaResult.java",
+      "sha256": "2D7BF1DC047C8223D2901A705E1638DD021D021D620066EBB5503D7C00DC6AB8"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/CallbackAdmission.java",
+      "sha256": "D70E3DEB59B06298EC3A9E67AD5D87B9C2F2F852823F28558290ABB030FEBD0F"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/CaptureDrain.java",
+      "sha256": "6358EBCAE49E89F80A5490DBB3DCD2C482D408C4705489DBEFCE3218FD3A659B"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/CapturePersistence.java",
+      "sha256": "0E966AA4BFAE75BF69260B3B889FFF9C8249A7CBDE77F75DAF64C783ED5422B3"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/CapturePhasePolicy.java",
+      "sha256": "385EA63954C4010352D8ACFE5B2E803ED76CCA97C083A68030837A3E462560F6"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/CaptureQueue.java",
+      "sha256": "5C9ECF08DE0542C4C3D9132EA20285392F1A2C219FFA08F0791C263FFE3FF811"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/CaptureRuns.java",
+      "sha256": "7DF11BE6C3FFA6724B9D9035C774604929253D0762487FA2097B522E132BE742"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/CommitExchange.java",
+      "sha256": "0116B94A533AAF9C822065477E6269B9947B4EC85C6841794FD61A79A0C68F9E"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/DiagnosticArchive.java",
+      "sha256": "1D8FE0C5134C99AEAFC17C738283E38AF1C8ACD4E655503BDD4611269EBC9E59"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/DiagnosticDispatcher.java",
+      "sha256": "8549A49833E77CEF603622A868770183C84F68D685A15428A02BD2F35E531D12"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/DiagnosticFeedback.java",
+      "sha256": "3C960AC75A7C7CDAEF56AD8336B015B24C867538B55CA7CE81A74A6E1F691AF2"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/DiagnosticReportBuilder.java",
+      "sha256": "1F481B254ECA895D2FF2795835A94B6517F2E0190A894B4F5A9B0B52361AFB37"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/DiagnosticSummary.java",
+      "sha256": "243B9E6F62323981E9A7003EA156E664D2B084452945204256C224540AF3E61A"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/EcgBatchQuality.java",
+      "sha256": "93888FAF49593A2C0A77352EF0A7AD7EDD29537850138789C08BE1CB36CAA450"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/EcgContinuityGate.java",
+      "sha256": "F66ED886A5075D5C7C8401BBC964464FC921E90633D4AEA7AD20BF798243670D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/EcgRetryPolicy.java",
+      "sha256": "7034DB2D3BBE3F353B8B1DD081CC719BC352C56F33A4B0D4BDD9C5AE30824D19"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/EcgWaitBudget.java",
+      "sha256": "0317F0A5F5A3D852F34977F524BA356AE7A84C8E4F9DD4D1DBD6123CB4E4652F"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/EdaEndBoundary.java",
+      "sha256": "72EF7CD8CB252CE5E308B659FF11EA736A2031127A7D0922429CA1A8470C1D7B"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ExportDestination.java",
+      "sha256": "126A2754539FBE179E04F7105389BDE46DF5C2E12913410537ED2F78F3A742ED"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/FileReceiveStore.java",
+      "sha256": "DB04E0D4F13CF133C55BB7C54348E8A5BDCD5B020482AD9214B6580F85CBF34D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/FileSendStore.java",
+      "sha256": "8F0F3738FFE26D2FE96C8356C0AC8D44E8690E58BE4FF95DAA604D77B6B9CA68"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/FileSummaryStore.java",
+      "sha256": "0164E1E02BFCAA55FD2E5BEB6A302C184A61FC01EF030B9272F7DC04FDF2F075"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/HelloRetryPolicy.java",
+      "sha256": "4F47AB30D98C2293198C954157BDDB47DF4CA94A112EC6B07997A1A64B92CEB1"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/Journal.java",
+      "sha256": "D65C28546474D2C17FF5A3B135153D6AB3E274F3DB8F459A28C3B39F5AB6EC19"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/LeaseScope.java",
+      "sha256": "59BF5EFAA8097CE22148CC69028967D75FB1B5EC8604D5252774C463C1BF288E"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ModuleVersions.java",
+      "sha256": "4592DA71D154ED9719F89B40FC51A914C791D7D7818727C2F148DB78859B437D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ReceiveStore.java",
+      "sha256": "73FE3888E348D110446186748F887254AE6134309C3F9156A1FBB08A2C3D94C9"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/RejectedActivity.java",
+      "sha256": "C41996222A09C66ACDF08E1E1694EFF3D9DCD9967B7D35181C3D4F5D28D1361A"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ReportBuilder.java",
+      "sha256": "86A446306E5BD72B40FBF63581F792155CB5AFFE54DAEA8FC7642E35BA3F208C"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ReportExporter.java",
+      "sha256": "A3A84E5D48A6CEE8269B89267C523FFC566A93F11F3A53773F9068B72D8DD630"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/ResourceHandoff.java",
+      "sha256": "2AD56A670AD5913FF522CACDF1546FF97F6591703819669EC0D31F84378A29AE"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/RunDeadlines.java",
+      "sha256": "DB5B513239B34A525DFDCB8184B8E1D9AA7853C3E61C78660ECD42BD797BF8A8"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SendStore.java",
+      "sha256": "E4A796DB2E75D6732352631B28EC18BCCE94615D2EFF6FA66FBEFB39D32597D0"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SensorCallbackFence.java",
+      "sha256": "DEA4BCE51C3F443CF7DA0EBD4E296A7091FBFEA5510C6397AF5A241FC6C29123"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SensorCatalog.java",
+      "sha256": "1D261D09BC4E3854B8393ECE9EDD98C05C410DD65BBC234FE45DD3CA328262C0"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SensorPort.java",
+      "sha256": "120AD940B39595FDA6AA31D7BA2C9AEA969D10D33EE6B47F532455758A8704ED"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SensorRows.java",
+      "sha256": "00AA83AA0CB2069E16539CACF439F473A2CD0E9F40422722BB357FF6BBB51044"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/StreamQualityTracker.java",
+      "sha256": "306F140902586433E2E388F736CFD1CECD57E9A09A40E17CA8D329C6B14EE88C"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SummaryReceiver.java",
+      "sha256": "70A037022A7B19214B24F495E7C7567A0AA79F007E0DB1BC0EDEFEC5DDAF987D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SummaryStore.java",
+      "sha256": "8C4EAA519DEE63EB717D5224F6CB30C0C3A953F95528E6AEBB5C5BE492F826CD"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SyncAdmission.java",
+      "sha256": "FC3028CE227591752DF5379A247A219944B6C0B0650AF1A57A7A08720AC92E3E"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/SyncStopScope.java",
+      "sha256": "6B2A03A461A435BC5C75D95043532683A667CD393675BEF757DF4104E330ED2F"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/TransferAttempt.java",
+      "sha256": "E4F6F02763E579FFE728F55959BCF4CCC44CA06406C5BF4F2E83A335D4A509E5"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/TransferCleanup.java",
+      "sha256": "F3D00CE0FBABFF60547950F438BE4801D8E2B84F5252BDA0C22D7AE48FECAA5B"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/TransferFiles.java",
+      "sha256": "2B96B04358699E31FF0F502051640E40B93C1A6B421C8E099A14E407CB5D266C"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/TransportAwait.java",
+      "sha256": "41730FA627B055315A5D1D98F3CE150B07E12DC4C8815BE5974EB3C1D499ED1D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/TransportPort.java",
+      "sha256": "6028808D67BD87344378A6E01F4BF78E52B60E06AB27FE2FF900D26F2A15B8D1"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/WakeHistory.java",
+      "sha256": "9AEBF85EFFC1C2CB57BD1298FC8A66E5DEC5E134B17E69DFB6EF893E10A8CA5D"
+    },
+    {
+      "path": "shared/src/main/java/com/rawwave/core/WorkBudget.java",
+      "sha256": "F6F1134C25DAD3816F4BDCAC81398EE6C31CA9CC5054313789E031E352E3F44F"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/ActivityArchiveTest.java",
+      "sha256": "DE7BFF8188FE5696002F0501DF4A4572D3EC20EE70C0EEA57BF9626BC1DE1259"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/ActivityDataExporterTest.java",
+      "sha256": "3220A9740468893B1ADB938B91564E4621B1F7E4BB9FB40ACB64A4A5A7A00EF4"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/ActivityStoreTest.java",
+      "sha256": "07F1E9F211C471C6365DE1FCD3C184F5619504CBA98156311028D5868B11D6D0"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/ActivitySyncAttemptGuardTest.java",
+      "sha256": "7E91B3D3CADCAE8D0DA9416A2500B982399084871AC560ED7A64F4C717587001"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/ActivitySyncPolicyTest.java",
+      "sha256": "DFA54361F89BA47D0E8FD16F6DF177590CA1768D860823DD800E370A009981A6"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/AutoSyncGateTest.java",
+      "sha256": "27C13D55924FF0B235E970D2EF78414838F1824DED27F884EE50DCF02F292F15"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/BiaPressureTest.java",
+      "sha256": "29C269A34F4E6D10911D015CF728CFE7179F6E8AED0C6CED2D14D96152A8C52D"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/CallbackAdmissionTest.java",
+      "sha256": "2A3FC101D24B484D8E152D474337F904CDB002E2B92DAD631F339E2FB13353B0"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/CapturePersistenceTest.java",
+      "sha256": "C213BB087E91BB8429FD3B70616B3C2C3F9FFB95BB6D20E08EF5CA834260059A"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/DiagnosticDispatcherTest.java",
+      "sha256": "FFD69BEA7F2D4DCA86FC5A0A0691A65BE42D7114F7A4F7A3D0805055B06BF5A8"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/DiagnosticFeedbackTest.java",
+      "sha256": "B72774956DA8D0F39D36A980490C17D20D4E607C6FFE97526E512A46945F08F7"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/DiagnosticsTest.java",
+      "sha256": "77A8D650C489801097E22A47785C4A6AFF1755B51779552C7DDA13AD1DA33ACC"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/EcgQualityTest.java",
+      "sha256": "AD780EE1BFF2FB1383D90BFC58585C448B249A798FC7C949E6C527F6E2DE5E35"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/HelloRetryPolicyTest.java",
+      "sha256": "5264CA04230CD11156C076B3B831F115D890926071A4CE08797E9540B0E43221"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/ReportModulesTest.java",
+      "sha256": "C7EB13C46084AD9CB9F8F525B8F35B5B678F3625D55931A47F462BB20A2B8C72"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/RunDeadlinesTest.java",
+      "sha256": "2B84F8DD68363F731DF786C9737671D44054A381550800E0DB78790A72A55F23"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/SensorCatalogTest.java",
+      "sha256": "46746289AC63F56FFB1872F84D42DAA62E98DB0C7A078AD8A4B07720B9191BDA"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/SyncAdmissionTest.java",
+      "sha256": "A2F105D4FDA11AA41AAB39D238F33582444C1E24892614FAD03148EE29166880"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/TransferAttemptTest.java",
+      "sha256": "9D77EB09F2DCD4A748BCFC0A705D800B911E0745CEAB59020419CEA0B15EB858"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/TransferCleanupTest.java",
+      "sha256": "0C885D4E872436FB3A4068E3CC0CEFD1A52C15FACA1F6CA232FC4B8548CE6F38"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/TransferFilesTest.java",
+      "sha256": "F7DB920E7A0E94BC55931179AEE9BCE2C7AA82EFACD5E94A13C8F7288DD2FD3E"
+    },
+    {
+      "path": "shared/src/test/java/com/rawwave/core/WakeHistoryTest.java",
+      "sha256": "615934CD4C977BDEBC60033BC382490C0E465ACE4323545F26917BEAC26BD3F8"
+    },
+    {
+      "path": "tools/Build-Candidate.ps1",
+      "sha256": "AF28C737785DF1E6447D5D6E9C70541139975EBEEFCCDF6FF12FA6299E7F753F"
+    },
+    {
+      "path": "tools/Inspect-Export.ps1",
+      "sha256": "7AB8C8AF3A1826A9AEDF6A047156100593555892A2590DE6EED3D96399068C3D"
+    },
+    {
+      "path": "tools/Test-ModuleBoundaries.ps1",
+      "sha256": "3AEE37E3B7DC85A18AE866E398213711E0BD70C64CBB74AA09983A3576A42DE7"
+    },
+    {
+      "path": "wear/build.gradle.kts",
+      "sha256": "C83B422D120F201A4E0CC3C75F03D2F80A120FD4228EA334E0FE572B0D060D2F"
+    },
+    {
+      "path": "wear/libs/samsung-health-sensor-api-1.4.1.aar",
+      "sha256": "893CD5D6564DB0F304BF511A555C1D65CA6BCCC8475FC979FF1D71D50680344C"
+    },
+    {
+      "path": "wear/src/main/AndroidManifest.xml",
+      "sha256": "4BE91B71C5CE8187FB77180B5BD6EFDC91A6DDC57799CAB43B52808DADA0B948"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/ActivityRecordingService.kt",
+      "sha256": "64B9342DB43E989D1F76369B1E8C1BCB471BDEA4635BF5BC15569AD675DE0DEE"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/CaptureAssembly.kt",
+      "sha256": "118102546351E14E498E1FBD415DA181F1BFC8E7F08D713C2395FCE4B15378CD"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/GyroscopeSensorAdapter.kt",
+      "sha256": "A54648CAFF6B9C1863B66ADD9026FCAB6CE32DC1EACD5FEE599B6CA4CE042EDA"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/MagneticFieldSensorAdapter.kt",
+      "sha256": "64A125AA68C926CE9E5A49959B599E6982662CAA84E8958F1EF62A8F2B31B8C5"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/PressureSensorAdapter.kt",
+      "sha256": "315C7F720517D4D0C6F4925FC2CA7806FA569B04EBC3649BB272FC8AC2407090"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/RecordingActivity.kt",
+      "sha256": "F538588BE2FE2B5380F1952B96007DED68850F78E291AA46AA4C9CC3C04916A8"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/SamsungBackend.kt",
+      "sha256": "5A1DFD3788CFF2564AA37A453FE60D1C625D4E5E49F800CDB02D73E21CC52D7D"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/SamsungSensorAdapter.kt",
+      "sha256": "EB1E64EE3B6A889817A3BF97B09BDD11C4597478ED6C996A05CB9BD6B9DC2B9D"
+    },
+    {
+      "path": "wear/src/main/java/com/rawwave/shell/SensorReleaseDiagnostics.kt",
+      "sha256": "572B7FDBA0559DD4F0595BFF4B8978508D0C11EDD18175317101A5A2E5FF4C57"
+    },
+    {
+      "path": "wear/src/test/java/com/rawwave/shell/CaptureServiceTest.kt",
+      "sha256": "F134B84EE03AF959731D77E365BCA21E66650A8BBB8D2A3BDB19AED233BE2C0E"
+    },
+    {
+      "path": "wear/src/test/java/com/rawwave/shell/SamsungReleaseTest.kt",
+      "sha256": "0C25BE9E3C11A41651E29A76C61239804A0D53C06F56CA7108943E6256C3565B"
+    },
+    {
+      "path": "wear/src/test/java/com/rawwave/shell/StreamOwnerTest.kt",
+      "sha256": "394520FF987B6080B1BDAEC710D7CD2F4B7C8E729E1311DC6D0A76F926926735"
+    },
+    {
+      "path": "wear/src/test/java/com/rawwave/shell/WatchSyncOwnerTest.kt",
+      "sha256": "34F71A67E9110588E17026BB0B928BF07F3A1EF84960426B3823BC8C3C2275F1"
+    }
+  ]
+}

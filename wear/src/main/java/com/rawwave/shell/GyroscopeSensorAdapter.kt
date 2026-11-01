@@ -35,7 +35,9 @@ class GyroscopeSensorAdapter(context: Context, private val dispatch: (() -> Unit
                         val v=event.values[i]; row[key]=if(v.isFinite()) v else v.toString()
                     }
                     val snapshot=SensorRows.snapshot(listOf(row))
-                    dispatch { if(!closed) data.accept(snapshot) }
+                    // SensorManager already invokes this callback on the capture owner Handler.
+                    // Reposting every sample queues an entire burst behind itself.
+                    if(!closed) data.accept(snapshot)
                     } catch(e:Exception) { dispatch { if(!closed) failed.accept("GYROSCOPE_CALLBACK_COPY:${e.message}") } }
                 } }
                 override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit

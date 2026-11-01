@@ -20,6 +20,9 @@ import java.io.File
 class RecordingActivity : ComponentActivity() {
     private lateinit var body: LinearLayout
     private lateinit var status: TextView
+    private lateinit var measurementHeader: TextView
+    private lateinit var topPane: ScrollView
+    
     private lateinit var controls: LinearLayout
     private lateinit var guide: HomeKeyGuide
     private var pending: ActivityStore.Template? = null
@@ -82,12 +85,19 @@ class RecordingActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
             setPadding(inset, dp(40), inset, dp(48)); setBackgroundColor(Color.BLACK)
         }
-        status = label("原波 · 活动采集测试")
-        guide = HomeKeyGuide(this)
-        body.addView(guide, LinearLayout.LayoutParams(-1, dp(95)))
+        measurementHeader = label("")
         controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         body.addView(controls)
-        setContentView(ScrollView(this).apply { addView(body) })
+        guide = HomeKeyGuide(this)
+        body.addView(guide, LinearLayout.LayoutParams(-1, dp(65)))
+        val details = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(inset, dp(4), inset, dp(32))
+        }
+        status = label("原波 · 活动采集测试", details)
+        topPane = ScrollView(this).apply { addView(body) }
+        body.addView(details)
+        setContentView(topPane)
         ActivityRecordingService.idleExitObserver = idleExitListener
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -135,21 +145,37 @@ class RecordingActivity : ComponentActivity() {
         if (s.active) { cancelAutoSync("RECORDING_ACTIVE"); idle?.close(); idle = null }
         else ensureIdle()
         val measuringEcg = s.shortSensor == "ECG" && (s.phase.startsWith("PRE") || s.phase.startsWith("POST"))
-        guide.visibility = if (measuringEcg) View.VISIBLE else View.GONE
+        guide.visibility = View.GONE
         guide.animateContact = measuringEcg && resumed
         if (measuringEcg || (s.active && (s.shortSensor == "SPO2" || s.shortSensor == "BIA"))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        status.text = if (s.active) s.text + if (measuringEcg)
-            (if (s.remaining < 0) "\n等待有效接触；检测到真实 ECG 数据后才开始30秒。"
-             else "\n正在测量，剩余 ${s.remaining} 秒。") +
-            "\n将另一只手的手指轻放在手表 Home（主页）键上，不要按下。不是放手机。\n" +
-                if (s.contact) "已检测到接触" else "请保持接触，手臂放松静止"
-            else "" else "原波 · 三项采集测试\n${s.text}"
+        measurementHeader.textSize = 19f
+        measurementHeader.text = if (s.active) {
+            val timer = when {
+                s.phase == "DRAINING" -> "正在保存…"
+                s.phase.startsWith("REVIEW") -> "本次测量已结束"
+                measuringEcg && s.remaining < 0 -> "等待接触"
+                s.remaining > 0 -> "${s.remaining} 秒"
+                else -> "正在记录"
+            }
+            val instruction = when {
+                s.phase == "DRAINING" -> "正在结束采集，请稍候"
+                s.phase.startsWith("REVIEW") -> "可以松开手指，选择重测或继续"
+                s.phase == "RESTORE_PRE" -> "恢复平时佩戴位置后继续"
+                s.shortSensor == "SPO2" -> "手臂放稳，与心脏大致同高\n测量期间保持静止"
+                s.shortSensor == "BIA" -> "两指分别接触两个按键\n手臂抬起，避免双手相碰"
+                measuringEcg -> "手指轻触 Home 键，不要按下\n保持接触，手臂静止"
+                s.phase == "CORE-1" -> "正常活动即可\n结束时点击下方按钮"
+                else -> "请稍候"
+            }
+            "$timer\n$instruction"
+        } else "原波"
+        status.text = if (s.active) "采集详情\n${s.text}" else s.text
         if (mode == "${s.active}/${s.phase}/${s.skipAllowed}") return
         mode = "${s.active}/${s.phase}/${s.skipAllowed}"
+        topPane.post { topPane.scrollTo(0, 0) }
         controls.removeAllViews()
         if (s.active) {
-            button("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
             if (s.phase.startsWith("READY_BIA_")) {
                 button("已调整好，开始体成分") { command("START_BIA") }
                 button("跳过体成分，继续") { command("SKIP_BIA") }
@@ -174,6 +200,7 @@ class RecordingActivity : ComponentActivity() {
                 android.app.AlertDialog.Builder(this).setMessage("中断本次记录？已保存的数据保留，并注明用户中断。")
                     .setPositiveButton("中断") { _, _ -> command("CANCEL") }.setNegativeButton("继续记录", null).show()
             }
+            button("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
         } else showHome()
     }
     private fun showHome() {

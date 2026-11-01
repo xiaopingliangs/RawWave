@@ -9,20 +9,35 @@ import com.samsung.android.service.health.tracking.*
 import com.samsung.android.service.health.tracking.data.*
 
 /** SDK boundary only. No storage, phase decisions, retry, or inferred samples. */
-class SamsungSensorAdapter(private val context: Context, private val dispatch: (() -> Unit) -> Unit, private val biaProfile: com.rawwave.core.BiaProfile? = null) : SensorPort {
+class SamsungSensorAdapter internal constructor(
+    private val backend: SamsungBackend,
+    private val dispatch: (() -> Unit) -> Unit,
+    private val evidence: (String, Map<String, Any>) -> Unit,
+    private val elapsed: () -> Long = { SystemClock.elapsedRealtime() },
+    private val utc: () -> Long = { System.currentTimeMillis() },
+    private val dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null
+) : SensorPort {
+    constructor(context: Context, dispatch: (() -> Unit) -> Unit, biaProfile: com.rawwave.core.BiaProfile? = null,
+                dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null) :
+        this(DeviceSamsungBackend(context, biaProfile), dispatch, SensorReleaseDiagnostics(context)::record, dispatchRows = dispatchRows)
+    private val ownerId = java.util.UUID.randomUUID().toString()
+    private var attemptSequence = 0L
     override fun contractVersion() = SensorPort.CONTRACT_VERSION
-    override fun implementationVersion() = "samsung-health-sensor-1.4.1/adapter-8"
+    override fun implementationVersion() = "samsung-health-sensor-1.4.1/adapter-9"
     private fun cleanupEvidence(stage: String, sensor: String, detail: String = "") {
-        try { (context.applicationContext as? ProbeApplication)?.journal?.event("CAPTURE_VENDOR_CLEANUP", mapOf(
+        try { evidence("CAPTURE_VENDOR_CLEANUP", mapOf("ownerId" to ownerId,
             "stage" to stage, "sensor" to sensor, "detail" to detail,
-            "elapsedMs" to SystemClock.elapsedRealtime(), "hardwareStoppedVerified" to false)) } catch (_: Exception) {}
+            "elapsedMs" to elapsed(), "hardwareStoppedVerified" to false)) } catch (_: Exception) {}
     }
     private var ready: Runnable? = null
     private var disconnected: SensorPort.Failure? = null
     private var connecting = false
-    private var closed = false
-    private val trackers = mutableMapOf<String, HealthTracker>()
-    private class Delivery {
+    @Volatile private var closed = false
+    private val trackers = mutableMapOf<String, SamsungTracker>()
+    private class Delivery(val id: Long) {
+        @Volatile var stoppedMs: Long? = null
+        val lateCallbacks = java.util.concurrent.atomic.AtomicLong()
+        @Volatile var lastStatus: Any? = null
         val fence = SensorCallbackFence()
         val endBoundary = com.rawwave.core.EdaEndBoundary()
         var sequence = 0L
@@ -30,60 +45,47 @@ class SamsungSensorAdapter(private val context: Context, private val dispatch: (
         var flushRequestedMs: Long? = null
     }
     private val deliveries = mutableMapOf<String, Delivery>()
-    private val service = HealthTrackingService(object : ConnectionListener {
-        override fun onConnectionSuccess() { dispatch { if (!closed) ready?.run() } }
-        override fun onConnectionEnded() { dispatch { if (!closed) disconnected?.accept("SDK_CONNECTION_ENDED") } }
-        override fun onConnectionFailed(error: HealthTrackerException) {
-            dispatch { if (!closed) disconnected?.accept("SDK_CONNECTION_FAILED:${error.errorCode}:${error.message}") }
-        }
-    }, context)
     override fun connect(ready: Runnable, disconnected: SensorPort.Failure) {
         check(!closed && !connecting) { "SENSOR_CONNECTION_ALREADY_USED" }
         this.ready = ready; this.disconnected = disconnected; connecting = true
-        service.connectService()
+        cleanupEvidence("CONNECT_REQUEST", "ALL")
+        backend.connect({
+            cleanupEvidence("CONNECTION_SUCCESS", "ALL", "closed=$closed")
+            dispatch { if (!closed) ready.run() }
+        }, {
+            // Record at callback entry, even when the serial owner is already closed.
+            cleanupEvidence("CONNECTION_ENDED_CALLBACK", "ALL", "closed=$closed")
+            dispatch { if (!closed) disconnected.accept("SDK_CONNECTION_ENDED") }
+        }, { reason ->
+            cleanupEvidence("CONNECTION_FAILED_CALLBACK", "ALL", reason)
+            dispatch { if (!closed) disconnected.accept(reason) }
+        })
     }
     override fun start(sensor: String, data: SensorPort.Rows, failed: SensorPort.Failure) {
+        if (closed || deliveries.containsKey(sensor)) {
+            failed.accept(if (closed) "SENSOR_PORT_CLOSED" else "SENSOR_ALREADY_STARTED:$sensor")
+            return
+        }
         try {
-            check(!closed) { "SENSOR_PORT_CLOSED" }
-            check(!trackers.containsKey(sensor)) { "SENSOR_ALREADY_STARTED:$sensor" }
-            val type = when (sensor) {
-                "ECG" -> HealthTrackerType.ECG_ON_DEMAND
-                "MF_BIA" -> HealthTrackerType.MF_BIA_ON_DEMAND
-                "BIA" -> HealthTrackerType.BIA_ON_DEMAND
-                "SPO2" -> HealthTrackerType.SPO2_ON_DEMAND
-                "HEART_RATE" -> HealthTrackerType.HEART_RATE_CONTINUOUS
-                "ACCELEROMETER" -> HealthTrackerType.ACCELEROMETER_CONTINUOUS
-                "PPG" -> HealthTrackerType.PPG_CONTINUOUS
-                "SKIN_TEMPERATURE" -> HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS
-                "EDA" -> HealthTrackerType.EDA_CONTINUOUS
-                else -> error("UNKNOWN_SENSOR:$sensor")
+            val tracker = trackers.getOrPut(sensor) {
+                backend.create(sensor).also { cleanupEvidence("TRACKER_CREATED", sensor) }
             }
-            val permission = when {
-                sensor == "ACCELEROMETER" -> android.Manifest.permission.ACTIVITY_RECOGNITION
-                android.os.Build.VERSION.SDK_INT < 36 -> android.Manifest.permission.BODY_SENSORS
-                sensor == "HEART_RATE" -> "android.permission.health.READ_HEART_RATE"
-                sensor == "SPO2" -> "android.permission.health.READ_OXYGEN_SATURATION"
-                sensor == "SKIN_TEMPERATURE" -> "android.permission.health.READ_SKIN_TEMPERATURE"
-                (sensor == "BIA" || sensor == "MF_BIA") || sensor == "ECG" || sensor == "PPG" || sensor == "EDA" ->
-                    "com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA"
-                else -> error("NO_PERMISSION_MAPPING:$sensor")
-            }
-            check(context.checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) { "PERMISSION_DENIED:$permission" }
-            check(service.trackingCapability.supportHealthTrackerTypes.contains(type)) { "UNSUPPORTED_$sensor" }
-            val tracker = if (sensor == "PPG") service.getHealthTracker(type,
-                setOf(PpgType.GREEN, PpgType.IR, PpgType.RED)) else if ((sensor == "BIA" || sensor == "MF_BIA")) {
-                val p = checkNotNull(biaProfile) { "BIA_PROFILE_REQUIRED" }
-                service.getHealthTracker(type, TrackerUserProfile.Builder().setHeight(p.heightCm())
-                    .setWeight(p.weightKg()).setAge(p.age()).setGender(p.gender()).build())
-            } else service.getHealthTracker(type)
             trackers[sensor] = tracker
-            val delivery = Delivery()
+            val delivery = Delivery(++attemptSequence)
             deliveries[sensor] = delivery
-            tracker.setEventListener(object : HealthTracker.TrackerEventListener {
+            cleanupEvidence("LISTEN_REQUEST", sensor, "attempt=${delivery.id}; tracker=${System.identityHashCode(tracker)}")
+            tracker.listen(object : HealthTracker.TrackerEventListener {
                 override fun onDataReceived(points: List<DataPoint>) {
+                    if (delivery.stoppedMs != null) {
+                        val n = delivery.lateCallbacks.incrementAndGet()
+                        // Bounded evidence, including callbacks previously hidden by the fence.
+                        if (n == 1L || n == 10L || n % 1000L == 0L)
+                            cleanupEvidence("CALLBACK_AFTER_STOP", sensor,
+                                "attempt=${delivery.id}; count=$n; points=${points.size}; sinceStopMs=${elapsed() - delivery.stoppedMs!!}; closed=$closed")
+                    }
                     delivery.fence.accept {
-                    val utc = System.currentTimeMillis()
-                    val elapsed = SystemClock.elapsedRealtime()
+                    val utc = utc()
+                    val elapsed = elapsed()
                     try {
                         val callbackSequence = ++delivery.sequence
                         // Copy SDK-owned values immediately. captureCallback* fields are acquisition
@@ -186,8 +188,9 @@ class SamsungSensorAdapter(private val context: Context, private val dispatch: (
                             }
                             row
                         }
+                        rows.lastOrNull()?.let { delivery.lastStatus = it["STATUS"] ?: it["HEART_RATE_STATUS"] }
                         val snapshot = SensorRows.snapshot(rows)
-                        dispatch {
+                        val deliver = {
                             if (!closed) {
                                 data.accept(snapshot)
                                 if(sensor=="EDA" && deliveries[sensor] === delivery) {
@@ -197,40 +200,50 @@ class SamsungSensorAdapter(private val context: Context, private val dispatch: (
                                 }
                             }
                         }
+                        if (dispatchRows != null) dispatchRows.invoke(snapshot, deliver) else dispatch(deliver)
                     } catch (e: Exception) { dispatch { if (!closed) failed.accept("CALLBACK_COPY:${e.message}") } }
                     }
                 }
                 override fun onFlushCompleted() {
-                    val callbackElapsedMs = SystemClock.elapsedRealtime()
+                    val callbackElapsedMs = elapsed()
                     dispatch {
                         cleanupEvidence("FLUSH_CALLBACK", sensor,
-                            "callbackElapsedMs=$callbackElapsedMs; dispatchElapsedMs=${SystemClock.elapsedRealtime()}; requestElapsedMs=${delivery.flushRequestedMs}; active=${deliveries[sensor] === delivery}; waiting=${delivery.completion != null}")
+                            "callbackElapsedMs=$callbackElapsedMs; dispatchElapsedMs=${elapsed()}; requestElapsedMs=${delivery.flushRequestedMs}; active=${deliveries[sensor] === delivery}; waiting=${delivery.completion != null}")
                         if (!closed && deliveries[sensor] === delivery && delivery.completion != null)
                             endDrain(sensor, delivery, SensorPort.DrainStatus.FLUSHED, "SDK_FLUSH_ACKNOWLEDGED")
                     }
                 }
-                override fun onError(error: HealthTracker.TrackerError) { dispatch {
-                    if (!closed) {
+                override fun onError(error: HealthTracker.TrackerError) {
+                    cleanupEvidence("TRACKER_ERROR", sensor, "attempt=${delivery.id}; error=$error; stopped=${delivery.stoppedMs != null}")
+                    dispatch {
+                    if (!closed && deliveries[sensor] === delivery) {
                         if (deliveries[sensor] === delivery && delivery.completion != null)
                             endDrain(sensor, delivery, SensorPort.DrainStatus.FAILED, "SDK_ERROR:$error")
                         else failed.accept(error.toString())
                     }
                 } }
             })
-        } catch (e: Exception) { failed.accept("${e.javaClass.simpleName}:${e.message}") }
+            cleanupEvidence("LISTEN_RETURNED", sensor, "attempt=${delivery.id}")
+        } catch (e: Exception) {
+            cleanupEvidence("START_FAILED", sensor, e.toString())
+            // A set-listener failure may follow a partial registration. Retain the handle
+            // for final cleanup even if immediate removal fails.
+            if (!closed && deliveries.containsKey(sensor)) try { stop(sensor) } catch (_: Exception) {}
+            failed.accept("${e.javaClass.simpleName}:${e.message}")
+        }
     }
     override fun drain(sensor: String, completed: SensorPort.Drain) {
         val delivery = deliveries[sensor]
         if (closed || delivery == null) { completed.accept(SensorPort.DrainStatus.FAILED, "SOURCE_NOT_ACTIVE"); return }
         check(delivery.completion == null) { "DRAIN_ALREADY_REQUESTED:$sensor" }
         delivery.completion = completed
-        if(sensor=="EDA") delivery.endBoundary.arm(System.currentTimeMillis(),SystemClock.elapsedRealtime())
+        if(sensor=="EDA") delivery.endBoundary.arm(utc(),elapsed())
         if (sensor == "ECG" || sensor == "SPO2" || (sensor == "BIA" || sensor == "MF_BIA")) {
             endDrain(sensor, delivery, SensorPort.DrainStatus.DELIVERED_ONLY, "${sensor}_HAS_NO_SDK_FLUSH;ACCEPTED_CALLBACKS_DRAINED")
             return
         }
         try {
-            delivery.flushRequestedMs = SystemClock.elapsedRealtime()
+            delivery.flushRequestedMs = elapsed()
             cleanupEvidence("FLUSH_REQUEST", sensor, "requestElapsedMs=${delivery.flushRequestedMs}")
             val accepted = trackers[sensor]?.flush() == true
             cleanupEvidence("FLUSH_RETURNED", sensor, "accepted=$accepted; requestElapsedMs=${delivery.flushRequestedMs}")
@@ -254,24 +267,34 @@ class SamsungSensorAdapter(private val context: Context, private val dispatch: (
         dispatch { if (!closed) completed.accept(outcome, description) }
     }
     override fun stop(sensor: String) {
-        val delivery = deliveries[sensor]
-        delivery?.fence?.close()
-        // Never call vendor APIs under the callback monitor: unset may wait for a callback.
+        val delivery = deliveries[sensor] ?: return
+        delivery.stoppedMs = elapsed()
+        delivery.fence.close()
         val tracker = trackers[sensor]
         if (tracker != null) {
-            cleanupEvidence("UNSET_REQUEST", sensor)
-            try { tracker.unsetEventListener(); cleanupEvidence("UNSET_RETURNED", sensor) }
+            cleanupEvidence("UNSET_REQUEST", sensor, "attempt=${delivery.id}; lastStatus=${delivery.lastStatus}")
+            try { tracker.unset(); cleanupEvidence("UNSET_RETURNED", sensor, "attempt=${delivery.id}") }
             catch(e: Exception) { cleanupEvidence("UNSET_FAILED", sensor, e.toString()); throw e }
         }
-        trackers.remove(sensor); deliveries.remove(sensor)
+        // Keep one handle per type for retries and a final release sweep. Samsung's void
+        // unset API can swallow RemoteException; return is not a remote release receipt.
+        deliveries.remove(sensor)
     }
     override fun close() {
+        if (closed) return
         closed = true
         var failure: Exception? = null
-        trackers.keys.toList().forEach { try { stop(it) } catch (e: Exception) { failure = e } }
-        cleanupEvidence("DISCONNECT_REQUEST", "ALL")
-        try { service.disconnectService(); cleanupEvidence("DISCONNECT_RETURNED", "ALL") }
+        deliveries.keys.toList().forEach { try { stop(it) } catch (e: Exception) { failure = e } }
+        trackers.forEach { (sensor, tracker) ->
+            cleanupEvidence("FINAL_UNSET_REQUEST", sensor, "tracker=${System.identityHashCode(tracker)}")
+            try { tracker.unset(); cleanupEvidence("FINAL_UNSET_RETURNED", sensor) }
+            catch(e: Exception) { cleanupEvidence("FINAL_UNSET_FAILED", sensor, e.toString()); failure = e }
+        }
+        cleanupEvidence("DISCONNECT_REQUEST", "ALL", "retainedTypes=${trackers.keys}")
+        try { backend.disconnect(); cleanupEvidence("DISCONNECT_RETURNED", "ALL") }
         catch (e: Exception) { cleanupEvidence("DISCONNECT_FAILED", "ALL", e.toString()); failure = e }
+        trackers.clear(); deliveries.clear()
+        cleanupEvidence("OWNER_CLOSED", "ALL", "failure=${failure?.toString().orEmpty()}")
         failure?.let { throw it }
     }
 }

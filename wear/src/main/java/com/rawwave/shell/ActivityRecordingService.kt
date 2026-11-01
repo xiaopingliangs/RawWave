@@ -41,7 +41,14 @@ class ActivityRecordingService : Service() {
     internal lateinit var writer: CaptureQueue
     internal var clock: () -> Long = { SystemClock.elapsedRealtime() }
     private val queued = AtomicInteger()
+    private val callbackAdmission = com.rawwave.core.CallbackAdmission()
     private var session: ActivityStore.Session? = null
+    private var persistence: com.rawwave.core.CapturePersistence? = null
+    internal var useDiskOwner = false
+    private fun appendRows(phase: String, sensor: String, rows: List<Map<String, Any?>>) {
+        persistence?.append(phase, sensor, rows) ?: session?.append(phase, sensor, rows)
+    }
+    private fun persistedCounts() = persistence?.counts() ?: session?.counts()
     private var adapter: SensorPort? = null
     private var lock: PowerManager.WakeLock? = null
     private var phase = "PRE-1"
@@ -66,11 +73,14 @@ class ActivityRecordingService : Service() {
     private var coreSources = SensorCatalog.defaultCoreSources()
     private var deadline = 0L
     private var sessionStartedMs = 0L
+    internal var terminalReason = ""; private set
     private var stopping = false
     private var draining: CaptureDrain? = null
     private var pendingFinish: Pair<String, Boolean>? = null
     private var incompleteTail = ""
     @Volatile private var destroyed = false
+    @Volatile private var taskRemoved = false
+    internal fun shouldStartFinishSync(sealed: Boolean) = sealed && !destroyed && !taskRemoved
     private val fatalPending = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private var started = false
     private var contact = false
@@ -99,6 +109,7 @@ class ActivityRecordingService : Service() {
             if (stopping || draining != null) return@guarded
             // Review is bounded too: keep the deadline runnable executing while the screen sleeps.
             renewCaptureLock()
+            persistence?.check()
             flush()
             running.filter { it != "SPO2" && it != "BIA" && it != "MF_BIA" }.forEach { sensor ->
                 if (clock() - (lastData[sensor] ?: 0) > 15_000 && silent.add(sensor)) {
@@ -148,7 +159,7 @@ class ActivityRecordingService : Service() {
     }
     override fun onBind(intent: Intent?) = null
     override fun onCreate() {
-        super.onCreate(); thread.start()
+        super.onCreate(); useDiskOwner = true; thread.start()
         val handler = Handler(thread.looper)
         writer = object : CaptureQueue {
             override fun post(action: Runnable) = handler.post(action)
@@ -179,7 +190,7 @@ class ActivityRecordingService : Service() {
                     val template = store.templates().single { it.id() == id }
                     beginSession(store.start(template, System.currentTimeMillis(), clock()),template,
                         CaptureAssembly.sensors(this, ::enqueue,
-                            template.ecg() || template.spo2() || template.bia() || template.coreSources().any { it != "GYROSCOPE" && it != "PRESSURE" && it != "MAGNETIC_FIELD" }, template.biaProfile()))
+                            template.ecg() || template.spo2() || template.bia() || template.coreSources().any { it != "GYROSCOPE" && it != "PRESSURE" && it != "MAGNETIC_FIELD" }, template.biaProfile(), ::enqueueRows))
                 } }
             } catch (e: Exception) { writer.post { fail(e) } }
         } else if (started) {
@@ -190,7 +201,9 @@ class ActivityRecordingService : Service() {
     /** Runs on the serial owner after platform permission/foreground setup. Also the host-test seam. */
     internal fun beginSession(value: ActivityStore.Session, template: ActivityStore.Template, sensors: SensorPort) {
         check(session == null && !destroyed && !stopping) { "CAPTURE_SESSION_ALREADY_USED" }
-        session = value; ecg = template.ecg(); coreSources = template.coreSources().toList()
+        session = value
+        if (useDiskOwner) persistence = com.rawwave.core.CapturePersistence(value)
+        ecg = template.ecg(); coreSources = template.coreSources().toList()
         spo2 = template.spo2(); bia = template.bia(); bodySource=if(template.mfBia()) "MF_BIA" else "BIA"
         sessionStartedMs = clock()
         event("CAPTURE_START", "build=${BuildConfig.BUILD_RUN}; template=${template.id()}")
@@ -256,6 +269,22 @@ class ActivityRecordingService : Service() {
                     "SKIP_ECG" -> if (shortSensor == "ECG" && (phase.startsWith("REVIEW_") || phase.startsWith("PRE") || phase.startsWith("POST"))) skipEcg()
                 }
             } }
+    }
+    // Raw payloads use a retained-size budget; controls keep their separate small bound.
+    // Both post to the SAME owner FIFO, preserving data/flush/stop ordering.
+    internal fun enqueueRows(rows: List<Map<String, Any?>>, action: () -> Unit) {
+        val lease = callbackAdmission.reserve(rows)
+        if (lease == null) {
+            fatalPending.compareAndSet(null,"CALLBACK_PAYLOAD_LIMIT_UNCOMMITTED_TAIL_UNKNOWN")
+            if (overflow.compareAndSet(false, true)) writer.post { guarded { finish(fatalPending.get()!!) } }
+            return
+        }
+        if (!writer.post {
+            try { if (!stopping) guarded(action) } finally { lease.close() }
+        }) {
+            lease.close()
+            fatalPending.compareAndSet(null,"CALLBACK_OWNER_CLOSED_TAIL_UNKNOWN")
+        }
     }
     internal fun enqueue(action: () -> Unit) {
         if (queued.incrementAndGet() > 256) {
@@ -401,7 +430,7 @@ class ActivityRecordingService : Service() {
         adapter!!.start(sensor, { rows ->
             if (phase != origin || !captureRuns.current(run)) {
                 // Preserve late delivered samples under their originating phase, never relabel them.
-                session?.append(origin, sensor, rows)
+                appendRows(origin, sensor, rows)
                 event("LATE_CALLBACK_SAVED", "$origin/$sensor:${rows.size}")
             } else {
                 if (rows.isNotEmpty()) {
@@ -637,8 +666,10 @@ class ActivityRecordingService : Service() {
         drain.persist({
             // Data callbacks preceding each completion have already run on this writer.
             stopSources()
+            persistence?.barrier()
             flush()
-            event("DRAIN_ROWS_PERSISTED", "phase=$phase; counts=${session?.counts()}; sourceFailures=${drain.failures()}; SDK atomic stop not guaranteed")
+            persistence?.barrier()
+            event("DRAIN_ROWS_PERSISTED", "phase=$phase; counts=${persistedCounts()}; sourceFailures=${drain.failures()}; SDK atomic stop not guaranteed")
         }, { failure ->
         draining = null
         val terminal = pendingFinish
@@ -665,7 +696,7 @@ class ActivityRecordingService : Service() {
         }
     }
     private fun flush() {
-        buffers.forEach { (sensor, rows) -> if (rows.isNotEmpty()) { session!!.append(streamPhase(), sensor, rows); rows.clear() } }
+        buffers.forEach { (sensor, rows) -> if (rows.isNotEmpty()) { appendRows(streamPhase(), sensor, rows); rows.clear() } }
     }
     private fun streamPhase() = when (phase) {
         "ARM_BIA_PRE", "CONNECTING", "READY_BIA_PRE", "READY_SPO2_PRE", "RESTORE_PRE" -> "PRE-1"
@@ -676,9 +707,12 @@ class ActivityRecordingService : Service() {
         else -> phase
     }
     private fun event(kind: String, detail: String) {
-        session?.append(streamPhase(), "EVENT", listOf(mapOf("kind" to kind, "detail" to detail,
+        appendRows(streamPhase(), "EVENT", listOf(mapOf("kind" to kind, "detail" to detail,
             "utcMs" to System.currentTimeMillis(), "elapsedMs" to clock())))
-        (application as? ProbeApplication)?.journal?.event("CAPTURE_$kind", mapOf("session" to (session?.id ?: "none"), "detail" to detail))
+        (application as? ProbeApplication)?.journal?.let { journal ->
+            val fields=mapOf("session" to (session?.id ?: "none"), "detail" to detail)
+            persistence?.journalEvent(journal,"CAPTURE_$kind",fields) ?: journal.event("CAPTURE_$kind",fields)
+        }
     }
     private fun publish() {
         val count = countText()
@@ -712,7 +746,7 @@ class ActivityRecordingService : Service() {
         state = next; main.post { observer?.invoke(next) }
     }
     private fun countText(): String {
-        val raw = session?.counts()?.filterKeys { !it.endsWith("/EVENT") && !it.endsWith("/SPO2") && !it.endsWith("/BIA") && !it.endsWith("/MF_BIA") }
+        val raw = persistedCounts()?.filterKeys { !it.endsWith("/EVENT") && !it.endsWith("/SPO2") && !it.endsWith("/BIA") && !it.endsWith("/MF_BIA") }
             ?.entries?.sortedBy { it.key }?.map {
                 val phaseName = when { it.key.startsWith("PRE") -> "活动前"; it.key.startsWith("POST") -> "活动后"; else -> "活动中" }
                 "$phaseName ${sensorLabel(it.key.substringAfter('/'))}：${it.value} 条原始记录"
@@ -774,12 +808,23 @@ class ActivityRecordingService : Service() {
         try { adapter?.close() } catch (e: Exception) { result += ";CLEANUP_FAILURE:${e.message}" }
         var sealed = false
         try {
+            // Sensors are stopped: empty the admitted disk backlog before submitting
+            // the final in-memory buffers, including after a backlog-limit failure.
+            persistence?.barrier()
             flush()
-            event("SESSION_END", "$result; counts=${session?.counts()}; SDK undelivered tail unknown; no zero-loss claim")
+            persistence?.barrier()
+            val diskEvidence = persistence?.evidence()
+            if (diskEvidence?.get("journalFailure")?.toString()?.isNotEmpty() == true)
+                result += ";DIAGNOSTIC_JOURNAL_FAILED"
+            event("PERSISTENCE_SUMMARY", diskEvidence.toString())
+            event("SESSION_END", "$result; counts=${persistedCounts()}; SDK undelivered tail unknown; no zero-loss claim")
+            persistence?.barrier()
             checkNotNull(session) { "NO_CAPTURE_SESSION" }.seal(result, System.currentTimeMillis())
             sealed = true
         }
         catch (e: Exception) { result += ";NOT_SEALED:${e.message};已有块保留" }
+        terminalReason = result
+        persistence?.close()
         try { lock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { result += ";LOCK_RELEASE_FAILURE:${e.message}" }
         if (destroyed) writer.close()
         if (idleExit) {
@@ -810,14 +855,16 @@ class ActivityRecordingService : Service() {
         state = preparing
         main.post {
             observer?.invoke(preparing)
-            // End the sensor foreground-service lifecycle before opening the separate bounded sync owner.
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            // Request the bounded sync owner while capture still has foreground eligibility.
             val app = application as ProbeApplication
             val ownerBefore = app.activeSyncOwner.orEmpty()
-            val syncStarted = sealed && !destroyed && app.startWatchActivitySync(ActivitySyncPolicy.CAPTURE_FINISHED)
+            // Establish the sync foreground-service owner before relinquishing capture's
+            // foreground eligibility. Sensors have already been stopped above.
+            val syncStarted = shouldStartFinishSync(sealed) && app.startWatchActivitySync(ActivitySyncPolicy.CAPTURE_FINISHED)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
             try { app.journal?.event("ACTIVITY_CAPTURE_FINISH_SYNC_DECISION", mapOf(
-                "sealed" to sealed,"started" to syncStarted,"activeOwnerBefore" to ownerBefore,
+                "sealed" to sealed,"started" to syncStarted,"taskRemoved" to taskRemoved,"activeOwnerBefore" to ownerBefore,
                 "trigger" to ActivitySyncPolicy.CAPTURE_FINISHED)) } catch (_: Exception) {}
             val syncText = if (syncStarted) "正在同步活动原始数据到手机；成功后立即停止，失败也不会自动重试。"
                 else "自动同步没有启动；数据仍保留，下次打开原波可补同步。"
@@ -825,6 +872,13 @@ class ActivityRecordingService : Service() {
             state = next
             observer?.invoke(next)
         }
+    }
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Explicit removal from Recents ends acquisition; screen-off/onStop does not.
+        taskRemoved = true
+        command("CANCEL")
+        (application as? ProbeApplication)?.requestStopBackgroundSync("WATCH_TASK_REMOVED")
+        super.onTaskRemoved(rootIntent)
     }
     override fun onDestroy() {
         destroyed = true

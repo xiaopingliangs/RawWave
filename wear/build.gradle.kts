@@ -6,8 +6,8 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 57
-        versionName = "0.8.2-eda-end-boundary"
+        versionCode = 60
+        versionName = "0.8.5-capture-handoff"
         buildConfigField("String", "DEVICE_ROLE", "\"watch\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))
@@ -29,6 +29,7 @@ android {
     }
 }
 dependencies {
+    testImplementation("com.google.code.gson:gson:2.11.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     implementation(files("libs/samsung-health-sensor-api-1.4.1.aar"))

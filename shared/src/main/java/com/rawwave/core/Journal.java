@@ -86,9 +86,13 @@ public final class Journal {
     public synchronized Map<String, byte[]> snapshot() throws IOException {
         Map<String, byte[]> files = new TreeMap<>();
         for (String name : List.of("events.jsonl", "events.previous.jsonl", "process.json",
-                "previous-process.json", "rotation.json", "first-fault.json", "last-fault.json")) {
+                "previous-process.json", "rotation.json", "first-fault.json", "last-fault.json", "sensor-sdk-logcat.txt", "sensor-sdk-logcat.previous.txt")) {
             File file = new File(directory, name);
             if (file.isFile()) files.put(role + "/" + name, Files.readAllBytes(file.toPath()));
+        }
+        File[] sdkLogs = directory.listFiles((dir, name) -> name.matches("sensor-sdk-[0-9a-f-]{36}\\.txt"));
+        if (sdkLogs != null) for (File file : sdkLogs) {
+            if (file.isFile()) files.put(role + "/" + file.getName(), Files.readAllBytes(file.toPath()));
         }
         return files;
     }

@@ -262,16 +262,19 @@ class ActivityTransferWindow(
     }
     private fun complete(success: Boolean,text: String) {
         if(!attemptState.close()) return
-        cleanup(); finished(success,text)
+        val cleanupFailure=cleanup()
+        finished(success && cleanupFailure == null, if(cleanupFailure == null) text else
+            "同步资源清理异常；数据保留，请查看问题报告。${cleanupFailure.javaClass.simpleName}")
     }
     fun cancel() {
         if(!attemptState.close()) return
         cleanup()
     }
-    private fun cleanup() {
+    private fun cleanup(): RuntimeException? {
         registered=false
         ready.countDown(); committed.countDown(); confirmed.countDown()
-        transport.close()
-        executor.shutdownNow()
+        val error=com.rawwave.core.TransferCleanup.run({transport.close()},{executor.shutdownNow()})
+        if(error != null) try {app.journal?.fault("ACTIVITY_TRANSFER_CLEANUP_FAILED",error)} catch(_:Exception) {}
+        return error
     }
 }

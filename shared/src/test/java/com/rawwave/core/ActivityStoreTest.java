@@ -11,6 +11,18 @@ public class ActivityStoreTest {
     private Map<String,Object> eda(long stamp,long utc,long elapsed) {
         return Map.of("sdkTimestamp",stamp,"receivedUtcMs",utc,"receivedElapsedMs",elapsed);
     }
+    @Test public void queuedPreCutoffReceiptCanEstablishEdaBoundary() {
+        var gate=new EdaEndBoundary();
+        gate.arm(2500,1500);
+        assertFalse(gate.observe(List.of(eda(2000,2100,1100))));
+        assertTrue(gate.observe(List.of(eda(3000,3100,2100))));
+    }
+    @Test public void queuedPreCutoffReceiptStillRejectsClockDiscontinuity() {
+        var gate=new EdaEndBoundary();
+        gate.arm(2500,1500);
+        assertFalse(gate.observe(List.of(eda(2000,2100,500))));
+        assertFalse(gate.observe(List.of(eda(3000,3100,2100))));
+    }
     @Test public void replayCode55RealEdaTailWithoutFlushCallback() {
         var gate=new EdaEndBoundary();
         gate.observe(List.of(eda(1793173128269L,1793173128434L,641246L)));

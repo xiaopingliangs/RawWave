@@ -6,8 +6,8 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 57
-        versionName = "0.8.2-eda-end-boundary"
+        versionCode = 60
+        versionName = "0.8.5-capture-handoff"
         buildConfigField("String", "DEVICE_ROLE", "\"phone\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))

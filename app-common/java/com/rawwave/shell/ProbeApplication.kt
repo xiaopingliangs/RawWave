@@ -41,7 +41,7 @@ class ProbeApplication : Application() {
         val normalized = ActivitySyncPolicy.normalize(trigger)
         activitySyncAttemptGuard.markStarted(normalized)
         WatchActivitySyncSession(this, normalized).also { activeWatchActivitySync = it; it.start() }
-        return true
+        return activeWatchActivitySync != null && activitySyncStatus.running
     }
 
     fun requestStopBackgroundSync(reason: String) {

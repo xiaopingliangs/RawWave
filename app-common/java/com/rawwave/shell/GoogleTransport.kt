@@ -64,10 +64,10 @@ class GoogleTransport(context: Context, evidence: (String,String) -> Unit) : Tra
             .thenApply { handle(it) }
     }
     override fun input(channel: TransportPort.Channel): CompletableFuture<java.io.InputStream> {
-        live(); return future(channels.getInputStream(native(channel)))
+        live(); return future(resources.pendingStream(channels.getInputStream(native(channel)),"input-stream"))
     }
     override fun output(channel: TransportPort.Channel): CompletableFuture<java.io.OutputStream> {
-        live(); return future(channels.getOutputStream(native(channel)))
+        live(); return future(resources.pendingStream(channels.getOutputStream(native(channel)),"output-stream"))
     }
     override fun adopt(channel: TransportPort.Channel) {
         val native = native(channel)

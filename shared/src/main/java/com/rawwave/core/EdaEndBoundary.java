@@ -18,7 +18,7 @@ public final class EdaEndBoundary {
                 || !(row.get("receivedElapsedMs") instanceof Number e)) { invalid=true; continue; }
             long stamp=t.longValue(), utc=u.longValue(), mono=e.longValue();
             if (stamp<=0 || stamp>utc+100 || (previous>=0 && stamp<=previous)) invalid=true;
-            if (armed && (mono<elapsed || Math.abs((utc-cutoff)-(mono-elapsed))>100)) invalid=true;
+            if (armed && (Math.abs((utc-cutoff)-(mono-elapsed))>100)) invalid=true;
             if (armed && !invalid && previous>=0 && previous<=cutoff && stamp>=cutoff
                 && stamp>previous && stamp-previous<=1250) covered=true;
             previous=stamp;

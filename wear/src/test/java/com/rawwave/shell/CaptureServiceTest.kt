@@ -172,20 +172,21 @@ class CaptureServiceTest {
         }
         override fun stop(sensor:String){stops.add(sensor)}
         override fun close(){closes++}
-        fun emit(sensor:String,data:List<Map<String,Any>>) {val receiver=rows.getValue(sensor);owner.enqueue {receiver.accept(data)}}
+        fun emit(sensor:String,data:List<Map<String,Any?>>) {val receiver=rows.getValue(sensor);owner.enqueueRows(data) {receiver.accept(data)}}
         fun ack(sensor:String, status:SensorPort.DrainStatus?=null) {
             val done=drains.remove(sensor) ?: error("no pending drain")
             owner.enqueue {done.accept(status ?: if(sensor=="MF_BIA" || sensor=="BIA" || sensor=="ECG" || sensor=="SPO2")SensorPort.DrainStatus.DELIVERED_ONLY else SensorPort.DrainStatus.FLUSHED,"fake ack")}
         }
     }
-    private inner class Rig(ecg:Boolean=false,autoRun:Boolean=true,spo2:Boolean=false,bia:Boolean=false,mf:Boolean=false,sources:List<String> = listOf("HEART_RATE","PPG")) {
+    private inner class Rig(ecg:Boolean=false,autoRun:Boolean=true,diskOwner:Boolean=false,spo2:Boolean=false,bia:Boolean=false,mf:Boolean=false,sources:List<String> = listOf("HEART_RATE","PPG")) {
         val queue=Queue();val service=ActivityRecordingService();val sensors=Sensors(service)
-        var failDisk=false
-        val store=ActivityStore(temp.newFolder()){if(failDisk)throw IOException("injected disk failure")}
+        @Volatile var failDisk=false
+        @Volatile var diskHook: (() -> Unit)? = null
+        val store=ActivityStore(temp.newFolder()){diskHook?.invoke();if(failDisk)throw IOException("injected disk failure")}
         val template=store.createTemplate("宿主收尾",ecg,sources,spo2,if(bia)BiaProfile(170f,65f,30,1)else null,mf)
         val session=store.start(template,1000,1)
         init {
-            service.writer=queue;service.clock={queue.now}
+            service.writer=queue;service.clock={queue.now};service.useDiskOwner=diskOwner
             service.beginSession(session,template,sensors)
             if(autoRun)queue.runReady()
         }
@@ -202,6 +203,202 @@ class CaptureServiceTest {
             }
             assertEquals("DRAINING",ActivityRecordingService.state.phase)
         }
+    }
+    @Test fun slowDiskWithEightSourcesDoesNotBlockCaptureOrLoseAcceptedSamples() {
+        val sources=listOf("HEART_RATE","PPG","ACCELEROMETER","EDA","SKIN_TEMPERATURE","GYROSCOPE","PRESSURE","MAGNETIC_FIELD")
+        val r=Rig(diskOwner=true,sources=sources)
+        val entered=java.util.concurrent.CountDownLatch(1)
+        val release=java.util.concurrent.CountDownLatch(1)
+        r.diskHook={ entered.countDown();check(release.await(10,java.util.concurrent.TimeUnit.SECONDS)) }
+        try {
+            r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to -7)))
+            r.queue.runReady();r.queue.advance(1000)
+            assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS))
+            repeat(20) { burst ->
+                repeat(25) { sample -> sources.forEach { sensor ->
+                    r.sensors.emit(sensor,listOf(mapOf("sdkTimestamp" to (2000L+burst*1000+sample),"STATUS" to -1,"rawFixtureValue" to sample)))
+                } }
+                r.queue.runReady();r.queue.advance(1000)
+                assertTrue(ActivityRecordingService.state.active)
+            }
+        } finally {release.countDown();r.diskHook=null}
+        r.end();sources.forEach {r.sensors.ack(it)};r.queue.runReady()
+        assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
+        sources.forEach {assertEquals(if(it=="PPG")501L else 500L,r.session.counts()["CORE-1/$it"])}
+        val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
+        assertTrue(ActivityArchive.verify(batch.file()).allSealed())
+    }
+    /** Opt-in private corpus: never embeds health records in source or test reports.
+     * Replays saved CORE rows, not SDK/hardware or missing uncommitted tails. */
+    @Test fun privateThreeActivityCorpusPreservesEverySavedCoreField() {
+        val input=System.getenv("RAWWAVE_REPLAY_INPUT")
+        org.junit.Assume.assumeTrue("Private corpus not configured",!input.isNullOrBlank())
+        val files=File(input!!).listFiles()!!.filter { it.name.startsWith("RawWave-activities-2026-10-30_") && it.extension=="zip" }.sortedBy {it.name}
+        assertEquals("Expected the three supplied activity archives",3,files.size)
+        val gson=com.google.gson.GsonBuilder().serializeNulls()
+            .setObjectToNumberStrategy(com.google.gson.ToNumberPolicy.LONG_OR_DOUBLE).create()
+        fun canonical(e:com.google.gson.JsonElement):String = when {
+            e.isJsonNull -> "null"
+            e.isJsonObject -> e.asJsonObject.entrySet().sortedBy {it.key}.joinToString(",","{","}") {gson.toJson(it.key)+":"+canonical(it.value)}
+            e.isJsonArray -> e.asJsonArray.joinToString(",","[","]") {canonical(it)}
+            e.asJsonPrimitive.isNumber -> java.math.BigDecimal(e.asString).stripTrailingZeros().toPlainString()
+            else -> gson.toJson(e)
+        }
+        fun digest()=java.security.MessageDigest.getInstance("SHA-256")
+        fun feed(d:java.security.MessageDigest,e:com.google.gson.JsonElement) {d.update((canonical(e)+"\n").toByteArray(Charsets.UTF_8))}
+        val rowType=object:com.google.gson.reflect.TypeToken<List<Map<String,Any?>>>(){}.type
+        files.forEach { archive ->
+            val rowsBySensor=linkedMapOf<String,MutableList<com.google.gson.JsonElement>>()
+            java.util.zip.ZipFile(archive).use { zip ->
+                zip.entries().asSequence().filter {it.name.contains("-CORE-1-") && !it.name.endsWith("-EVENT.json")}.sortedBy {it.name}.forEach {entry ->
+                    val block=zip.getInputStream(entry).reader().use {com.google.gson.JsonParser.parseReader(it).asJsonObject}
+                    rowsBySensor.getOrPut(block["sensor"].asString){mutableListOf()}.addAll(block["samples"].asJsonArray.toList())
+                }
+            }
+            if(archive.name.contains("11-59-15")) {
+                val cutoff=1793334551466L;val mono=93967374L
+                val boundary=EdaEndBoundary()
+                val eda=rowsBySensor.getValue("EDA")
+                // Model the last pre-cutoff callback waiting on the owner when drain arms.
+                val queued=eda.indexOfLast {it.asJsonObject["receivedUtcMs"].asLong<=cutoff}
+                assertTrue(queued>=0)
+                var covered=false
+                eda.forEachIndexed {index,row ->
+                    if(index==queued)boundary.arm(cutoff,mono)
+                    val values:List<Map<String,Any?>> = gson.fromJson(gson.toJson(listOf(row)),rowType)
+                    covered=boundary.observe(values) || covered
+                }
+                assertTrue("Actual saved EDA covers the stop boundary even with a queued pre-cutoff callback",covered)
+                println("PRIVATE_EDA_BOUNDARY savedRows=${eda.size} queuedPreCutoffScenarioCovered=true;notSdkFlushAck=true")
+            }
+            assertTrue(rowsBySensor.isNotEmpty())
+            val expected=rowsBySensor.mapValues {(_,rows)->digest().also {d->rows.forEach {feed(d,it)}}.digest()}
+            val batches=mutableListOf<Pair<String,List<com.google.gson.JsonElement>>>()
+            rowsBySensor.forEach { (sensor,rows) ->
+                var batch=mutableListOf<com.google.gson.JsonElement>();var key:String?=null
+                rows.forEach { row ->
+                    val obj=row.asJsonObject
+                    val next=obj["captureCallbackSequence"]?.toString() ?: obj["sensorTimestampNs"]?.toString() ?: obj["sdkTimestamp"].toString()
+                    if(key!=next && batch.isNotEmpty()){batches.add(sensor to batch);batch=mutableListOf()}
+                    key=next;batch.add(row)
+                }
+                if(batch.isNotEmpty())batches.add(sensor to batch)
+            }
+            batches.sortBy {it.second.first().asJsonObject["receivedElapsedMs"]?.asLong ?: 0L}
+            val r=Rig(diskOwner=true,sources=rowsBySensor.keys.toList())
+            var pendingRows=0;var pendingBatches=0;var submittedRows=0L
+            fun pump() {
+                r.queue.runReady()
+                // Offline replay is faster than acquisition. Bound the replay lead over
+                // disk, while still exercising 500 pending callback bursts. No production throttling.
+                val deadline=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(30)
+                while(r.session.counts().filterKeys {it!="CORE-1/EVENT"}.values.sum()<submittedRows-8000) {
+                    assertTrue("Replay stopped: "+r.service.terminalReason,ActivityRecordingService.state.active)
+                    assertTrue("Replay disk catch-up timeout",System.nanoTime()<deadline)
+                    Thread.sleep(2)
+                }
+            }
+            batches.forEach { (sensor,rows) ->
+                if(pendingRows+rows.size>4000 || pendingBatches>=500) {pump();pendingRows=0;pendingBatches=0}
+                val values:List<Map<String,Any?>> = gson.fromJson(gson.toJson(rows),rowType)
+                r.sensors.emit(sensor,values);pendingRows+=rows.size;pendingBatches++;submittedRows+=rows.size
+            }
+            r.end();rowsBySensor.keys.forEach {r.sensors.ack(it)};r.queue.runReady()
+            assertTrue("Corpus activity must seal: "+r.service.terminalReason,r.seal().exists());assertEquals(1,r.sensors.closes)
+            val actual=rowsBySensor.keys.associateWith {digest()}
+            r.session.folder.listFiles()!!.filter {it.name.contains("-CORE-1-") && !it.name.endsWith("-EVENT.json")}.sortedBy {it.name}.forEach {file ->
+                val block=file.reader().use {com.google.gson.JsonParser.parseReader(it).asJsonObject}
+                block["samples"].asJsonArray.forEach {feed(actual.getValue(block["sensor"].asString),it)}
+            }
+            rowsBySensor.forEach { (sensor,rows) ->
+                assertEquals("Saved row count: $sensor",rows.size.toLong(),r.session.counts()["CORE-1/$sensor"])
+                assertArrayEquals("Every original field and per-source order: $sensor",expected.getValue(sensor),actual.getValue(sensor).digest())
+            }
+            println("PRIVATE_CORE_REPLAY rows=${rowsBySensor.values.sumOf {it.size}} callbacks=${batches.size} sources=${rowsBySensor.size} allFieldsAndOrderMatch=true")
+        }
+    }
+    @Test fun backlogLimitStopsButRecoverySavesAlreadyBufferedRows() {
+        val r=Rig(diskOwner=true,sources=listOf("PPG"))
+        val entered=java.util.concurrent.CountDownLatch(1)
+        val release=java.util.concurrent.CountDownLatch(1)
+        r.diskHook={entered.countDown();check(release.await(30,java.util.concurrent.TimeUnit.SECONDS))}
+        val value="x".repeat(8192)
+        var submitted=0L
+        try {
+            while(ActivityRecordingService.state.phase=="CORE-1" && submitted<5000) {
+                r.sensors.emit("PPG",List(50){mapOf("sdkTimestamp" to submitted+it,"PPG_GREEN" to -1,"rawFixture" to value)})
+                submitted+=50;r.queue.runReady()
+            }
+            assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals("DRAINING",ActivityRecordingService.state.phase)
+        } finally {release.countDown();r.diskHook=null}
+        r.sensors.ack("PPG");r.queue.runReady()
+        assertTrue(r.service.terminalReason,r.seal().exists())
+        assertTrue(r.service.terminalReason.contains("PERSISTENCE_BACKLOG_LIMIT"))
+        assertFalse(r.service.terminalReason.contains("NOT_SEALED"))
+        assertEquals(submitted,r.session.counts()["CORE-1/PPG"])
+        assertEquals(1,r.sensors.closes)
+    }
+    @Test fun removingTaskDuringFinalDrainSuppressesNewSyncAfterSeal() {
+        val r=Rig(diskOwner=true)
+        r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to -1)));r.queue.runReady()
+        r.end();r.service.onTaskRemoved(null);r.queue.runReady()
+        r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
+        assertEquals(1L,r.session.counts()["CORE-1/PPG"])
+        assertFalse(r.service.shouldStartFinishSync(true))
+    }
+    @Test fun normalCompletionCanSyncButUnsealedDataCannot() {
+        val r=Rig(diskOwner=true)
+        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertTrue(r.seal().exists());assertTrue(r.service.shouldStartFinishSync(true))
+        assertFalse(r.service.shouldStartFinishSync(false))
+        // Also covers task removal after the owner queued the main-thread handoff.
+        r.service.onTaskRemoved(null)
+        assertFalse(r.service.shouldStartFinishSync(true))
+    }
+    @Test fun thousandQueuedRawCallbacksSurviveOld256LimitAndDrainInOrder() {
+        val r=Rig(diskOwner=true)
+        repeat(1000) { n -> r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to n.toLong(),"PPG_GREEN" to -n))) }
+        // END is queued behind all samples, with no owner execution during admission.
+        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertTrue(r.seal().exists());assertEquals(1000L,r.session.counts()["CORE-1/PPG"])
+        assertEquals(1,r.sensors.closes)
+        val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
+        assertTrue(ActivityArchive.verify(batch.file()).allSealed())
+    }
+    @Test fun eightSourceBurstsUseProductionDiskOwnerAndSealEveryAcceptedRow() {
+        val sources=listOf("HEART_RATE","PPG","ACCELEROMETER","EDA","SKIN_TEMPERATURE","GYROSCOPE","PRESSURE","MAGNETIC_FIELD")
+        val r=Rig(diskOwner=true,sources=sources)
+        repeat(100) { burst ->
+            // 200 callbacks per burst; all sources share the actual capture service FIFO.
+            repeat(25) { sample -> sources.forEach { sensor ->
+                r.sensors.emit(sensor,listOf(mapOf("sdkTimestamp" to (burst*1000L+sample),"STATUS" to -1,"rawFixtureValue" to sample)))
+            } }
+            r.queue.runReady();r.queue.advance(1000)
+            assertTrue(ActivityRecordingService.state.active)
+        }
+        r.end();sources.forEach {r.sensors.ack(it)};r.queue.runReady()
+        assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
+        sources.forEach {assertEquals(2500L,r.session.counts()["CORE-1/$it"])}
+        val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
+        assertTrue(ActivityArchive.verify(batch.file()).allSealed())
+    }
+    @Test fun asyncDiskFailureClosesSensorsAndCannotSeal() {
+        val r=Rig(diskOwner=true)
+        r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to 12)))
+        r.queue.runReady();r.failDisk=true
+        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertFalse(r.seal().exists());assertEquals(1,r.sensors.closes)
+        assertFalse(ActivityRecordingService.state.active)
+    }
+    @Test fun removingTaskStopsAsyncCaptureAndNeverStartsPostMeasurement() {
+        val r=Rig(diskOwner=true)
+        r.service.onTaskRemoved(null);r.queue.runReady()
+        r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertEquals(1,r.sensors.closes);assertTrue(r.seal().exists())
+        assertFalse(ActivityRecordingService.state.active)
+        assertTrue(r.seal().readText().contains("USER_INTERRUPTED"))
     }
     @Test fun coreEndWaitsForBothSourcesAndPersistsQueuedTail() {
         val r=Rig();r.end();r.service.command("END");r.queue.runReady()

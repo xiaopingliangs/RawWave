@@ -94,9 +94,11 @@ public final class ActivityArchive {
                 long bytes = 0; int count;
                 while ((count = zip.read(buffer)) != -1) {
                     bytes += count; total += count;
-                    long metadataLimit = name.equals("bundle.json") ? 1024L * 1024 : 8L * 1024 * 1024;
-                    if (total > MAX_UNCOMPRESSED_BYTES || (captured != null && bytes > metadataLimit))
+                    long metadataLimit = name.equals("bundle.json") ? 16L * 1024 * 1024 : 8L * 1024 * 1024;
+                    if (total > MAX_UNCOMPRESSED_BYTES)
                         throw new IOException("ACTIVITY_ARCHIVE_EXPANSION_LIMIT");
+                    if (captured != null && bytes > metadataLimit)
+                        throw new IOException("ACTIVITY_METADATA_LIMIT:" + name + ":" + bytes);
                     digest.update(buffer, 0, count);
                     if (captured != null) captured.write(buffer, 0, count);
                 }
