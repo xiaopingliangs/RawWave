@@ -10,14 +10,37 @@ public final class RunDeadlines {
     private final LongSupplier clock;
     private final EnumMap<Kind, Long> deadlines = new EnumMap<>(Kind.class);
     private boolean closed;
+    /** True while a bounded transfer owns the app; the UI idle countdown is suspended. */
+    private boolean idleHeld;
     public RunDeadlines(LongSupplier clock) { this.clock = Objects.requireNonNull(clock); }
     public long now() { return clock.getAsLong(); }
     /** No work survives an idle background page. Background time still counts toward
      * the existing absolute idle deadline; returning is not itself an interaction. */
     public boolean resumeIdle(long budgetMs) {
         if (closed || deadlines.keySet().stream().anyMatch(k -> k != Kind.IDLE)) return false;
+        if (idleHeld) return true;
         if (deadlines.isEmpty()) put(Kind.IDLE, budgetMs);
         return expired() == null;
+    }
+    /**
+     * Suspend the idle countdown while a transfer is genuinely active. Holding never
+     * forgives an expired operation deadline and never replaces TRANSFER/EXPORT.
+     */
+    public boolean holdIdle() {
+        if (closed) return false;
+        if (idleHeld) return true;
+        if (expired() != null) return false;
+        if (deadlines.keySet().stream().anyMatch(k -> k != Kind.IDLE)) return false;
+        idleHeld = true;
+        deadlines.remove(Kind.IDLE);
+        return true;
+    }
+    /** Re-arm one fresh idle window after the transfer ends; no-op if not held. */
+    public boolean releaseIdle(long budgetMs) {
+        if (closed || !idleHeld) return false;
+        idleHeld = false;
+        if (deadlines.isEmpty()) put(Kind.IDLE, budgetMs);
+        return true;
     }
     public Map<Kind, Long> snapshot() { return Map.copyOf(deadlines); }
     public Due expired() {
@@ -28,13 +51,14 @@ public final class RunDeadlines {
     }
     /** Interaction cannot forgive an expired window, or extend an operation deadline. */
     public boolean touchIdle(long budgetMs) {
-        if (closed || expired() != null || deadlines.keySet().stream().anyMatch(k -> k != Kind.IDLE)) return false;
+        if (closed || idleHeld || expired() != null || deadlines.keySet().stream().anyMatch(k -> k != Kind.IDLE)) return false;
         put(Kind.IDLE, budgetMs); return true;
     }
     public boolean begin(Kind kind, long budgetMs) {
         if (kind == Kind.IDLE) throw new IllegalArgumentException("USE_TOUCH_IDLE");
         if (closed || expired() != null) return false;
         long end = Math.addExact(now(), positive(budgetMs));
+        idleHeld = false;
         deadlines.remove(Kind.IDLE);
         // Repeated callbacks cannot renew an existing operation's budget.
         deadlines.merge(kind, end, Math::min);
@@ -43,20 +67,20 @@ public final class RunDeadlines {
     public boolean finishExport(long idleBudgetMs) {
         if (closed || expired() != null) return false;
         deadlines.remove(Kind.EXPORT);
-        if (deadlines.isEmpty()) put(Kind.IDLE, idleBudgetMs);
+        if (deadlines.isEmpty() && !idleHeld) put(Kind.IDLE, idleBudgetMs);
         return true;
     }
     public boolean finishTransfer(long idleBudgetMs) {
         if (closed || expired() != null) return false;
         deadlines.remove(Kind.TRANSFER);
-        if (deadlines.isEmpty()) put(Kind.IDLE, idleBudgetMs);
+        if (deadlines.isEmpty() && !idleHeld) put(Kind.IDLE, idleBudgetMs);
         return true;
     }
     public long delayMs() {
         if (closed || deadlines.isEmpty()) return Long.MAX_VALUE;
         return Math.max(0, Collections.min(deadlines.values()) - now());
     }
-    public void close() { closed = true; deadlines.clear(); }
+    public void close() { closed = true; idleHeld = false; deadlines.clear(); }
     private void put(Kind kind, long budgetMs) { deadlines.put(kind, Math.addExact(now(), positive(budgetMs))); }
     private long positive(long budgetMs) {
         if (budgetMs <= 0) throw new IllegalArgumentException("INVALID_BUDGET");

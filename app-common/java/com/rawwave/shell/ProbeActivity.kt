@@ -36,13 +36,20 @@ class ProbeActivity : ComponentActivity() {
     }
     private val activitySyncObserver: (ProbeApplication.ActivitySyncStatus) -> Unit = { sync ->
         if (!exiting && ::status.isInitialized) status.text = sync.text
+        if (!exiting && transfer == null) {
+            if (sync.running) holdIdleForActivitySync() else releaseIdleForActivitySync()
+        }
     }
-    private var runtime = DeadlineRuntime { reason, evidence -> exitNow(reason, force = true, deadlineEvidence = evidence) }
+    private val activityIdleHold: () -> Boolean = { holdIdleForActivitySync() }
+    private val activityIdleRelease: () -> Boolean = { releaseIdleForActivitySync() }
+    private var runtime = DeadlineRuntime { reason, evidence -> onIdleDeadline(reason, evidence) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         app.syncFinished = syncObserver
         app.activitySyncObserver = activitySyncObserver
+        app.activityIdleHold = activityIdleHold
+        app.activityIdleRelease = activityIdleRelease
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { exitNow("USER_BACK") }
         })
@@ -80,15 +87,6 @@ class ProbeActivity : ComponentActivity() {
             if (!working && app.activeSyncOwner == null) {
                 try { startActivity(android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
                 catch (error: Exception) { status.text = "请在系统应用设置中查看原波的电池/后台限制。当前设备没有提供此设置入口。" }
-            }
-        }
-        button("记录测试错误") {
-            if (!working) {
-                try {
-                    val journal = app.journal ?: error("诊断未初始化，不能声称测试错误已经保存")
-                    journal.fault("TEST_FIXTURE_USER_REQUEST", IllegalStateException("用户主动触发的 G1 测试错误，不是采集故障"))
-                    status.text = "已记录明确标注的测试错误，请导出报告核对。"
-                } catch (failure: Exception) { showError(failure) }
             }
         }
         button("退出（停止所有工作）") { exitNow("USER_EXIT") }
@@ -173,6 +171,45 @@ class ProbeActivity : ComponentActivity() {
     }
     private fun scheduleIdle() {
         if (!working && !exiting) runtime.touchIdle()
+    }
+    private fun newIdleRuntime() = DeadlineRuntime { reason, evidence -> onIdleDeadline(reason, evidence) }
+    private fun onIdleDeadline(reason: String, evidence: Map<String, Any>) {
+        // A watch-initiated activity transfer owns its own lease; the page idle countdown must
+        // never cancel that receive just because the screen was untouched.
+        if (app.activitySyncStatus.running && transfer == null) {
+            record("IDLE_DEADLINE_SUPPRESSED_DURING_ACTIVITY_SYNC", evidence + mapOf(
+                "reason" to reason, "syncTrigger" to app.activitySyncStatus.trigger,
+                "syncRunning" to true, "stoppedSync" to false))
+            return
+        }
+        exitNow(reason, force = true, deadlineEvidence = evidence)
+    }
+    private fun holdIdleForActivitySync(): Boolean {
+        if (exiting || transfer != null || working) return false
+        if (runtime.isClosed()) {
+            if (!app.activitySyncStatus.running) return false
+            runtime = newIdleRuntime().also { it.touchIdle() }
+        }
+        if (runtime.isIdleHeld()) return true
+        val held = runtime.holdIdle()
+        record(if (held) "IDLE_HELD_FOR_ACTIVITY_SYNC" else "IDLE_HOLD_FAILED_FOR_ACTIVITY_SYNC",
+            runtime.evidence() + mapOf("trigger" to app.activitySyncStatus.trigger))
+        return held
+    }
+    private fun releaseIdleForActivitySync(): Boolean {
+        if (exiting || transfer != null || working) return false
+        if (app.activitySyncStatus.running) return false
+        if (runtime.isClosed()) {
+            runtime = newIdleRuntime().also { it.touchIdle() }
+            record("IDLE_REARMED_AFTER_ACTIVITY_SYNC", runtime.evidence())
+            return true
+        }
+        if (runtime.releaseIdle()) {
+            record("IDLE_RELEASED_AFTER_ACTIVITY_SYNC", runtime.evidence())
+            return true
+        }
+        runtime.touchIdle()
+        return true
     }
 
     private fun exportActivityData(selected: List<String>? = null, recent: Boolean = false) {
@@ -293,6 +330,8 @@ class ProbeActivity : ComponentActivity() {
         runtime.close()
         if (app.syncFinished === syncObserver) app.syncFinished = null
         if (app.activitySyncObserver === activitySyncObserver) app.activitySyncObserver = null
+        if (app.activityIdleHold === activityIdleHold) app.activityIdleHold = null
+        if (app.activityIdleRelease === activityIdleRelease) app.activityIdleRelease = null
         val stopBackground = SyncStopScope.mayStop(
             reason == "USER_EXIT" || reason == "USER_BACK", ownerToken, app.activeSyncOwner)
         record("SYNC_EXIT_SCOPE", mapOf("reason" to reason, "pageOwner" to ownerToken,
@@ -322,6 +361,8 @@ class ProbeActivity : ComponentActivity() {
         if (app.activeSyncOwner == ownerToken) { app.activeSyncOwner = null; app.receiveHello = null }
         if (app.syncFinished === syncObserver) app.syncFinished = null
         if (app.activitySyncObserver === activitySyncObserver) app.activitySyncObserver = null
+        if (app.activityIdleHold === activityIdleHold) app.activityIdleHold = null
+        if (app.activityIdleRelease === activityIdleRelease) app.activityIdleRelease = null
         transfer?.cancel()
         worker.shutdownNow()
         main.removeCallbacksAndMessages(null)
@@ -344,6 +385,10 @@ class ProbeActivity : ComponentActivity() {
         }
         // Background time counts toward the same absolute 80-second idle deadline.
         // Returning is not itself a user interaction and cannot renew that deadline.
+        if (!exiting && transfer == null && !working) {
+            if (app.activitySyncStatus.running) holdIdleForActivitySync()
+            else if (runtime.isClosed()) releaseIdleForActivitySync()
+        }
         if (!exiting && runtime.resumeIdle()) record("IDLE_PAGE_RETURNED_WITHIN_EXISTING_DEADLINE", runtime.evidence())
         if (!exiting && runtime.check("RESUME")) record("ACTIVITY_RESUMED", runtime.evidence())
     }

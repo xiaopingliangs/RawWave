@@ -26,6 +26,7 @@ class RecordingActivity : ComponentActivity() {
     private lateinit var controls: LinearLayout
     private lateinit var guide: HomeKeyGuide
     private var pending: ActivityStore.Template? = null
+    private var stopDialog: android.app.AlertDialog? = null
     private var idle: DeadlineRuntime? = null
     private var mode = ""
     private var resumed = false
@@ -42,10 +43,21 @@ class RecordingActivity : ComponentActivity() {
         if (start) { syncCycleSeen = true; startPendingSync(ActivitySyncPolicy.OPEN_IDLE_AUTO) }
     }
     private val syncListener: (ProbeApplication.ActivitySyncStatus) -> Unit = syncListener@{ sync ->
-        if (inActivityManagement() && !ActivityRecordingService.state.active) return@syncListener
+        if (inActivityManagement() && !ActivityRecordingService.state.active) {
+            if (!sync.running) releaseIdleAfterSync()
+            return@syncListener
+        }
         syncCycleSeen = true
+        if (!resumed) {
+            // The screen may be off while the bounded sync finishes. Do not touch views here;
+            // only consume the one-shot completion signal and close the task.
+            if (!sync.running && sync.success && consumeSyncExit()) {
+                main.post { if (!isFinishing) finishAndRemoveTask() }
+            }
+            return@syncListener
+        }
         if (ActivitySyncPolicy.isNonBlockingHomeSync(sync.trigger)) {
-            ensureIdle()
+            if (sync.running) holdIdleForSync() else releaseIdleAfterSync()
             if (sync.running) {
                 status.text = "正在后台补同步上次活动；你仍可直接选择活动开始采集。\n${sync.text}"
             } else {
@@ -58,21 +70,43 @@ class RecordingActivity : ComponentActivity() {
         } else if (sync.running) {
             renderSync(sync)
         } else if (sync.success && ActivitySyncPolicy.exitAfterSuccessfulSync(sync.trigger)) {
+            consumeSyncExit()
+            idle?.close(); idle = null
             main.post { if (!isFinishing) finishAndRemoveTask() }
         } else {
+            releaseIdleAfterSync()
             mode = ""
             render(ActivityRecordingService.state)
             if (!ActivityRecordingService.state.active) status.text =
                 "本轮同步未完成，数据仍保留。你可以开始活动；无操作满80秒后停止所有工作。"
         }
     }
+    private fun consumeSyncExit(): Boolean =
+        (application as ProbeApplication).pendingActivitySyncExit.getAndSet(false)
     private val listener: (ActivityRecordingService.Companion.State) -> Unit = { render(it) }
-    private val idleExitListener: () -> Unit = {
-        cancelAutoSync("ECG_IDLE_STOP")
+    private val idleExitListener: () -> Unit = { finishIdle("ECG_IDLE_STOP") }
+    private fun finishIdle(reason: String) {
+        cancelAutoSync(reason)
         idle?.close(); idle = null
         guide.animateContact = false
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         finishAndRemoveTask()
+    }
+    /** The UI countdown is never allowed to stop a bounded transfer that already owns the app. */
+    private fun onIdleDeadline(reason: String, evidence: Map<String, Any>) {
+        if (app.activitySyncStatus.running) {
+            try { app.journal?.event("ACTIVITY_UI_IDLE_EXPIRED_DURING_SYNC_SUPPRESSED",
+                evidence + mapOf("reason" to reason, "syncRunning" to true,
+                    "syncTrigger" to app.activitySyncStatus.trigger, "stoppedSync" to false)) }
+            catch (_: Exception) {}
+            idle = null
+            return
+        }
+        try { app.journal?.event("ACTIVITY_UI_IDLE_EXPIRED", evidence + mapOf("reason" to reason,
+            "syncRunning" to false, "syncTrigger" to app.activitySyncStatus.trigger)) }
+        catch (_: Exception) {}
+        app.requestStopBackgroundSync("WATCH_RECORDING_IDLE_DEADLINE")
+        finishIdle("WATCH_RECORDING_IDLE_DEADLINE")
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -99,20 +133,30 @@ class RecordingActivity : ComponentActivity() {
         body.addView(details)
         setContentView(topPane)
         ActivityRecordingService.idleExitObserver = idleExitListener
+        // Keep the completion observer alive across onStop: a watch screen can turn off during
+        // the bounded sync, and the success must still close the task instead of waiting for a
+        // later manual launch.
+        app.activitySyncObserver = syncListener
+        if (consumeSyncExit()) { finishAndRemoveTask(); return }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (mode == "EDIT_TEMPLATE") { showActivityManagement(); return }
                 if (mode == "MANAGE_ACTIVITIES") { returnHome(); return }
-                // Leaving the screen is not a request to discard or end an activity.
-                if (ActivityRecordingService.state.active || app.activitySyncStatus.running) moveTaskToBack(true)
-                else finishAndRemoveTask()
+                if (ActivityRecordingService.state.active) {
+                    // Back is ambiguous while capture is running: make the user choose
+                    // between a saved early stop and continuing in the background.
+                    if (ActivityRecordingService.state.phase == "DRAINING") { moveTaskToBack(true); return }
+                    confirmStopCapture(); return
+                }
+                // Leaving the screen during sync is not a request to stop the transfer.
+                if (app.activitySyncStatus.running) moveTaskToBack(true) else finishAndRemoveTask()
             }
         })
     }
     override fun onStart() {
         super.onStart(); resumed = true
         ActivityRecordingService.observer = listener
-        app.activitySyncObserver = syncListener
+        if (consumeSyncExit()) { finishAndRemoveTask(); return }
         if (app.activitySyncStatus.running && !ActivitySyncPolicy.isNonBlockingHomeSync(app.activitySyncStatus.trigger))
             renderSync(app.activitySyncStatus)
         else render(ActivityRecordingService.state)
@@ -121,7 +165,6 @@ class RecordingActivity : ComponentActivity() {
     override fun onStop() {
         resumed = false
         if (ActivityRecordingService.observer === listener) ActivityRecordingService.observer = null
-        if (app.activitySyncObserver === syncListener) app.activitySyncObserver = null
         cancelAutoSync("ON_STOP")
         guide.animateContact = false
         idle?.parkIdle()
@@ -129,6 +172,8 @@ class RecordingActivity : ComponentActivity() {
     }
     override fun onDestroy() {
         if (ActivityRecordingService.idleExitObserver === idleExitListener) ActivityRecordingService.idleExitObserver = null
+        if (app.activitySyncObserver === syncListener) app.activitySyncObserver = null
+        stopDialog?.dismiss(); stopDialog = null
         cancelAutoSync("ON_DESTROY"); idle?.close(); super.onDestroy()
     }
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -143,11 +188,12 @@ class RecordingActivity : ComponentActivity() {
             renderSync(app.activitySyncStatus); return
         }
         if (s.active) { cancelAutoSync("RECORDING_ACTIVE"); idle?.close(); idle = null }
+        else if (app.activitySyncStatus.running) holdIdleForSync()
         else ensureIdle()
         val measuringEcg = s.shortSensor == "ECG" && (s.phase.startsWith("PRE") || s.phase.startsWith("POST"))
         guide.visibility = View.GONE
         guide.animateContact = measuringEcg && resumed
-        if (measuringEcg || (s.active && (s.shortSensor == "SPO2" || s.shortSensor == "BIA"))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (measuringEcg || (s.active && (s.shortSensor == "SPO2" || s.shortSensor == "BIA" || s.shortSensor == "PPG_ON_DEMAND"))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         measurementHeader.textSize = 19f
         measurementHeader.text = if (s.active) {
@@ -160,10 +206,12 @@ class RecordingActivity : ComponentActivity() {
             }
             val instruction = when {
                 s.phase == "DRAINING" -> "正在结束采集，请稍候"
-                s.phase.startsWith("REVIEW") -> "可以松开手指，选择重测或继续"
+                s.phase.startsWith("REVIEW") -> if (s.shortSensor == "PPG_ON_DEMAND")
+                    "可以调整手臂，选择重测或继续" else "可以松开手指，选择重测或继续"
                 s.phase == "RESTORE_PRE" -> "恢复平时佩戴位置后继续"
                 s.shortSensor == "SPO2" -> "手臂放稳，与心脏大致同高\n测量期间保持静止"
                 s.shortSensor == "BIA" -> "两指分别接触两个按键\n手臂抬起，避免双手相碰"
+                s.shortSensor == "PPG_ON_DEMAND" -> "正常佩戴，保持贴合\n手臂静止，采集30秒"
                 measuringEcg -> "手指轻触 Home 键，不要按下\n保持接触，手臂静止"
                 s.phase == "CORE-1" -> "正常活动即可\n结束时点击下方按钮"
                 else -> "请稍候"
@@ -184,11 +232,17 @@ class RecordingActivity : ComponentActivity() {
                 button("跳过体成分，继续") { command("SKIP_BIA") }
             } else if (s.phase.startsWith("READY_SPO2_")) {
                 button("已调整好，开始血氧") { command("START_SPO2") }
+            } else if (s.phase.startsWith("READY_PPG_")) {
+                button("已调整好，开始 PPG 30秒") { command("START_PPG") }
+                button("跳过 PPG，继续") { command("SKIP_PPG") }
             } else if (s.phase == "RESTORE_PRE") {
                 button("已恢复佩戴，继续") { command("PLACEMENT_READY") }
             } else if (s.phase.startsWith("REVIEW_SPO2")) {
                 button("重测血氧") { command("RETRY_SPO2") }
                 button("跳过血氧，继续") { command("SKIP_SPO2") }
+            } else if (s.phase.startsWith("REVIEW_PPG_")) {
+                button("重测 PPG") { command("RETRY_PPG") }
+                button("跳过 PPG，继续") { command("SKIP_PPG") }
             } else if (s.phase.startsWith("REVIEW_")) {
                 button("继续重测 ECG（不限次数）") { command("RETRY_ECG") }
                 if (s.skipAllowed) button("跳过 ECG，继续本次活动") { command("SKIP_ECG") }
@@ -234,7 +288,8 @@ class RecordingActivity : ComponentActivity() {
     private fun renderSync(sync: ProbeApplication.ActivitySyncStatus) {
         if (inActivityManagement()) return
         cancelAutoSync("SYNC_RUNNING")
-        ensureIdle(); guide.visibility = View.GONE; guide.animateContact = false
+        if (sync.running) holdIdleForSync() else ensureIdle()
+        guide.visibility = View.GONE; guide.animateContact = false
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         status.text = "活动数据同步\n${sync.text}\n采集文件在手机完整校验前不会从手表标记为已同步。"
         controls.removeAllViews()
@@ -250,6 +305,7 @@ class RecordingActivity : ComponentActivity() {
         if (!app.startWatchActivitySync(trigger)) {
             if (!app.activitySyncStatus.running) status.text = "当前有其他工作正在进行，活动数据稍后再同步。"
         } else if (ActivitySyncPolicy.isNonBlockingHomeSync(trigger)) {
+            holdIdleForSync()
             status.text = "正在后台补同步上次活动；你仍可直接选择活动开始采集。"
         } else renderSync(app.activitySyncStatus)
     }
@@ -296,7 +352,7 @@ class RecordingActivity : ComponentActivity() {
             if (templates.isEmpty()) label("还没有活动，点击上方创建。", controls)
             templates.forEach { t ->
                 val core = t.coreSources().joinToString("、", transform = ::sensorLabel)
-                val short = listOfNotNull(if(t.ecg()) "ECG" else null, if(t.spo2()) "血氧" else null, if(t.bia()) (if(t.mfBia()) "多频阻抗" else "体成分") else null)
+                val short = listOfNotNull(if(t.ecg()) "ECG" else null, if(t.spo2()) "血氧" else null, if(t.ppg()) "PPG 100Hz" else null, if(t.bia()) (if(t.mfBia()) "多频阻抗" else "体成分") else null)
                     .joinToString("、").ifEmpty { "无" }
                 label("${t.name()}\n活动前后：$short\n活动中：$core", controls)
                 button("更改：${t.name()}") { createForm(t) }
@@ -322,6 +378,14 @@ class RecordingActivity : ComponentActivity() {
         val name = EditText(this).apply { hint = "活动名称"; setTextColor(Color.WHITE); setSingleLine() }
         val ecg = CheckBox(this).apply { text = "活动前后各测 ECG 30 秒"; isChecked = true; setTextColor(Color.WHITE) }
         val spo2 = CheckBox(this).apply { text = "活动前后各测血氧 SpO₂（三星处理结果，最多30秒）"; setTextColor(Color.WHITE) }
+        val ppgContinuous = CheckBox(this).apply { text = "活动中连续 PPG 25Hz（长时间，原始绿/红外/红）"; setTextColor(Color.WHITE) }
+        val ppgShort = CheckBox(this).apply { text = "活动前后各测 PPG 100Hz 30秒（原始绿/红外/红）"; setTextColor(Color.WHITE) }
+        val ppgTitle = TextView(this).apply { text = "PPG 采集模式（两种可独立选择）"; setTextColor(Color.WHITE); textSize = 14f }
+        val ppgPresets = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val ppgNote = TextView(this).apply {
+            text = "测试预设会清空其他采集项，便于最小对照；需要其他源时再手动勾选。先只选连续 PPG 60 秒；灯灭后再选两种都测。结束后观察红绿灯；若仍亮，导出系统 bugreport，不要重复 17 分钟活动。"
+            setTextColor(Color.WHITE); textSize = 12f
+        }
         val bia = CheckBox(this).apply { text="活动前后各测体成分 BIA（处理结果，双指触键）"; setTextColor(Color.WHITE) }
         val mfBia=CheckBox(this).apply { text="体成分短测改用多频阻抗 MF-BIA（四频幅值/相位，成功即结束）";setTextColor(Color.WHITE);isChecked=existing?.mfBia()==true }
         val profileBox=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
@@ -379,17 +443,41 @@ class RecordingActivity : ComponentActivity() {
         val choices = linkedMapOf(
             SensorCatalog.HEART_RATE to CheckBox(this).apply { text = "活动中：心率（处理结果）"; isChecked = true; setTextColor(Color.WHITE) },
             SensorCatalog.ACCELEROMETER to CheckBox(this).apply { text = "活动中：加速度（原始）"; isChecked = true; setTextColor(Color.WHITE) },
-            SensorCatalog.PPG to CheckBox(this).apply { text = "活动中：PPG 绿/红/红外（原始）"; setTextColor(Color.WHITE) },
             SensorCatalog.SKIN_TEMPERATURE to CheckBox(this).apply { text = "活动中：皮肤温度（处理结果，不是体温）"; setTextColor(Color.WHITE) },
             SensorCatalog.EDA to CheckBox(this).apply { text = "活动中：皮肤电导 EDA（原始，部分型号支持）"; setTextColor(Color.WHITE) },
             SensorCatalog.MAGNETIC_FIELD to CheckBox(this).apply { text="活动中：三轴磁场（Android，微特斯拉，目标10Hz）";setTextColor(Color.WHITE) },
             SensorCatalog.PRESSURE to CheckBox(this).apply { text = "活动中：气压（Android，hPa，目标1Hz）"; setTextColor(Color.WHITE) },
             SensorCatalog.GYROSCOPE to CheckBox(this).apply { text = "活动中：陀螺仪角速度（Android，目标25Hz）"; setTextColor(Color.WHITE) })
+        fun addPpgPresetRow(vararg presets: Triple<String, Boolean, Boolean>) {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            presets.forEach { (label, continuous, short) ->
+                row.addView(Button(this).apply {
+                    text = label; textSize = 11f; minWidth = 0; minimumWidth = 0; setPadding(0, 0, 0, 0)
+                    setOnClickListener {
+                        ppgContinuous.isChecked = continuous
+                        ppgShort.isChecked = short
+                        // These are test presets: clear other capture items so the
+                        // comparison changes only the two PPG modes.
+                        ecg.isChecked = false
+                        spo2.isChecked = false
+                        bia.isChecked = false
+                        mfBia.isChecked = false
+                        choices.values.forEach { it.isChecked = false }
+                    }
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            ppgPresets.addView(row)
+        }
+        addPpgPresetRow(Triple("测试：只连续 PPG", true, false), Triple("测试：只前后短测", false, true))
+        addPpgPresetRow(Triple("测试：两种都测（LED 复现）", true, true), Triple("测试：都不选", false, false))
         if (existing != null) {
-            name.setText(existing.name()); ecg.isChecked = existing.ecg(); spo2.isChecked = existing.spo2()
+            name.setText(existing.name()); ecg.isChecked = existing.ecg(); spo2.isChecked = existing.spo2(); ppgShort.isChecked = existing.ppg()
+            ppgContinuous.isChecked = SensorCatalog.PPG in existing.coreSources()
             choices.forEach { (source, choice) -> choice.isChecked = source in existing.coreSources() }
         }
-        controls.addView(name); controls.addView(ecg); controls.addView(spo2); controls.addView(bia);controls.addView(mfBia);controls.addView(profileBox); choices.values.forEach { controls.addView(it) }
+        controls.addView(name); controls.addView(ppgTitle); controls.addView(ppgContinuous); controls.addView(ppgShort)
+        controls.addView(ppgPresets); controls.addView(ppgNote)
+        controls.addView(ecg); controls.addView(spo2); controls.addView(bia);controls.addView(mfBia);controls.addView(profileBox); choices.values.forEach { controls.addView(it) }
         button(if (existing == null) "保存活动" else "修改并保存") {
             try {
                 val profile=if(bia.isChecked) com.rawwave.core.BiaProfile(
@@ -397,10 +485,11 @@ class RecordingActivity : ComponentActivity() {
                     weight.text.toString().trim().toFloatOrNull() ?: error("请填写体重（千克）"),
                     age.text.toString().trim().toIntOrNull() ?: error("请填写年龄（岁）"),
                     when(gender.checkedRadioButtonId) {female.id->0;male.id->1;else->error("请选择体成分算法所需性别")}) else null
-                val selected = choices.filterValues { it.isChecked }.keys
+                val selected = choices.filterValues { it.isChecked }.keys.toMutableSet()
+                if (ppgContinuous.isChecked) selected.add(SensorCatalog.PPG)
                 val store = ActivityRecordingService.store(this)
-                if (existing == null) store.createTemplate(name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked)
-                else store.updateTemplate(existing.id(), name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked)
+                if (existing == null) store.createTemplate(name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked, ppgShort.isChecked)
+                else store.updateTemplate(existing.id(), name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked, ppgShort.isChecked)
                 if(profile!=null) check(savedProfile.edit().putFloat("height",profile.heightCm())
                     .putFloat("weight",profile.weightKg()).putInt("age",profile.age()).putInt("gender",profile.gender()).commit()) {
                     "活动已保存，但个人资料复用设置保存失败，请重试"
@@ -454,7 +543,7 @@ class RecordingActivity : ComponentActivity() {
                     result += "com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA"
             }
         }
-        if (t.ecg() || t.bia()) result += if (Build.VERSION.SDK_INT < 36) Manifest.permission.BODY_SENSORS
+        if (t.ecg() || t.bia() || t.ppg()) result += if (Build.VERSION.SDK_INT < 36) Manifest.permission.BODY_SENSORS
             else "com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA"
         if (t.spo2()) result += if (Build.VERSION.SDK_INT < 36) Manifest.permission.BODY_SENSORS
             else "android.permission.health.READ_OXYGEN_SATURATION"
@@ -463,7 +552,8 @@ class RecordingActivity : ComponentActivity() {
     private fun sensorLabel(sensor: String) = when (sensor) {
         SensorCatalog.HEART_RATE -> "心率"
         SensorCatalog.ACCELEROMETER -> "加速度"
-        SensorCatalog.PPG -> "PPG"
+        SensorCatalog.PPG -> "PPG 25Hz 连续"
+        SensorCatalog.PPG_ON_DEMAND -> "PPG 100Hz 短测"
         SensorCatalog.SKIN_TEMPERATURE -> "皮肤温度"
         SensorCatalog.EDA -> "皮肤电导"
         SensorCatalog.MAGNETIC_FIELD -> "三轴磁场"
@@ -471,17 +561,58 @@ class RecordingActivity : ComponentActivity() {
         SensorCatalog.GYROSCOPE -> "陀螺仪"
         else -> sensor
     }
+    private fun confirmStopCapture() {
+        if (stopDialog?.isShowing == true) return
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setMessage("结束并保存已有数据？\n提前结束不会继续活动后短测。若要按模板完成，请选“继续记录”，再点“结束活动”。")
+            .setPositiveButton("结束并保存") { _, _ -> command("CANCEL") }
+            .setNegativeButton("继续记录", null)
+            .create()
+        dialog.setOnDismissListener { if (stopDialog === dialog) stopDialog = null }
+        stopDialog = dialog
+        dialog.show()
+    }
     private fun command(action: String) { startService(Intent(this, ActivityRecordingService::class.java).setAction(action)) }
+    private fun idleRuntime(): DeadlineRuntime {
+        val current = idle
+        if (current != null && !current.isClosed()) return current
+        return DeadlineRuntime { reason, evidence -> onIdleDeadline(reason, evidence) }
+            .also { it.touchIdle(); idle = it }
+    }
     private fun ensureIdle() {
         if (ActivityRecordingService.state.active) return
-        if (idle == null) idle = DeadlineRuntime { reason, evidence ->
-            try { app.journal?.event("ACTIVITY_UI_IDLE_EXPIRED", evidence + mapOf("reason" to reason,
-                "syncRunning" to app.activitySyncStatus.running,"syncTrigger" to app.activitySyncStatus.trigger)) }
-            catch (_: Exception) {}
-            app.requestStopBackgroundSync("WATCH_RECORDING_IDLE_DEADLINE")
-            finishAndRemoveTask()
-        }.also { it.touchIdle() }
-        else idle?.resumeIdle()
+        if (app.activitySyncStatus.running) { holdIdleForSync(); return }
+        val current = idle
+        if (current == null || current.isClosed()) idleRuntime() else current.resumeIdle()
+    }
+    /** A transfer owns the app: suspend only the UI idle countdown, never its own lease. */
+    private fun holdIdleForSync() {
+        if (ActivityRecordingService.state.active || !app.activitySyncStatus.running) return
+        val runtime = idleRuntime()
+        if (runtime.isIdleHeld()) return
+        if (runtime.holdIdle()) {
+            try { app.journal?.event("ACTIVITY_UI_IDLE_HELD_FOR_SYNC",
+                runtime.evidence() + mapOf("trigger" to app.activitySyncStatus.trigger)) } catch (_: Exception) {}
+        } else {
+            try { app.journal?.event("ACTIVITY_UI_IDLE_HOLD_FAILED_FOR_SYNC",
+                runtime.evidence() + mapOf("trigger" to app.activitySyncStatus.trigger)) } catch (_: Exception) {}
+        }
+    }
+    /** Re-arm one fresh idle window only after the transfer is no longer running. */
+    private fun releaseIdleAfterSync() {
+        if (ActivityRecordingService.state.active) { idle?.close(); idle = null; return }
+        if (app.activitySyncStatus.running) return
+        val runtime = idle
+        if (runtime == null || runtime.isClosed()) {
+            idleRuntime()
+            try { app.journal?.event("ACTIVITY_UI_IDLE_REARMED_AFTER_SYNC", idle?.evidence().orEmpty()) } catch (_: Exception) {}
+            return
+        }
+        if (runtime.releaseIdle()) {
+            try { app.journal?.event("ACTIVITY_UI_IDLE_RELEASED_AFTER_SYNC", runtime.evidence()) } catch (_: Exception) {}
+        } else {
+            runtime.touchIdle()
+        }
     }
     private fun label(text: String, parent: LinearLayout = body) = TextView(this).apply {
         this.text = text; textSize = 14f; setTextColor(Color.WHITE); gravity = Gravity.CENTER; setPadding(0, dp(6), 0, dp(6))

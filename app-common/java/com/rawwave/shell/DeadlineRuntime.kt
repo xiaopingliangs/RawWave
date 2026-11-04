@@ -12,13 +12,18 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
     private val deadlines = RunDeadlines { SystemClock.elapsedRealtime() }
     private var closed = false
     private var parked = false
+    private var held = false
     private val timer = Runnable { if (check("TIMER")) schedule() }
+
+    fun isClosed() = closed
+    fun isIdleHeld() = held
 
     fun evidence(): Map<String, Any> = mapOf(
         "elapsedRealtimeMs" to SystemClock.elapsedRealtime(),
         "uptimeMs" to SystemClock.uptimeMillis(),
         "deadlineClock" to "ELAPSED_REALTIME_INCLUDES_SLEEP",
         "deadlines" to deadlines.snapshot().mapKeys { it.key.name },
+        "idleHeld" to held,
         "suspendedProcessDeadlineGuarantee" to false)
 
     fun check(trigger: String): Boolean {
@@ -35,10 +40,29 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
         return true
     }
     fun touchIdle() {
+        if (held) return
         if (check("INTERACTION")) { deadlines.touchIdle(WorkBudget.IDLE_MS); schedule() }
     }
+    /** Suspend the UI idle countdown while a bounded activity transfer is genuinely active. */
+    fun holdIdle(): Boolean {
+        if (closed) return false
+        if (held) return true
+        if (!deadlines.holdIdle()) return false
+        held = true
+        handler.removeCallbacks(timer)
+        return true
+    }
+    /** Re-arm one fresh idle window after the transfer ends. */
+    fun releaseIdle(): Boolean {
+        if (closed || !held) return false
+        held = false
+        val renewed = deadlines.releaseIdle(WorkBudget.IDLE_MS)
+        if (renewed) schedule()
+        return renewed
+    }
     fun parkIdle(): Boolean {
-        if (closed || deadlines.snapshot().keys.any { it != RunDeadlines.Kind.IDLE }) return false
+        if (closed) return false
+        if (!held && deadlines.snapshot().keys.any { it != RunDeadlines.Kind.IDLE }) return false
         parked = true
         handler.removeCallbacks(timer)
         return true
@@ -46,6 +70,7 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
     fun resumeIdle(): Boolean {
         if (!parked || closed) return false
         parked = false
+        if (held) return true
         if (!check("RESUME_IDLE")) return false
         val renewed = deadlines.resumeIdle(WorkBudget.IDLE_MS)
         if (renewed) schedule()
@@ -54,6 +79,7 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
     fun begin(kind: RunDeadlines.Kind, budgetMs: Long): Boolean {
         if (!check("BEGIN_${kind.name}")) return false
         val accepted = deadlines.begin(kind, budgetMs)
+        if (accepted) held = false
         schedule()
         return accepted
     }
@@ -68,6 +94,6 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
         val delay = deadlines.delayMs()
         if (!closed && !parked && delay != Long.MAX_VALUE) handler.postDelayed(timer, delay)
     }
-    fun close() { closed = true; deadlines.close(); handler.removeCallbacks(timer) }
+    fun close() { closed = true; held = false; parked = false; deadlines.close(); handler.removeCallbacks(timer) }
 }
 

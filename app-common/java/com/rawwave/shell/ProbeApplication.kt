@@ -25,8 +25,13 @@ class ProbeApplication : Application() {
     var preemptDiagnosticReceive: (() -> Unit)? = null
     var receiveHello: ((String, ByteArray) -> Unit)? = null
     var receiveActivityHello: ((String, ByteArray) -> Unit)? = null
+    /** Main-thread UI idle hooks; absent when no diagnostic page owns a deadline. */
+    var activityIdleHold: (() -> Boolean)? = null
+    var activityIdleRelease: (() -> Boolean)? = null
     @Volatile var activitySyncStatus = ActivitySyncStatus()
     var activitySyncObserver: ((ActivitySyncStatus) -> Unit)? = null
+    /** One-shot completion signal; consumed by the watch UI even after onStop/onStart. */
+    val pendingActivitySyncExit = java.util.concurrent.atomic.AtomicBoolean(false)
     var activeWatchActivitySync: WatchActivitySyncSession? = null
     val activitySyncAttemptGuard = ActivitySyncAttemptGuard()
     var lastStopReason: String? = null
@@ -38,6 +43,7 @@ class ProbeApplication : Application() {
     /** Explicit UI/capture trigger only. No alarm, worker, receiver or retry loop calls this on watch. */
     fun startWatchActivitySync(trigger: String): Boolean {
         if (BuildConfig.DEVICE_ROLE != "watch" || activeWatchActivitySync != null || activeSyncOwner != null) return false
+        pendingActivitySyncExit.set(false)
         val normalized = ActivitySyncPolicy.normalize(trigger)
         activitySyncAttemptGuard.markStarted(normalized)
         WatchActivitySyncSession(this, normalized).also { activeWatchActivitySync = it; it.start() }

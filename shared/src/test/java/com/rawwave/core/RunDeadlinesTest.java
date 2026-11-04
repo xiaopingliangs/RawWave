@@ -101,5 +101,47 @@ public class RunDeadlinesTest {
         assertFalse(deadlines.resumeIdle(175000)); deadlines.close();
         assertFalse(deadlines.resumeIdle(175000));
     }
+    @Test public void heldIdleDoesNotCountDownDuringALongTransfer() {
+        deadlines.touchIdle(80000); now=1000;
+        assertTrue(deadlines.holdIdle());
+        assertTrue(deadlines.snapshot().isEmpty());
+        now=1_000_000;
+        assertNull(deadlines.expired());
+        assertFalse(deadlines.touchIdle(80000));
+        assertTrue(deadlines.resumeIdle(80000));
+        assertTrue(deadlines.snapshot().isEmpty());
+        assertTrue(deadlines.releaseIdle(80000));
+        assertEquals(Long.valueOf(1_080_000),deadlines.snapshot().get(IDLE));
+        now=1_079_999; assertNull(deadlines.expired());
+        now=1_080_000; assertEquals(IDLE,deadlines.expired().kind());
+    }
+    @Test public void holdCannotReplaceAnOperationDeadline() {
+        deadlines.begin(TRANSFER,175000);
+        assertFalse(deadlines.holdIdle());
+        assertEquals(1,deadlines.snapshot().size());
+        assertEquals(Long.valueOf(175000),deadlines.snapshot().get(TRANSFER));
+    }
+    @Test public void expiredOrClosedIdleCannotBeHeldOrReleased() {
+        deadlines.touchIdle(1000); now=1000;
+        assertFalse(deadlines.holdIdle());
+        assertFalse(deadlines.releaseIdle(1000));
+        deadlines.close();
+        assertFalse(deadlines.holdIdle());
+        assertFalse(deadlines.releaseIdle(1000));
+    }
+    @Test public void operationBeginEndsAnIdleHoldAndItsFinishRearmsIdle() {
+        deadlines.holdIdle(); now=1000;
+        assertTrue(deadlines.begin(EXPORT,58000));
+        assertFalse(deadlines.releaseIdle(80000));
+        now=2000; assertTrue(deadlines.finishExport(80000));
+        assertEquals(Long.valueOf(82000),deadlines.snapshot().get(IDLE));
+    }
+    @Test public void finishingAnOperationDuringAHoldStillWaitsForRelease() {
+        assertTrue(deadlines.holdIdle()); now=1000;
+        assertTrue(deadlines.finishExport(80000));
+        assertTrue(deadlines.snapshot().isEmpty());
+        assertTrue(deadlines.releaseIdle(80000));
+        assertEquals(Long.valueOf(81000),deadlines.snapshot().get(IDLE));
+    }
 }
 

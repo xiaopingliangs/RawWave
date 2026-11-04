@@ -15,15 +15,26 @@ class SamsungSensorAdapter internal constructor(
     private val evidence: (String, Map<String, Any>) -> Unit,
     private val elapsed: () -> Long = { SystemClock.elapsedRealtime() },
     private val utc: () -> Long = { System.currentTimeMillis() },
-    private val dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null
+    private val dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null,
+    private val releaseGraceMs: Long = 0L,
+    private val postRetryGraceMs: Long = 0L,
+    private val pause: (Long) -> Unit = { Thread.sleep(it) }
 ) : SensorPort {
     constructor(context: Context, dispatch: (() -> Unit) -> Unit, biaProfile: com.rawwave.core.BiaProfile? = null,
                 dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null) :
-        this(DeviceSamsungBackend(context, biaProfile), dispatch, SensorReleaseDiagnostics(context)::record, dispatchRows = dispatchRows)
+        this(DeviceSamsungBackend(context, biaProfile), dispatch, SensorReleaseDiagnostics(context)::record,
+            dispatchRows = dispatchRows, releaseGraceMs = PRODUCTION_RELEASE_GRACE_MS,
+            postRetryGraceMs = PRODUCTION_POST_RETRY_GRACE_MS)
+    private companion object {
+        /** A short pause between the last unset and connector teardown; not a hardware receipt. */
+        const val PRODUCTION_RELEASE_GRACE_MS = 300L
+        /** Extra time after the final unset retry, before the vendor connector is unbound. */
+        const val PRODUCTION_POST_RETRY_GRACE_MS = 300L
+    }
     private val ownerId = java.util.UUID.randomUUID().toString()
     private var attemptSequence = 0L
     override fun contractVersion() = SensorPort.CONTRACT_VERSION
-    override fun implementationVersion() = "samsung-health-sensor-1.4.1/adapter-9"
+    override fun implementationVersion() = "samsung-health-sensor-1.4.1/adapter-12"
     private fun cleanupEvidence(stage: String, sensor: String, detail: String = "") {
         try { evidence("CAPTURE_VENDOR_CLEANUP", mapOf("ownerId" to ownerId,
             "stage" to stage, "sensor" to sensor, "detail" to detail,
@@ -167,7 +178,7 @@ class SamsungSensorAdapter internal constructor(
                                     field("ACCELEROMETER_Y", ValueKey.AccelerometerSet.ACCELEROMETER_Y)
                                     field("ACCELEROMETER_Z", ValueKey.AccelerometerSet.ACCELEROMETER_Z)
                                 }
-                                "PPG" -> {
+                                "PPG", "PPG_ON_DEMAND" -> {
                                     field("PPG_GREEN", ValueKey.PpgSet.PPG_GREEN)
                                     field("GREEN_STATUS", ValueKey.PpgSet.GREEN_STATUS)
                                     field("PPG_IR", ValueKey.PpgSet.PPG_IR)
@@ -238,7 +249,7 @@ class SamsungSensorAdapter internal constructor(
         check(delivery.completion == null) { "DRAIN_ALREADY_REQUESTED:$sensor" }
         delivery.completion = completed
         if(sensor=="EDA") delivery.endBoundary.arm(utc(),elapsed())
-        if (sensor == "ECG" || sensor == "SPO2" || (sensor == "BIA" || sensor == "MF_BIA")) {
+        if (sensor == "ECG" || sensor == "SPO2" || sensor == "PPG_ON_DEMAND" || (sensor == "BIA" || sensor == "MF_BIA")) {
             endDrain(sensor, delivery, SensorPort.DrainStatus.DELIVERED_ONLY, "${sensor}_HAS_NO_SDK_FLUSH;ACCEPTED_CALLBACKS_DRAINED")
             return
         }
@@ -290,10 +301,44 @@ class SamsungSensorAdapter internal constructor(
             try { tracker.unset(); cleanupEvidence("FINAL_UNSET_RETURNED", sensor) }
             catch(e: Exception) { cleanupEvidence("FINAL_UNSET_FAILED", sensor, e.toString()); failure = e }
         }
-        cleanupEvidence("DISCONNECT_REQUEST", "ALL", "retainedTypes=${trackers.keys}")
+        // Give the vendor service a short window to process the final unset before the
+        // connector is torn down, then retry each retained handle once. SDK return values
+        // are still not treated as a hardware-stop receipt.
+        if (releaseGraceMs > 0L && trackers.isNotEmpty()) {
+            cleanupEvidence("RELEASE_GRACE_BEFORE_DISCONNECT", "ALL", "graceMs=$releaseGraceMs")
+            try { pause(releaseGraceMs) }
+            catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                cleanupEvidence("RELEASE_GRACE_INTERRUPTED", "ALL", e.toString())
+            }
+            trackers.forEach { (sensor, tracker) ->
+                cleanupEvidence("FINAL_UNSET_RETRY_REQUEST", sensor, "tracker=${System.identityHashCode(tracker)}")
+                try { tracker.unset(); cleanupEvidence("FINAL_UNSET_RETRY_RETURNED", sensor) }
+                catch(e: Exception) { cleanupEvidence("FINAL_UNSET_RETRY_FAILED", sensor, e.toString()); failure = e }
+            }
+        }
+        // Give the vendor service a short window after the last unset retry before unbinding.
+        // This is still only cleanup evidence; it is not a hardware-stop receipt.
+        if (postRetryGraceMs > 0L && trackers.isNotEmpty()) {
+            cleanupEvidence("RELEASE_GRACE_AFTER_UNSET_RETRY", "ALL", "graceMs=$postRetryGraceMs")
+            try { pause(postRetryGraceMs) }
+            catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                cleanupEvidence("RELEASE_GRACE_AFTER_RETRY_INTERRUPTED", "ALL", e.toString())
+            }
+        }
+        // Clear adapter-owned vendor references before tearing the connector down. The final
+        // unset retries above have already run; no tracker handle should outlive this point.
+        val retainedTypes = trackers.keys.toList()
+        val retainedDeliveries = deliveries.keys.toList()
+        cleanupEvidence("REFS_CLEARED_BEFORE_DISCONNECT", "ALL",
+            "trackers=$retainedTypes; deliveries=$retainedDeliveries")
+        trackers.clear(); deliveries.clear()
+        cleanupEvidence("DISCONNECT_REQUEST", "ALL", "retainedTypes=$retainedTypes")
         try { backend.disconnect(); cleanupEvidence("DISCONNECT_RETURNED", "ALL") }
         catch (e: Exception) { cleanupEvidence("DISCONNECT_FAILED", "ALL", e.toString()); failure = e }
-        trackers.clear(); deliveries.clear()
+        cleanupEvidence("DISCONNECT_RECHECK", "ALL",
+            "trackersRetained=${trackers.size}; deliveriesRetained=${deliveries.size}; hardwareStoppedVerified=false")
         cleanupEvidence("OWNER_CLOSED", "ALL", "failure=${failure?.toString().orEmpty()}")
         failure?.let { throw it }
     }

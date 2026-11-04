@@ -54,4 +54,59 @@ class SamsungReleaseTest {
         old.onDataReceived(emptyList());assertEquals(0,rows)
         assertTrue(stages.contains("CALLBACK_AFTER_STOP"));a.close()
     }
+    @Test fun configuredGraceRetriesUnsetBeforeVendorDisconnect() {
+        val b=Backend();val stages=mutableListOf<String>();val pauses=mutableListOf<Long>()
+        val a=SamsungSensorAdapter(b,{it()},{_,f->stages.add(f["stage"].toString())},{1L},{1L},
+            releaseGraceMs=40L,pause={pauses.add(it)})
+        a.start("PPG",{}, {})
+        a.close()
+        assertEquals(listOf(40L),pauses)
+        assertEquals(3,b.trackers.getValue("PPG").stops)
+        assertTrue(stages.indexOf("RELEASE_GRACE_BEFORE_DISCONNECT") < stages.indexOf("FINAL_UNSET_RETRY_REQUEST"))
+        assertTrue(stages.indexOf("FINAL_UNSET_RETRY_RETURNED") < stages.indexOf("DISCONNECT_REQUEST"))
+        assertEquals(1,b.disconnects)
+    }
+    @Test fun postRetryGraceWaitsBeforeVendorDisconnect() {
+        val b=Backend();val stages=mutableListOf<String>();val pauses=mutableListOf<Long>()
+        val a=SamsungSensorAdapter(b,{it()},{_,f->stages.add(f["stage"].toString())},{1L},{1L},
+            releaseGraceMs=40L,postRetryGraceMs=25L,pause={pauses.add(it)})
+        a.start("PPG_ON_DEMAND",{}, {})
+        a.close()
+        assertEquals(listOf(40L,25L),pauses)
+        assertTrue(stages.indexOf("RELEASE_GRACE_AFTER_UNSET_RETRY") < stages.indexOf("REFS_CLEARED_BEFORE_DISCONNECT"))
+        assertEquals(1,b.disconnects)
+    }
+    @Test fun noGraceKeepsExistingReleaseOrderAndStopCount() {
+        val b=Backend();val stages=mutableListOf<String>()
+        val a=SamsungSensorAdapter(b,{it()},{_,f->stages.add(f["stage"].toString())},{1L},{1L})
+        a.start("PPG",{}, {})
+        a.close()
+        assertEquals(2,b.trackers.getValue("PPG").stops)
+        assertFalse(stages.contains("RELEASE_GRACE_BEFORE_DISCONNECT"))
+        assertEquals(1,b.disconnects)
+    }
+    @Test fun closeClearsVendorReferencesBeforeDisconnectAndRecordsRecheck() {
+        val b=Backend();val stages=mutableListOf<String>()
+        val a=SamsungSensorAdapter(b,{it()},{_,f->stages.add(f["stage"].toString())},{1L},{1L},
+            releaseGraceMs=40L,pause={})
+        a.start("PPG",{}, {})
+        a.close()
+        assertTrue(stages.indexOf("FINAL_UNSET_RETRY_RETURNED") < stages.indexOf("REFS_CLEARED_BEFORE_DISCONNECT"))
+        assertTrue(stages.indexOf("REFS_CLEARED_BEFORE_DISCONNECT") < stages.indexOf("DISCONNECT_REQUEST"))
+        assertTrue(stages.indexOf("DISCONNECT_REQUEST") < stages.indexOf("DISCONNECT_RETURNED"))
+        assertTrue(stages.indexOf("DISCONNECT_RETURNED") < stages.indexOf("DISCONNECT_RECHECK"))
+        assertTrue(stages.indexOf("DISCONNECT_RECHECK") < stages.indexOf("OWNER_CLOSED"))
+        assertEquals(1,b.disconnects)
+    }
+    @Test fun failedDisconnectStillClearsReferencesAndRecordsRecheck() {
+        val b=Backend();b.failDisconnect=true;val stages=mutableListOf<String>()
+        val a=SamsungSensorAdapter(b,{it()},{_,f->stages.add(f["stage"].toString())},{1L},{1L})
+        a.start("PPG",{}, {})
+        try { a.close(); fail("Expected failure") } catch (_:IllegalStateException){}
+        assertTrue(stages.contains("REFS_CLEARED_BEFORE_DISCONNECT"))
+        assertTrue(stages.contains("DISCONNECT_FAILED"))
+        assertTrue(stages.contains("DISCONNECT_RECHECK"))
+        assertTrue(stages.contains("OWNER_CLOSED"))
+        assertEquals(1,b.disconnects)
+    }
 }

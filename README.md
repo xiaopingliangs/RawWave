@@ -20,6 +20,13 @@ RawWave 是一个开源的手表数据采集软件，主要用于三星 Galaxy W
 
 目前项目仍在开发中，具体支持哪些数据，取决于手表硬件和系统开放的功能。
 
+## 最新测试版（2026-11-04）
+
+- `ppg-mode-test-20261104-r02` / `0.8.9-ppg-mode-test` / versionCode 65
+- 模板可独立选择“活动中连续 PPG 25Hz”和“活动前后 PPG 100Hz 30秒”，并提供四个测试预设；同时包含手表同步成功退出修复。
+- 这是诊断测试版，真机尚未验收，不是稳定发布；LED 仍未闭环。
+- 安装包、SHA256 和测试步骤见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，也可到 [Releases](https://github.com/xiaopingliangs/RawWave/releases/tag/ppg-mode-test-20261104-r02) 下载。
+
 ---
 
 # RawWave
@@ -43,3 +50,7 @@ You can use other apps, AI tools, or your own methods to explore the exported da
 **Simply put: you choose what to record. RawWave helps you keep the data.**
 
 RawWave is still in development. Available features depend on the watch hardware and system support.
+
+### Latest test build (2026-11-04)
+
+`ppg-mode-test-20261104-r02` / `0.8.9-ppg-mode-test` / versionCode 65. Independent continuous 25 Hz PPG and pre/post 100 Hz PPG modes, four test presets, and the watch sync-exit fix. Diagnostic build; not device-verified and not a stable release. See [RELEASE_NOTES.md](RELEASE_NOTES.md).

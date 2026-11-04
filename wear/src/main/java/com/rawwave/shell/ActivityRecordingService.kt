@@ -19,6 +19,7 @@ import com.rawwave.core.CapturePhasePolicy
 import com.rawwave.core.CaptureRuns
 import com.rawwave.core.CaptureDrain
 import com.rawwave.core.CaptureQueue
+import com.rawwave.core.CoreDataBudget
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -63,6 +64,8 @@ class ActivityRecordingService : Service() {
     private var biaSummary = ""
     private var spo2 = false
     private var spo2Pre = true
+    private var ppg = false
+    private var ppgPre = true
     private var shortSensor = "ECG"
     private var shortFailure = false
     private var preSpo2Attempt = 99
@@ -70,9 +73,15 @@ class ActivityRecordingService : Service() {
     private var spo2Phase = "PRE-100"
     private val spo2Results = linkedMapOf<String, String>()
     private var spo2Value: Int? = null
+    private var prePpgAttempt = 299
+    private var postPpgAttempt = 299
+    private var ppgPhase = "PRE-300"
+    private val ppgResults = linkedMapOf<String, String>()
+    private var ppgRows = 0L
     private var coreSources = SensorCatalog.defaultCoreSources()
     private var deadline = 0L
     private var sessionStartedMs = 0L
+    @Volatile private var coreDataObserved = false
     internal var terminalReason = ""; private set
     private var stopping = false
     private var draining: CaptureDrain? = null
@@ -80,7 +89,7 @@ class ActivityRecordingService : Service() {
     private var incompleteTail = ""
     @Volatile private var destroyed = false
     @Volatile private var taskRemoved = false
-    internal fun shouldStartFinishSync(sealed: Boolean) = sealed && !destroyed && !taskRemoved
+    internal fun shouldStartFinishSync(sealed: Boolean) = sealed && !destroyed && !taskRemoved && coreDataObserved
     private val fatalPending = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private var started = false
     private var contact = false
@@ -111,7 +120,7 @@ class ActivityRecordingService : Service() {
             renewCaptureLock()
             persistence?.check()
             flush()
-            running.filter { it != "SPO2" && it != "BIA" && it != "MF_BIA" }.forEach { sensor ->
+            running.filter { it != "SPO2" && it != "BIA" && it != "MF_BIA" && it != "PPG_ON_DEMAND" }.forEach { sensor ->
                 if (clock() - (lastData[sensor] ?: 0) > 15_000 && silent.add(sensor)) {
                     event("DATA_SILENCE_OBSERVED", "$sensor: no callback for 15s; SDK buffering versus missing data unknown")
                     notice = "$sensor 暂无新数据，原因未确认；其他采集继续。"
@@ -127,6 +136,16 @@ class ActivityRecordingService : Service() {
                 event("CAPTURE_DEADLINE_OBSERVED", "phase=$phase; deadlineMs=$deadline; observedMs=${clock()}; lateMs=${clock()-deadline}; wakeLockHeld=${lock?.isHeld == true}; uptimeMs=${SystemClock.uptimeMillis()}")
                 if (phase.startsWith("ARM_BIA_")) { beginBia(); return@guarded }
                 if (placementWaiting()) { finish("PLACEMENT_IDLE_TIMEOUT_80S", true); return@guarded }
+                if (phase == "CORE-1") {
+                    // No non-empty row from any core source arrived inside the initial window.
+                    // This is a power/lifecycle timeout, not a clinical validity judgment.
+                    if (CoreDataBudget.mustStop(deadline, clock(), coreDataObserved)) {
+                        event("CORE_NO_DATA_TIMEOUT_80S", "No raw row from any core source; ending without post measurements or sync")
+                        finish("CORE_NO_DATA_TIMEOUT_80S", true); return@guarded
+                    }
+                    deadline = 0
+                    publish(); writer.postDelayed(this, 1000); return@guarded
+                }
                 if (shortSensor == "BIA") {
                     if(phase.startsWith("REVIEW_")) finish("BIA_REVIEW_IDLE_TIMEOUT_80S",true)
                     else endBia(false,"MEASUREMENT_TIMEOUT_60S")
@@ -135,6 +154,11 @@ class ActivityRecordingService : Service() {
                 if (shortSensor == "SPO2") {
                     if (phase.startsWith("REVIEW_")) finish("SPO2_REVIEW_IDLE_TIMEOUT_80S", true)
                     else endSpo2(false, "MEASUREMENT_TIMEOUT_30S")
+                    return@guarded
+                }
+                if (shortSensor == "PPG_ON_DEMAND") {
+                    if (phase.startsWith("REVIEW_")) finish("PPG_REVIEW_IDLE_TIMEOUT_80S", true)
+                    else endPpg(ppgRows > 0, if (ppgRows > 0) "MEASUREMENT_WINDOW_COMPLETE_30S" else "NO_DATA_30S")
                     return@guarded
                 }
                 val next = CapturePhasePolicy.expired(phase, ecgGate.measuring())
@@ -176,9 +200,14 @@ class ActivityRecordingService : Service() {
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.createNotificationChannel(NotificationChannel("capture", "活动采集", NotificationManager.IMPORTANCE_LOW))
                 val pending = PendingIntent.getActivity(this, 0, Intent(this, RecordingActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                val stop = PendingIntent.getService(this, 1,
+                    Intent(this, ActivityRecordingService::class.java).setAction("CANCEL"),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
                 startForeground(410, Notification.Builder(this, "capture").setSmallIcon(R.drawable.ic_rawwave)
-                    .setContentTitle("原波正在记录活动").setContentText("返回原波结束活动；已采集数据持续保存")
-                    .setContentIntent(pending).setOngoing(true).build(),
+                    .setContentTitle("原波正在记录活动")
+                    .setContentText("返回原波正常结束；也可停止采集并保存（不做活动后短测）")
+                    .setContentIntent(pending).setOngoing(true)
+                    .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止采集（保存）", stop).build(),
                     if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH else 0)
                 lock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RawWave:Capture").apply {
                     setReferenceCounted(false); acquire(60_000)
@@ -190,7 +219,7 @@ class ActivityRecordingService : Service() {
                     val template = store.templates().single { it.id() == id }
                     beginSession(store.start(template, System.currentTimeMillis(), clock()),template,
                         CaptureAssembly.sensors(this, ::enqueue,
-                            template.ecg() || template.spo2() || template.bia() || template.coreSources().any { it != "GYROSCOPE" && it != "PRESSURE" && it != "MAGNETIC_FIELD" }, template.biaProfile(), ::enqueueRows))
+                            template.ecg() || template.spo2() || template.ppg() || template.bia() || template.coreSources().any { it != "GYROSCOPE" && it != "PRESSURE" && it != "MAGNETIC_FIELD" }, template.biaProfile(), ::enqueueRows))
                 } }
             } catch (e: Exception) { writer.post { fail(e) } }
         } else if (started) {
@@ -204,7 +233,7 @@ class ActivityRecordingService : Service() {
         session = value
         if (useDiskOwner) persistence = com.rawwave.core.CapturePersistence(value)
         ecg = template.ecg(); coreSources = template.coreSources().toList()
-        spo2 = template.spo2(); bia = template.bia(); bodySource=if(template.mfBia()) "MF_BIA" else "BIA"
+        spo2 = template.spo2(); bia = template.bia(); ppg = template.ppg(); bodySource=if(template.mfBia()) "MF_BIA" else "BIA"
         sessionStartedMs = clock()
         event("CAPTURE_START", "build=${BuildConfig.BUILD_RUN}; template=${template.id()}")
         phase = "CONNECTING"; deadline = clock() + 20_000
@@ -215,7 +244,7 @@ class ActivityRecordingService : Service() {
             if (phase != "CONNECTING") return@connect
             if (clock() >= deadline) { finish("SDK_CONNECT_TIMEOUT"); return@connect }
             writer.removeCallbacks(tick)
-            if (spo2) prepareSpo2(true) else if (bia) prepareBia(true) else if (ecg) beginEcg("PRE-1") else beginCore()
+            if (spo2) prepareSpo2(true) else if (ppg) preparePpg(true) else if (bia) prepareBia(true) else if (ecg) beginEcg("PRE-1") else beginCore()
         }, { finish(it) })
         writer.post(tick)
     }
@@ -230,13 +259,13 @@ class ActivityRecordingService : Service() {
                 if (placementWaiting() && clock() >= deadline) {
                     finish("PLACEMENT_IDLE_TIMEOUT_80S", true); return@guarded
                 }
-                if ((shortSensor == "SPO2" || shortSensor == "BIA") && phase.startsWith("REVIEW_") && clock() >= deadline) {
+                if ((shortSensor == "SPO2" || shortSensor == "BIA" || shortSensor == "PPG_ON_DEMAND") && phase.startsWith("REVIEW_") && clock() >= deadline) {
                     finish("${shortSensor}_REVIEW_IDLE_TIMEOUT_80S", true); return@guarded
                 }
                 when (action) {
                     "END" -> if (phase == "CORE-1") {
                         event("USER_ENDED_CORE", "Post measurements follow the template, not a new choice")
-                        drainSources(allowPartialPost = ecg || spo2 || bia) {
+                        drainSources(allowPartialPost = ecg || spo2 || bia || ppg) {
                         when(CapturePhasePolicy.coreEnded(ecg)) {
                             CapturePhasePolicy.Next.POST_ECG -> beginEcg("POST-1")
                             else -> beginPostShorts()
@@ -252,6 +281,7 @@ class ActivityRecordingService : Service() {
                           event("USER_SKIPPED_BIA","pre=$biaPre"); afterBia()
                       }
                       "START_SPO2" -> if (phase.startsWith("READY_SPO2_")) beginSpo2(spo2Pre)
+                      "START_PPG" -> if (phase.startsWith("READY_PPG_")) beginPpg(ppgPre)
                       "PLACEMENT_READY" -> if (phase == "RESTORE_PRE") {
                           event("NORMAL_PLACEMENT_CONFIRMED", "next=${if(ecg) "ECG" else "CORE"}")
                           if(ecg) beginEcg("PRE-1") else beginCore()
@@ -261,6 +291,13 @@ class ActivityRecordingService : Service() {
                           shortFailure = true; spo2Results[spo2Phase] = "未取得有效结果，已跳过"
                           event("USER_SKIPPED_SPO2", "pre=$spo2Pre")
                           afterSpo2()
+                      }
+                      "RETRY_PPG" -> if (phase.startsWith("REVIEW_PPG_")) preparePpg(ppgPre)
+                      "SKIP_PPG" -> if (phase.startsWith("REVIEW_PPG_") || phase.startsWith("READY_PPG_")) {
+                          shortFailure = true
+                          if (phase.startsWith("REVIEW_")) ppgResults[ppgPhase] = "未采集，已跳过"
+                          event("USER_SKIPPED_PPG", "pre=$ppgPre")
+                          afterPpg()
                       }
                     "RETRY_ECG" -> if (shortSensor == "ECG" && phase.startsWith("REVIEW_")) {
                         event("USER_RETRY_ECG", ecgPhase)
@@ -311,16 +348,19 @@ class ActivityRecordingService : Service() {
     }
     private fun beginCore() {
         shortSensor = ""
-        phase = "CORE-1"; notice = ""; deadline = 0
+        phase = "CORE-1"; notice = ""; coreDataObserved = false
+        // If the user starts an activity and is then interrupted before any raw row arrives,
+        // end the session and exit instead of holding the watch awake indefinitely.
+        deadline = CoreDataBudget.initialDeadline(clock())
         event("PHASE_START", phase)
         startingSources = true
         coreSources.forEach(::startSource)
         startingSources = false
         if (running.isEmpty()) finish("ALL_CORE_SOURCES_FAILED") else restartTick()
     }
-    private fun placementWaiting() = phase.startsWith("READY_BIA_") || phase.startsWith("READY_SPO2_") || phase == "RESTORE_PRE"
+    private fun placementWaiting() = phase.startsWith("READY_BIA_") || phase.startsWith("READY_SPO2_") || phase.startsWith("READY_PPG_") || phase == "RESTORE_PRE"
     private fun beginPostShorts() {
-        if(bia) prepareBia(false) else if(spo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        if(bia) prepareBia(false) else if(ppg) preparePpg(false) else if(spo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun prepareBia(pre: Boolean) {
         shortSensor="BIA"; biaPre=pre
@@ -368,6 +408,7 @@ class ActivityRecordingService : Service() {
     }
     private fun afterBia() {
         if(biaPre) restorePlacement()
+        else if(ppg) preparePpg(false)
         else if(spo2) prepareSpo2(false)
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
@@ -409,7 +450,43 @@ class ActivityRecordingService : Service() {
         }
     }
     private fun afterSpo2() {
-        if(spo2Pre) { if(bia) prepareBia(true) else restorePlacement() }
+        if(spo2Pre) { if(ppg) preparePpg(true) else if(bia) prepareBia(true) else restorePlacement() }
+        else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+    }
+    private fun preparePpg(pre: Boolean) {
+        shortSensor = "PPG_ON_DEMAND"; ppgPre = pre
+        phase = if(pre) "READY_PPG_PRE" else "READY_PPG_POST"
+        notice = "请正常佩戴手表并保持贴合，手臂静止。\n点开始后采集30秒原始 PPG（绿/红外/红，100Hz）；准备时间不计入测量。80秒不操作则停止。"
+        deadline = clock() + 80_000
+        event("PPG_PLACEMENT_PREPARATION", "pre=$pre; sensorsNotStarted=true")
+        holdDecisionWindow(); restartTick()
+    }
+    private fun beginPpg(pre: Boolean) {
+        shortSensor = "PPG_ON_DEMAND"; ppgPre = pre
+        phase = if(pre) "PRE-${++prePpgAttempt}" else "POST-${++postPpgAttempt}"
+        ppgPhase = phase
+        ppgRows = 0
+        ppgResults[phase] = "测量中，尚无原始记录"
+        deadline = clock() + 30_000
+        notice = "PPG 测量中，请保持静止；最多采集30秒，原始绿/红外/红记录会原样保存。"
+        event("PPG_MEASUREMENT_STARTED", "pre=$pre; deadlineMs=$deadline")
+        startSource("PPG_ON_DEMAND"); restartTick()
+    }
+    private fun endPpg(success: Boolean, reason: String) {
+        if(draining != null || stopping) return
+        drainSources {
+            ppgResults[ppgPhase] = if(success) "已采集 $ppgRows 条原始记录" else "未采集到原始记录"
+            event("PPG_MEASUREMENT_SAVED", "success=$success; reason=$reason; pre=$ppgPre; rawRows=$ppgRows")
+            if(success) afterPpg() else {
+                phase = if(ppgPre) "REVIEW_PPG_PRE" else "REVIEW_PPG_POST"
+                notice = "PPG 未取得原始记录（$reason）。已有数据已保存，可重测或跳过；80秒不操作则退出。"
+                deadline = clock() + 80_000; holdDecisionWindow(); restartTick()
+            }
+        }
+    }
+    private fun afterPpg() {
+        if(ppgPre) { if(bia) prepareBia(true) else restorePlacement() }
+        else if(spo2) prepareSpo2(false)
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun restorePlacement() {
@@ -418,6 +495,16 @@ class ActivityRecordingService : Service() {
             deadline = clock() + 80_000
             event("NORMAL_PLACEMENT_REQUESTED", "sensorsNotStarted=true")
             holdDecisionWindow(); restartTick()
+    }
+    /** Any non-empty raw row from a core source disarms the no-data watchdog. Not a clinical validity judgment. */
+    private fun noteCoreData(origin: String, sensor: String, rows: List<Map<String, Any?>>) {
+        if (origin != "CORE-1" || rows.isEmpty()) return
+        val first = !coreDataObserved
+        coreDataObserved = true
+        if (phase == "CORE-1") deadline = 0
+        if (first && phase == "CORE-1") {
+            event("CORE_DATA_OBSERVED", "first non-empty row from $sensor; no-data watchdog disarmed; not a clinical validity judgment")
+        }
     }
     private fun startSource(sensor: String) {
         val origin = phase
@@ -428,6 +515,7 @@ class ActivityRecordingService : Service() {
         lastData[sensor] = clock(); silent.remove(sensor)
         event("SENSOR_START_REQUEST", sensor)
         adapter!!.start(sensor, { rows ->
+            noteCoreData(origin, sensor, rows)
             if (phase != origin || !captureRuns.current(run)) {
                 // Preserve late delivered samples under their originating phase, never relabel them.
                 appendRows(origin, sensor, rows)
@@ -472,6 +560,16 @@ class ActivityRecordingService : Service() {
                             "计算中，尚无有效结果" else "尚无有效结果，等待测量完成"
                         publish()
                     }
+                }
+                if (sensor == "PPG_ON_DEMAND" && rows.isNotEmpty() && draining == null) {
+                    ppgRows += rows.size
+                    ppgResults[ppgPhase] = "已接收 $ppgRows 条原始记录"
+                    if (clock() >= deadline) {
+                        endPpg(true, "MEASUREMENT_WINDOW_COMPLETE_30S")
+                        return@start
+                    }
+                    notice = "PPG 测量中，已接收 $ppgRows 条原始记录；保持静止至30秒结束。"
+                    publish()
                 }
                 if (sensor == "ECG" && rows.isNotEmpty() && draining == null) {
                     // A late SDK batch cannot revive an expired no-contact wait.
@@ -531,6 +629,8 @@ class ActivityRecordingService : Service() {
                     endBia(false,"SDK_FAILURE:$error")
                 } else if(sensor == "SPO2") {
                     endSpo2(false,"SDK_FAILURE:$error")
+                } else if(sensor == "PPG_ON_DEMAND") {
+                    endPpg(false,"SDK_FAILURE:$error")
                 } else {
                     notice = "$sensor 失败：$error；其他数据保留"
                     if (phase.startsWith("CORE") && running.isEmpty() && !startingSources) finish("ALL_CORE_SOURCES_FAILED")
@@ -681,7 +781,7 @@ class ActivityRecordingService : Service() {
                   failure.startsWith("DRAIN_INCOMPLETE:") && !failure.contains("DRAIN_SAVE_FAILED:") &&
                   drain.failures().values.all { it == "DRAIN_TIMEOUT_TAIL_UNKNOWN" } -> {
                   incompleteTail = failure
-                  event("CORE_TAIL_UNCONFIRMED_POST_CONTINUES", "$failure; accepted rows persisted; sources stopped; post ECG follows")
+                  event("CORE_TAIL_UNCONFIRMED_POST_CONTINUES", "$failure; accepted rows persisted; sources stopped; post measurements follow")
                   next()
               }
             failure != null -> finishNow(failure, terminal?.second ?: false)
@@ -699,11 +799,12 @@ class ActivityRecordingService : Service() {
         buffers.forEach { (sensor, rows) -> if (rows.isNotEmpty()) { appendRows(streamPhase(), sensor, rows); rows.clear() } }
     }
     private fun streamPhase() = when (phase) {
-        "ARM_BIA_PRE", "CONNECTING", "READY_BIA_PRE", "READY_SPO2_PRE", "RESTORE_PRE" -> "PRE-1"
-        "ARM_BIA_POST", "READY_BIA_POST", "READY_SPO2_POST" -> "POST-1"
+        "ARM_BIA_PRE", "CONNECTING", "READY_BIA_PRE", "READY_SPO2_PRE", "READY_PPG_PRE", "RESTORE_PRE" -> "PRE-1"
+        "ARM_BIA_POST", "READY_BIA_POST", "READY_SPO2_POST", "READY_PPG_POST" -> "POST-1"
         "REVIEW_PRE", "REVIEW_POST" -> ecgPhase
         "REVIEW_BIA_PRE", "REVIEW_BIA_POST" -> biaPhase
         "REVIEW_SPO2_PRE", "REVIEW_SPO2_POST" -> spo2Phase
+        "REVIEW_PPG_PRE", "REVIEW_PPG_POST" -> ppgPhase
         else -> phase
     }
     private fun event(kind: String, detail: String) {
@@ -720,6 +821,7 @@ class ActivityRecordingService : Service() {
             phase == "RESTORE_PRE" -> "恢复运动佩戴位置"
             shortSensor == "BIA" -> if(biaPre) "活动前 $bodySource" else "活动后 $bodySource"
             shortSensor == "SPO2" -> if(spo2Pre) "活动前血氧 SpO₂" else "活动后血氧 SpO₂"
+            shortSensor == "PPG_ON_DEMAND" -> if(ppgPre) "活动前 PPG 100Hz" else "活动后 PPG 100Hz"
             phase == "CONNECTING" -> "正在连接三星传感器"
             phase.startsWith("PRE") -> "活动前 ECG"
             phase.startsWith("POST") -> "活动后 ECG"
@@ -737,16 +839,19 @@ class ActivityRecordingService : Service() {
         val idleHint = if (ecgPhaseActive && !ecgGate.measuring())
             "\n等待有效接触，${((deadline-clock()).coerceAtLeast(0)+999)/1000}秒后停止并退出；已有数据保留。"
             else ""
+        val postLedHint = if (phase.contains("POST"))
+            "\n活动后短测仍在进行，传感器灯亮着是正常的。短测结束后会停止采集；若灯仍长时间亮着，请发送问题报告。"
+            else ""
         val next = State(true, if (draining != null) "DRAINING" else phase,
             if (draining != null) "正在收尾并保存各传感器数据，请稍候（最多5秒收尾等待）\n$count"
-            else "$title\n$notice$idleHint" + (if(shortSensor == "BIA" || shortSensor == "SPO2" || placementWaiting()) "\n${if(placementWaiting() || phase.startsWith("REVIEW_")) "等待操作" else if(phase.startsWith("ARM_BIA_")) "距离开始" else "最多等待"} $remaining 秒" else "") +
+            else "$title\n$notice$idleHint$postLedHint" + (if(shortSensor == "BIA" || shortSensor == "SPO2" || shortSensor == "PPG_ON_DEMAND" || placementWaiting()) "\n${if(placementWaiting() || phase.startsWith("REVIEW_")) "等待操作" else if(phase.startsWith("ARM_BIA_")) "距离开始" else "最多等待"} $remaining 秒" else "") +
                 (if (incompleteTail.isEmpty()) "" else "\n部分活动传感器尾部未确认，已收数据已保存；继续活动后短测。") + "\n采集记录：\n$count", remaining,
             contact && clock() - lastContactMs < 2000,
             policy.skipAllowed(), policy.failures(), shortSensor)
         state = next; main.post { observer?.invoke(next) }
     }
     private fun countText(): String {
-        val raw = persistedCounts()?.filterKeys { !it.endsWith("/EVENT") && !it.endsWith("/SPO2") && !it.endsWith("/BIA") && !it.endsWith("/MF_BIA") }
+        val raw = persistedCounts()?.filterKeys { !it.endsWith("/EVENT") && !it.endsWith("/SPO2") && !it.endsWith("/BIA") && !it.endsWith("/MF_BIA") && !it.endsWith("/PPG_ON_DEMAND") }
             ?.entries?.sortedBy { it.key }?.map {
                 val phaseName = when { it.key.startsWith("PRE") -> "活动前"; it.key.startsWith("POST") -> "活动后"; else -> "活动中" }
                 "$phaseName ${sensorLabel(it.key.substringAfter('/'))}：${it.value} 条原始记录"
@@ -759,7 +864,10 @@ class ActivityRecordingService : Service() {
         val body = biaResults.map { (attempt,result) ->
             "${if(attempt.startsWith("PRE")) "活动前" else "活动后"} 体成分第${attempt.substringAfter('-').toInt()-199}次：$result"
         }
-        return (body + oxygen + raw).joinToString("\n").ifEmpty { "暂无采集记录" }
+        val ppgLines = ppgResults.map { (attempt,result) ->
+            "${if(attempt.startsWith("PRE")) "活动前" else "活动后"} PPG 100Hz第${attempt.substringAfter('-').toInt()-299}次：$result"
+        }
+        return (body + oxygen + ppgLines + raw).joinToString("\n").ifEmpty { "暂无采集记录" }
     }
     private fun sensorLabel(sensor: String) = when (sensor) {
         "ECG" -> "ECG"
@@ -771,6 +879,7 @@ class ActivityRecordingService : Service() {
         "HEART_RATE" -> "心率"
         "ACCELEROMETER" -> "加速度"
         "PPG" -> "PPG"
+        "PPG_ON_DEMAND" -> "PPG 100Hz"
         "SKIN_TEMPERATURE" -> "皮肤温度"
         "EDA" -> "皮肤电导"
         else -> sensor
@@ -802,6 +911,9 @@ class ActivityRecordingService : Service() {
                 "已停止，未取得有效结果"
             else if(result.contains("正在保存")) "已获得数值，保存是否完成请查看记录" else result
         }
+        ppgResults.replaceAll { _, result ->
+            if(result.contains("测量中")) "已停止，原始记录保存是否完成请查看记录" else result
+        }
         var result = reason + (if (incompleteTail.isEmpty()) "" else ";CORE_TAIL_UNCONFIRMED:$incompleteTail") +
             if(shortFailure) ";SHORT_MEASUREMENT_SKIPPED" else ""
         try { stopSources() } catch (e: Exception) { result += ";STOP_FAILURE:${e.message}" }
@@ -828,7 +940,9 @@ class ActivityRecordingService : Service() {
         try { lock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { result += ";LOCK_RELEASE_FAILURE:${e.message}" }
         if (destroyed) writer.close()
         if (idleExit) {
-            val next = State(false, "DONE", "短测等待或选择超时，已停止；已有数据保留，下次打开可同步。")
+            val next = State(false, "DONE", if (reason.startsWith("CORE_NO_DATA_TIMEOUT"))
+                "没有收到活动数据，已停止并退出；本次不会自动同步。" else
+                "短测等待或选择超时，已停止；已有数据保留，下次打开可同步。")
             state = next
             main.post {
                 stopForeground(STOP_FOREGROUND_REMOVE)

@@ -15,6 +15,10 @@ class ActivityCoordinatorTest {
     @get:Rule val temp=TemporaryFolder()
     private class Wire(val loseFirstReady: Boolean) {
         var breakOutput=false
+        var blockOutput=false
+        var onWrite: (Int) -> Unit = {}
+        val writeStarted=CountDownLatch(1)
+        val releaseWrite=CountDownLatch(1)
         var beforeNodes: () -> Unit = {}
         var nodeResult: CompletableFuture<List<String>>? = null
         val nodesRequested=CountDownLatch(1)
@@ -55,8 +59,26 @@ class ActivityCoordinatorTest {
             }
             override fun input(channel:TransportPort.Channel):CompletableFuture<InputStream> = CompletableFuture.completedFuture(this@Wire.input)
             override fun output(channel:TransportPort.Channel):CompletableFuture<OutputStream> = CompletableFuture.completedFuture(
-                if(breakOutput)object:OutputStream(){override fun write(value:Int){throw IOException("injected broken stream")}}
-                else this@Wire.output)
+                when {
+                    breakOutput -> object:OutputStream(){
+                        override fun write(value:Int){throw IOException("injected broken stream")}
+                    }
+                    blockOutput -> object:OutputStream(){
+                        private fun stall() {
+                            writeStarted.countDown()
+                            try { releaseWrite.await(30,TimeUnit.SECONDS) }
+                            catch (e:InterruptedException) { Thread.currentThread().interrupt(); throw IOException("injected stalled write interrupted",e) }
+                            throw IOException("injected stalled write released")
+                        }
+                        override fun write(value:Int)=stall()
+                        override fun write(buffer:ByteArray,offset:Int,length:Int)=stall()
+                    }
+                    else -> object:OutputStream(){
+                        override fun write(value:Int){onWrite(1);this@Wire.output.write(value)}
+                        override fun write(buffer:ByteArray,offset:Int,length:Int){onWrite(length);this@Wire.output.write(buffer,offset,length)}
+                        override fun flush(){this@Wire.output.flush()}
+                    }
+                })
             override fun adopt(channel:TransportPort.Channel) {}
             override fun reject(channel:TransportPort.Channel) { error("Unexpected rejected channel") }
             override fun close() { closes.incrementAndGet() }
@@ -156,6 +178,79 @@ class ActivityCoordinatorTest {
             if(dropReady)assertTrue(wire.readyCount.get()>=2)
         } finally {watch.cancel();phone.cancel();wire.dispose()}
     }
+    @Test fun activityLargeSlowTransferUsesSizeAwareBudget() {
+        val watchRoot=temp.newFolder();val phoneRoot=temp.newFolder()
+        val store=ActivityStore(File(watchRoot,"activities")){}
+        val session=store.start(store.createTemplate("大包",false),1000,1)
+        val random=java.util.Random(7)
+        val encoder=java.util.Base64.getEncoder()
+        session.append("CORE-1","HEART_RATE",(0 until 10_000).map { index ->
+            // Incompressible padding keeps the test archive large after ZIP compression.
+            val raw=ByteArray(512).also(random::nextBytes)
+            mapOf("HEART_RATE" to 70,"sdkTimestamp" to index.toLong(),"pad" to encoder.encodeToString(raw))
+        })
+        session.seal("DONE",2000)
+        val sender=FileSendStore(watchRoot,ReceiveStore.Kind.RAW_ACTIVITY){}
+        val payload=sender.prepare(null)!!
+        assertTrue("archive should exceed the old fixed budget",payload.bytes() > 4_000_000L)
+        val original=payload.file().readBytes()
+        val now=java.util.concurrent.atomic.AtomicLong(1)
+        // Two seconds of simulated link time per 64 KiB written. The old 75-second
+        // ceiling would expire before this archive finished.
+        val wire=Wire(false).apply { onWrite={ bytes -> now.addAndGet(bytes.toLong()/32L) } }
+        val receiverReady=CountDownLatch(1)
+        val watchDone=CompletableFuture<Pair<Boolean,String>>()
+        val phoneDone=CompletableFuture<Pair<Boolean,String>>()
+        val app=ProbeApplication()
+        val phone=ActivityTransferWindow(app,app,{if(it.contains("手机已准备接收"))receiverReady.countDown()},
+            {ok,text->phoneDone.complete(ok to text)},receiveStore=FileReceiveStore(phoneRoot){},
+            transportPort=wire.phone,sendStore=FileSendStore(phoneRoot,ReceiveStore.Kind.RAW_ACTIVITY){},
+            watchRole=false,monotonicMs={now.get()},environment={emptyMap()})
+        val watch=ActivityTransferWindow(app,app,{}, {ok,text->watchDone.complete(ok to text)},
+            receiveStore=FileReceiveStore(watchRoot){},transportPort=wire.watch,sendStore=sender,
+            watchRole=true,monotonicMs={now.get()},environment={emptyMap()})
+        try {
+            phone.start();assertTrue(receiverReady.await(5,TimeUnit.SECONDS));watch.start()
+            val w=watchDone.get(30,TimeUnit.SECONDS);val p=phoneDone.get(30,TimeUnit.SECONDS)
+            assertTrue(w.second,w.first);assertTrue(p.second,p.first)
+            assertTrue("simulated transfer time must exceed the old 75s budget",now.get() > WorkBudget.TRANSFER_MS)
+            assertArrayEquals(original,File(phoneRoot,"activity-inbox/${payload.id()}.zip").readBytes())
+            assertArrayEquals(original,payload.file().readBytes())
+            assertTrue(File(payload.file().parentFile,"${payload.id()}.ack.json").isFile)
+        } finally {watch.cancel();phone.cancel();wire.dispose()}
+    }
+    @Test fun activityStalledWriteAbortsAtStallDeadline() {
+        val watchRoot=temp.newFolder();val phoneRoot=temp.newFolder()
+        val store=ActivityStore(File(watchRoot,"activities")){}
+        val session=store.start(store.createTemplate("阻塞",false),1000,1)
+        session.append("CORE-1","HEART_RATE",listOf(mapOf("HEART_RATE" to 73,"sdkTimestamp" to 123L)))
+        session.seal("DONE",2000)
+        val sender=FileSendStore(watchRoot,ReceiveStore.Kind.RAW_ACTIVITY){}
+        val payload=sender.prepare(null)!!
+        val now=java.util.concurrent.atomic.AtomicLong(1)
+        val wire=Wire(false).apply { blockOutput=true }
+        val receiverReady=CountDownLatch(1)
+        val watchDone=CompletableFuture<Pair<Boolean,String>>()
+        val phoneDone=CompletableFuture<Pair<Boolean,String>>()
+        val app=ProbeApplication()
+        val phone=ActivityTransferWindow(app,app,{if(it.contains("手机已准备接收"))receiverReady.countDown()},
+            {ok,text->phoneDone.complete(ok to text)},receiveStore=FileReceiveStore(phoneRoot){},
+            transportPort=wire.phone,sendStore=FileSendStore(phoneRoot,ReceiveStore.Kind.RAW_ACTIVITY){},
+            watchRole=false,monotonicMs={now.get()},environment={emptyMap()})
+        val watch=ActivityTransferWindow(app,app,{}, {ok,text->watchDone.complete(ok to text)},
+            receiveStore=FileReceiveStore(watchRoot){},transportPort=wire.watch,sendStore=sender,
+            watchRole=true,monotonicMs={now.get()},environment={emptyMap()})
+        try {
+            phone.start();assertTrue(receiverReady.await(5,TimeUnit.SECONDS));watch.start()
+            assertTrue(wire.writeStarted.await(5,TimeUnit.SECONDS))
+            now.addAndGet(ActivityTransferBudget.STALL_MS+1)
+            val w=watchDone.get(5,TimeUnit.SECONDS)
+            assertFalse(w.second,w.first)
+            assertTrue(w.second.contains("没有进展"))
+            assertFalse(File(payload.file().parentFile,"${payload.id()}.ack.json").exists())
+            assertEquals(1,wire.watch.closes.get())
+        } finally {wire.releaseWrite.countDown();watch.cancel();phone.cancel();wire.dispose()}
+    }
     private fun runStoppedDiscovery(cancel:Boolean,report:Boolean=false) {
         val root=temp.newFolder();val store=ActivityStore(File(root,"activities")){}
         val session=store.start(store.createTemplate("截止取消",false),1000,1)
@@ -167,7 +262,9 @@ class ActivityCoordinatorTest {
         val now=java.util.concurrent.atomic.AtomicLong(1)
         val late=CompletableFuture<List<String>>()
         val wire=Wire(false).apply {
-            if(cancel)nodeResult=late else beforeNodes={now.addAndGet(WorkBudget.TRANSFER_MS+1)}
+            if(cancel)nodeResult=late
+            else beforeNodes={now.addAndGet(
+                if(report) WorkBudget.TRANSFER_MS+1 else ActivityTransferBudget.INITIAL_MS+1)}
         }
         val done=CompletableFuture<Pair<Boolean,String>>();val app=ProbeApplication()
         val start:()->Unit;val cancelWindow:()->Unit

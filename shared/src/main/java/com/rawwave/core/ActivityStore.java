@@ -16,10 +16,14 @@ public final class ActivityStore {
         this.root = root; this.directorySync = directorySync;
         Files.createDirectories(root.toPath());
     }
-    public record Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia) {
+    public record Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia, boolean ppg) {
         public Template {
             Objects.requireNonNull(id); Objects.requireNonNull(name);
             coreSources = SensorCatalog.normalizeCoreSources(coreSources);
+        }
+        /** Source-compatible constructor for templates written before the PPG short measurement existed. */
+        public Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia) {
+            this(id, name, ecg, coreSources, spo2, biaProfile, mfBia, false);
         }
         public Template(String id,String name,boolean ecg,List<String> sources,boolean spo2,BiaProfile profile) {
             this(id,name,ecg,sources,spo2,profile,false);
@@ -49,12 +53,15 @@ public final class ActivityStore {
         return createTemplate(name,ecg,coreSources,spo2,profile,false);
     }
     public Template createTemplate(String name, boolean ecg, Collection<String> coreSources, boolean spo2, BiaProfile profile, boolean mfBia) throws IOException {
+        return createTemplate(name, ecg, coreSources, spo2, profile, mfBia, false);
+    }
+    public Template createTemplate(String name, boolean ecg, Collection<String> coreSources, boolean spo2, BiaProfile profile, boolean mfBia, boolean ppg) throws IOException {
         name = name.trim();
         if (name.isEmpty() || name.length() > 40) throw new IOException("活动名称需要1至40个字");
         final List<String> normalized;
         try { normalized = SensorCatalog.normalizeCoreSources(coreSources); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage(),e); }
-        Template t = new Template(UUID.randomUUID().toString(), name, ecg, normalized, spo2, profile, mfBia);
+        Template t = new Template(UUID.randomUUID().toString(), name, ecg, normalized, spo2, profile, mfBia, ppg);
         File folder = new File(root,"templates"); Files.createDirectories(folder.toPath());
         write(new File(folder,t.id()+".json"),t); return t;
     }
@@ -68,12 +75,15 @@ public final class ActivityStore {
         return updateTemplate(id,name,ecg,sources,spo2,profile,false);
     }
     public synchronized Template updateTemplate(String id,String name,boolean ecg,Collection<String> sources,boolean spo2,BiaProfile profile,boolean mfBia) throws IOException {
+        return updateTemplate(id, name, ecg, sources, spo2, profile, mfBia, false);
+    }
+    public synchronized Template updateTemplate(String id,String name,boolean ecg,Collection<String> sources,boolean spo2,BiaProfile profile,boolean mfBia,boolean ppg) throws IOException {
         if (id == null || !id.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))
             throw new IOException("INVALID_TEMPLATE_ID");
         name = name.trim();
         if (name.isEmpty() || name.length() > 40) throw new IOException("活动名称需要1至40个字");
         final Template updated;
-        try { updated = new Template(id, name, ecg, SensorCatalog.normalizeCoreSources(sources), spo2, profile, mfBia); }
+        try { updated = new Template(id, name, ecg, SensorCatalog.normalizeCoreSources(sources), spo2, profile, mfBia, ppg); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage(), e); }
         File folder = new File(root,"templates"), target = new File(folder,id+".json");
         if (!target.isFile()) throw new IOException("活动已不存在，请返回重新选择");
@@ -99,7 +109,8 @@ public final class ActivityStore {
             }
             result.add(new Template(object.get("id").getAsString(), object.get("name").getAsString(),
                 object.get("ecg").getAsBoolean(), coreSources, object.has("spo2") && object.get("spo2").getAsBoolean(),
-                object.has("biaProfile") ? JSON.fromJson(object.get("biaProfile"), BiaProfile.class) : null, object.has("mfBia") && object.get("mfBia").getAsBoolean()));
+                object.has("biaProfile") ? JSON.fromJson(object.get("biaProfile"), BiaProfile.class) : null, object.has("mfBia") && object.get("mfBia").getAsBoolean(),
+                object.has("ppg") && object.get("ppg").getAsBoolean()));
         }
         result.sort(Comparator.comparing(Template::name)); return result;
     }
@@ -170,14 +181,15 @@ public final class ActivityStore {
         private Session(Template t,long utc,long elapsed) throws IOException {
             folder = new File(new File(root,"sessions"),id); Files.createDirectories(folder.toPath());
             Map<String,Object> plan=new LinkedHashMap<>();
-            plan.put("schema",4); plan.put("sessionId",id); plan.put("template",t);
+            plan.put("schema",5); plan.put("sessionId",id); plan.put("template",t);
             plan.put("createdUtcMs",utc); plan.put("createdElapsedMs",elapsed);
             plan.put("coreSources",t.coreSources());
-            plan.put("source","Samsung Health Sensor SDK 1.4.1; GYROSCOPE and PRESSURE use Android SensorManager");
+            plan.put("source","Samsung Health Sensor SDK 1.4.1; GYROSCOPE, PRESSURE and MAGNETIC_FIELD use Android SensorManager");
             Map<String,String> kinds = new LinkedHashMap<>();
             if (t.ecg()) kinds.put(SensorCatalog.ECG,SensorCatalog.dataKind(SensorCatalog.ECG));
             if (t.bia()) { String body=t.mfBia()?"MF_BIA":"BIA"; kinds.put(body,SensorCatalog.dataKind(body)); }
             if (t.spo2()) kinds.put(SensorCatalog.SPO2,SensorCatalog.dataKind(SensorCatalog.SPO2));
+            if (t.ppg()) kinds.put(SensorCatalog.PPG_ON_DEMAND,SensorCatalog.dataKind(SensorCatalog.PPG_ON_DEMAND));
             for (String sensor : t.coreSources()) kinds.put(sensor,SensorCatalog.dataKind(sensor));
             plan.put("dataKinds",kinds);
             plan.put("rawPolicy","SDK values copied without filtering, interpolation, invented samples or unit conversion; quality metadata is separate");

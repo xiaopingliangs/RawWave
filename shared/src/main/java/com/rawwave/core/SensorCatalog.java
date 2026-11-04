@@ -7,6 +7,7 @@ public final class SensorCatalog {
     public static final String MAGNETIC_FIELD = "MAGNETIC_FIELD";
     public static final String MF_BIA = "MF_BIA";
     public static final String BIA = "BIA";
+    public static final String PPG_ON_DEMAND = "PPG_ON_DEMAND";
     public static final String PRESSURE = "PRESSURE";
     public static final String ECG = "ECG";
     public static final String SPO2 = "SPO2";
@@ -23,6 +24,7 @@ public final class SensorCatalog {
     private static final List<String> DEFAULT_CORE = List.of(HEART_RATE, ACCELEROMETER);
     private static final Map<String,String> DATA_KINDS = Map.ofEntries(
         Map.entry(MF_BIA, "Samsung SDK processed multi-frequency impedance magnitude and phase at 5/10/50/250 kHz; original status/progress"),
+        Map.entry(PPG_ON_DEMAND, "Samsung SDK raw PPG green, infrared and red values at 100 Hz for an on-demand short measurement; per-channel status; not continuous"),
         Map.entry(MAGNETIC_FIELD, "Android TYPE_MAGNETIC_FIELD calibrated XYZ microtesla; original timestamp and accuracy; no app filtering"),
         Map.entry(BIA, "Samsung SDK processed body composition and impedance; original status and progress retained; not raw impedance waveform"),
         Map.entry(PRESSURE, "Android TYPE_PRESSURE ambient pressure hPa, original sensorTimestampNs and accuracy; no altitude conversion or app filtering"),
@@ -52,7 +54,8 @@ public final class SensorCatalog {
     }
 
     public static boolean acceptsStream(String sensor) {
-        return MF_BIA.equals(sensor) || EVENT.equals(sensor) || BIA.equals(sensor) || ECG.equals(sensor) || SPO2.equals(sensor) || CORE_ORDER.contains(sensor);
+        return MF_BIA.equals(sensor) || EVENT.equals(sensor) || BIA.equals(sensor) || ECG.equals(sensor)
+            || SPO2.equals(sensor) || PPG_ON_DEMAND.equals(sensor) || CORE_ORDER.contains(sensor);
     }
 
     public static String dataKind(String sensor) {

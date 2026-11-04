@@ -32,6 +32,74 @@ class CaptureServiceTest {
     private fun bodyRow(status:Int=0):Map<String,Any> = mapOf("STATUS" to status,"BODY_FAT_RATIO" to 20f,
         "BODY_FAT_MASS" to 13f,"SKELETAL_MUSCLE_MASS" to 28f,"TOTAL_BODY_WATER" to 40f,
         "sdkTimestamp" to 100L,"captureCallbackSequence" to 1L,"captureCallbackIndex" to 0,"captureCallbackSize" to 1)
+    private fun ppgRows(count:Int) = List(count) { index -> mapOf(
+        "sdkTimestamp" to index * 10L,
+        "PPG_GREEN" to 100 + index, "PPG_IR" to 200 + index, "PPG_RED" to 300 + index,
+        "GREEN_STATUS" to 0, "IR_STATUS" to 0, "RED_STATUS" to 0) }
+    @Test fun ppgOnDemandRunsBeforeAndAfterCoreAndKeepsEveryRawRow() {
+        val r=Rig(ppg=true,sources=listOf("PRESSURE"))
+        assertEquals("READY_PPG_PRE",ActivityRecordingService.state.phase)
+        r.service.command("START_PPG");r.queue.runReady()
+        assertEquals("PRE-300",ActivityRecordingService.state.phase)
+        assertEquals("PPG_ON_DEMAND",ActivityRecordingService.state.shortSensor)
+        r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
+        assertTrue(ActivityRecordingService.state.text.contains("10 条原始记录"))
+        r.queue.advance(30000)
+        assertEquals("DRAINING",ActivityRecordingService.state.phase)
+        r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
+        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
+        assertEquals("READY_PPG_POST",ActivityRecordingService.state.phase)
+        r.service.command("START_PPG");r.queue.runReady()
+        r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
+        r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(10L,r.session.counts()["PRE-300/PPG_ON_DEMAND"])
+        assertEquals(10L,r.session.counts()["POST-300/PPG_ON_DEMAND"])
+        assertEquals(listOf("PPG_ON_DEMAND","PRESSURE","PPG_ON_DEMAND"),r.sensors.starts)
+    }
+    @Test fun continuousAndOnDemandPpgCanBothBeSelected() {
+        val r=Rig(ppg=true,sources=listOf("PPG"))
+        assertEquals("READY_PPG_PRE",ActivityRecordingService.state.phase)
+        r.service.command("START_PPG");r.queue.runReady()
+        r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
+        r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
+        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        r.sensors.emit("PPG",ppgRows(10));r.queue.runReady()
+        r.end();r.sensors.ack("PPG");r.queue.runReady()
+        assertEquals("READY_PPG_POST",ActivityRecordingService.state.phase)
+        r.service.command("START_PPG");r.queue.runReady()
+        r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
+        r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(10L,r.session.counts()["PRE-300/PPG_ON_DEMAND"])
+        assertEquals(10L,r.session.counts()["CORE-1/PPG"])
+        assertEquals(10L,r.session.counts()["POST-300/PPG_ON_DEMAND"])
+        assertEquals(listOf("PPG_ON_DEMAND","PPG","PPG_ON_DEMAND"),r.sensors.starts)
+    }
+    @Test fun ppgOnlyPostStillRunsAfterUnconfirmedCoreTail() {
+        val r=Rig(ppg=true,sources=listOf("PRESSURE"))
+        r.service.command("START_PPG");r.queue.runReady()
+        r.sensors.emit("PPG_ON_DEMAND",ppgRows(1));r.queue.runReady()
+        r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
+        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        r.end();r.queue.advance(5000)
+        assertEquals("READY_PPG_POST",ActivityRecordingService.state.phase)
+    }
+    @Test fun ppgWithoutRowsGoesToReviewAndSkipContinues() {
+        val r=Rig(ppg=true,sources=listOf("PRESSURE"))
+        r.service.command("START_PPG");r.queue.runReady()
+        r.queue.advance(30000)
+        assertEquals("DRAINING",ActivityRecordingService.state.phase)
+        r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
+        assertEquals("REVIEW_PPG_PRE",ActivityRecordingService.state.phase)
+        assertTrue(ActivityRecordingService.state.text.contains("未取得原始记录"))
+        r.service.command("SKIP_PPG");r.queue.runReady()
+        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+    }
     @Test fun oxygenIsFirstAndLastWithBiaInsideAndOneRestore() {
         val r=Rig(bia=true,spo2=true,sources=listOf("PRESSURE"))
         assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
@@ -175,15 +243,15 @@ class CaptureServiceTest {
         fun emit(sensor:String,data:List<Map<String,Any?>>) {val receiver=rows.getValue(sensor);owner.enqueueRows(data) {receiver.accept(data)}}
         fun ack(sensor:String, status:SensorPort.DrainStatus?=null) {
             val done=drains.remove(sensor) ?: error("no pending drain")
-            owner.enqueue {done.accept(status ?: if(sensor=="MF_BIA" || sensor=="BIA" || sensor=="ECG" || sensor=="SPO2")SensorPort.DrainStatus.DELIVERED_ONLY else SensorPort.DrainStatus.FLUSHED,"fake ack")}
+            owner.enqueue {done.accept(status ?: if(sensor=="MF_BIA" || sensor=="BIA" || sensor=="ECG" || sensor=="SPO2" || sensor=="PPG_ON_DEMAND")SensorPort.DrainStatus.DELIVERED_ONLY else SensorPort.DrainStatus.FLUSHED,"fake ack")}
         }
     }
-    private inner class Rig(ecg:Boolean=false,autoRun:Boolean=true,diskOwner:Boolean=false,spo2:Boolean=false,bia:Boolean=false,mf:Boolean=false,sources:List<String> = listOf("HEART_RATE","PPG")) {
+    private inner class Rig(ecg:Boolean=false,autoRun:Boolean=true,diskOwner:Boolean=false,spo2:Boolean=false,bia:Boolean=false,mf:Boolean=false,ppg:Boolean=false,sources:List<String> = listOf("HEART_RATE","PPG")) {
         val queue=Queue();val service=ActivityRecordingService();val sensors=Sensors(service)
         @Volatile var failDisk=false
         @Volatile var diskHook: (() -> Unit)? = null
         val store=ActivityStore(temp.newFolder()){diskHook?.invoke();if(failDisk)throw IOException("injected disk failure")}
-        val template=store.createTemplate("宿主收尾",ecg,sources,spo2,if(bia)BiaProfile(170f,65f,30,1)else null,mf)
+        val template=store.createTemplate("宿主收尾",ecg,sources,spo2,if(bia)BiaProfile(170f,65f,30,1)else null,mf,ppg)
         val session=store.start(template,1000,1)
         init {
             service.writer=queue;service.clock={queue.now};service.useDiskOwner=diskOwner
@@ -350,12 +418,45 @@ class CaptureServiceTest {
     }
     @Test fun normalCompletionCanSyncButUnsealedDataCannot() {
         val r=Rig(diskOwner=true)
+        r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to -1)))
+        r.queue.runReady()
         r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
         assertTrue(r.seal().exists());assertTrue(r.service.shouldStartFinishSync(true))
         assertFalse(r.service.shouldStartFinishSync(false))
         // Also covers task removal after the owner queued the main-thread handoff.
         r.service.onTaskRemoved(null)
         assertFalse(r.service.shouldStartFinishSync(true))
+    }
+    @Test fun noCoreDataCannotStartFinishSync() {
+        val r=Rig(diskOwner=true)
+        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertFalse(r.service.shouldStartFinishSync(true))
+    }
+    @Test fun coreNoDataTimeoutStopsAndExitsAfter80Seconds() {
+        val r=Rig(diskOwner=true)
+        r.queue.advance(79_999)
+        assertTrue(ActivityRecordingService.state.active)
+        assertFalse(r.seal().exists())
+        r.queue.advance(1_000)
+        assertEquals("DRAINING",ActivityRecordingService.state.phase)
+        r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertTrue(r.service.terminalReason.contains("CORE_NO_DATA_TIMEOUT_80S"))
+        assertFalse(r.service.shouldStartFinishSync(true))
+        assertFalse(ActivityRecordingService.state.active)
+    }
+    @Test fun firstCoreRowDisarmsNoDataTimeout() {
+        val r=Rig(diskOwner=true)
+        r.queue.advance(30_000)
+        r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to -1)))
+        r.queue.runReady()
+        r.queue.advance(60_000)
+        assertTrue(ActivityRecordingService.state.active)
+        assertFalse(r.seal().exists())
+        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertTrue(r.service.shouldStartFinishSync(true))
     }
     @Test fun thousandQueuedRawCallbacksSurviveOld256LimitAndDrainInOrder() {
         val r=Rig(diskOwner=true)

@@ -40,7 +40,7 @@ public class ActivityArchiveTest {
             ActivityStore value=store(root);
             ActivityStore.Session source=value.start(value.createTemplate("contract",false),123,456);
             List<String> streams=new ArrayList<>(SensorCatalog.availableCoreSources());
-            streams.add(SensorCatalog.MF_BIA); streams.add(SensorCatalog.BIA); streams.add(SensorCatalog.ECG); streams.add(SensorCatalog.SPO2); streams.add(SensorCatalog.EVENT);
+            streams.add(SensorCatalog.MF_BIA); streams.add(SensorCatalog.BIA); streams.add(SensorCatalog.ECG); streams.add(SensorCatalog.SPO2); streams.add(SensorCatalog.PPG_ON_DEMAND); streams.add(SensorCatalog.EVENT);
             for(String stream:streams) source.append("CORE-1",stream,List.of(Map.of("sdkTimestamp",123,"value",-7)));
             if(sealed) source.seal("USER_COMPLETED",789);
             ActivityArchive.Batch batch=ActivityArchive.preparePending(root,outgoing);
@@ -128,7 +128,7 @@ public class ActivityArchiveTest {
             ActivityStore value=store(root);
             ActivityStore.Session source=value.start(value.createTemplate("恢复五传感器",false),123,456);
             List<String> streams=new ArrayList<>(SensorCatalog.availableCoreSources());
-            streams.add(SensorCatalog.MF_BIA); streams.add(SensorCatalog.BIA); streams.add(SensorCatalog.ECG); streams.add(SensorCatalog.EVENT);
+            streams.add(SensorCatalog.MF_BIA); streams.add(SensorCatalog.BIA); streams.add(SensorCatalog.ECG); streams.add(SensorCatalog.PPG_ON_DEMAND); streams.add(SensorCatalog.EVENT);
             for(String stream:streams) source.append("CORE-1",stream,List.of(Map.of("sdkTimestamp",123,"value",-7)));
             if(sealed) source.seal("USER_COMPLETED",789);
             Map<String,byte[]> originals=new TreeMap<>();

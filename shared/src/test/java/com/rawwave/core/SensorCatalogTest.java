@@ -31,4 +31,18 @@ public class SensorCatalogTest {
         eda.observe(List.of(Map.of("sdkTimestamp",1,"SKIN_CONDUCTANCE",2.5f,"STATUS",0)));
         assertEquals(1L,skin.summary().get("valueRows"));assertEquals(1L,eda.summary().get("valueRows"));
     }
+    @Test public void ppgOnDemandIsAShortStreamNotACoreSource() {
+        assertTrue(SensorCatalog.acceptsStream(SensorCatalog.PPG_ON_DEMAND));
+        assertFalse(SensorCatalog.availableCoreSources().contains(SensorCatalog.PPG_ON_DEMAND));
+        assertTrue(SensorCatalog.dataKind(SensorCatalog.PPG_ON_DEMAND).contains("100 Hz"));
+        assertThrows(IllegalArgumentException.class,
+            () -> SensorCatalog.normalizeCoreSources(List.of(SensorCatalog.PPG_ON_DEMAND)));
+    }
+    @Test public void ppgOnDemandQualityUsesTheSameThreeRawChannels() {
+        var ppg=new StreamQualityTracker(SensorCatalog.PPG_ON_DEMAND);
+        ppg.observe(List.of(Map.of("sdkTimestamp",1,"PPG_GREEN",10,"PPG_IR",20,"PPG_RED",30,
+            "GREEN_STATUS",0,"IR_STATUS",0,"RED_STATUS",0)));
+        assertEquals(1L,ppg.summary().get("valueRows"));
+        assertEquals(3,((Map<?,?>)ppg.summary().get("statusCounts")).size());
+    }
 }

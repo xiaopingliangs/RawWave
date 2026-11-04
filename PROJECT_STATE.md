@@ -1,3 +1,5 @@
+2026-11-04 当前测试版：ppg-mode-test-20261104-r02 / 0.8.9-ppg-mode-test / versionCode 65。模板可独立选择“活动中连续 PPG 25Hz”和“活动前后 PPG 100Hz 30秒”，提供四个测试预设；包含手表同步成功退出修复。346测试/30份JUnit报告/失败0/错误0/跳过1；7构建目标及双端release/lint/APK检查PASS；DEVICE NOT_RUN；LED仍未闭环。详见 RELEASE_NOTES.md 与 dist/ppg-mode-test-20261104-r02/build.json。
+
 2026-11-01 测试版交付：core-audit-20261101-r01。按用户最新要求提供双端测试APK。已复核126源码输入及双APK哈希0差异，既有27份报告共305测试/失败错误跳过0，原构建154任务PASS；本轮未重建、未改生产代码。DEVICE NOT_RUN；LED与EDA实机收尾未闭环。交付及更新日志见TEST_RELEASE_20261101.md。此前不请求安装的记录为历史阶段策略。
 
 2026-11-01 当前：exit-sync-20261101-r01 内部候选，303测试/154任务、双端release/lint PASS。修复任务划掉先取消同步、采集收尾却又启动同步的竞争；taskRemoved标记在最终交接前阻止新同步，已有数据仍保存。新增排空期间及封存后划掉任务测试，正常结束同步资格测试通过。真实数据及异常回归继续通过。LED/EDA及物理后台行为仍未证实，不请求安装。证据：evidence/sensors/20261101-exit-sync.md。

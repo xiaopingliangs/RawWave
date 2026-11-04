@@ -79,7 +79,7 @@ public final class StreamQualityTracker {
             case "HEART_RATE" -> row.get("HEART_RATE") instanceof Number;
             case "ACCELEROMETER" -> row.get("ACCELEROMETER_X") instanceof Number
                 && row.get("ACCELEROMETER_Y") instanceof Number && row.get("ACCELEROMETER_Z") instanceof Number;
-            case "PPG" -> row.get("PPG_GREEN") instanceof Number && row.get("PPG_IR") instanceof Number
+            case "PPG", "PPG_ON_DEMAND" -> row.get("PPG_GREEN") instanceof Number && row.get("PPG_IR") instanceof Number
                 && row.get("PPG_RED") instanceof Number;
             case "SKIN_TEMPERATURE" -> row.get("OBJECT_TEMPERATURE") instanceof Number
                 && row.get("AMBIENT_TEMPERATURE") instanceof Number;
@@ -89,13 +89,13 @@ public final class StreamQualityTracker {
     }
     private List<String> statusNames() { return switch(sensor) {
         case "HEART_RATE" -> List.of("HEART_RATE_STATUS");
-        case "PPG" -> List.of("GREEN_STATUS","IR_STATUS","RED_STATUS");
+        case "PPG", "PPG_ON_DEMAND" -> List.of("GREEN_STATUS","IR_STATUS","RED_STATUS");
         case "MF_BIA", "BIA", "SKIN_TEMPERATURE", "EDA", "SPO2" -> List.of("STATUS");
         case "MAGNETIC_FIELD", "PRESSURE", "GYROSCOPE" -> List.of("accuracy");
         default -> List.of();
     }; }
     private long gapThresholdMs(){return switch(sensor){
-        case "ECG"->100; case "ACCELEROMETER", "PPG"->200; default->5_000;
+        case "ECG"->100; case "ACCELEROMETER", "PPG", "PPG_ON_DEMAND"->200; default->5_000;
     };}
     private static Object nullableTime(long value){return value==Long.MIN_VALUE?null:value;}
 }

@@ -330,4 +330,16 @@ public class TransferAttemptTest {
             assertNotEquals(a.get(2,TimeUnit.SECONDS),b.get(2,TimeUnit.SECONDS));
         } finally {pool.shutdownNow();}
     }
+    @Test public void deadlineExtensionOnlyMovesLaterAndCannotReviveAClosedAttempt() {
+        var state=new TransferAttempt(true,true,100);
+        state.extendDeadline(50);
+        assertTrue(state.isLive(99));
+        state.extendDeadline(200);
+        assertTrue(state.isLive(150));
+        assertFalse(state.isLive(200));
+        assertTrue(state.close());
+        state.extendDeadline(10_000);
+        assertFalse(state.isLive(1));
+        assertFalse(state.isLive(9_999));
+    }
 }

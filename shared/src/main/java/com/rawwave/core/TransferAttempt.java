@@ -20,7 +20,7 @@ public final class TransferAttempt {
     }
     public enum Action { IGNORE, ACCEPT_HELLO, REPEAT_HELLO, READY, COMMITTED, CONFIRM, FINISHED }
     private final boolean sender, repeatHello;
-    private final long deadlineMs;
+    private long deadlineMs;
     private final EnumSet<Action> delivered = EnumSet.noneOf(Action.class);
     private Identity identity;
     private boolean channelAccepted, receiptReady, closed;
@@ -30,6 +30,13 @@ public final class TransferAttempt {
     }
     public synchronized boolean isClosed() { return closed; }
     public synchronized boolean isLive(long nowMs) { return !closed && nowMs<deadlineMs; }
+    /**
+     * Move an open attempt's ceiling later. Used when an activity archive's size becomes known
+     * after packaging; a deadline can never be shortened or revived after close.
+     */
+    public synchronized void extendDeadline(long value) {
+        if (!closed && value > deadlineMs) deadlineMs = value;
+    }
     /** Sender binds once, after discovery and before sending HELLO. Cannot rebind a window. */
     public synchronized void bindSender(Identity value, long nowMs) {
         if(!sender || !isLive(nowMs) || identity!=null) throw new IllegalStateException("ATTEMPT_BIND_REJECTED");

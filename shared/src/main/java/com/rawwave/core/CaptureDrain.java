@@ -14,7 +14,8 @@ public final class CaptureDrain {
             failures.put(sensor, String.valueOf(detail));
         else if (status == SensorPort.DrainStatus.END_TIME_COVERED && !sensor.equals("EDA"))
             failures.put(sensor,"END_TIME_COVERAGE_NOT_SUPPORTED:" + detail);
-        else if (status == SensorPort.DrainStatus.DELIVERED_ONLY && !sensor.equals("ECG") && !sensor.equals("SPO2") && !sensor.equals("BIA") && !sensor.equals("MF_BIA"))
+        else if (status == SensorPort.DrainStatus.DELIVERED_ONLY && !sensor.equals("ECG") && !sensor.equals("SPO2")
+                && !sensor.equals("BIA") && !sensor.equals("MF_BIA") && !sensor.equals("PPG_ON_DEMAND"))
             failures.put(sensor,"SDK_FLUSH_REQUIRED:" + detail);
         return true;
     }

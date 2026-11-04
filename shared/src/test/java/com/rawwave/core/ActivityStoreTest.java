@@ -627,6 +627,11 @@ public class ActivityStoreTest {
         assertTrue(d.claimReady());assertFalse(d.succeeded());
         assertEquals(Set.of("PPG"),d.failures().keySet());
     }
+    @Test public void ppgOnDemandMayUseDeliveredOnlyLikeOtherShortMeasurements() {
+        var d=new CaptureDrain(List.of("PPG_ON_DEMAND"));
+        d.complete("PPG_ON_DEMAND",SensorPort.DrainStatus.DELIVERED_ONLY,"on demand has no SDK flush");
+        assertTrue(d.claimReady());assertTrue(d.succeeded());
+    }
     @Test public void failedDrainRetainsOtherSourceCompletionButCannotAdvanceNormally() {
         var d=new CaptureDrain(List.of("PPG","EDA"));
         d.complete("PPG",SensorPort.DrainStatus.FAILED,"flush rejected");
@@ -704,6 +709,44 @@ public class ActivityStoreTest {
         String plan=Files.readString(new File(s.folder,"plan.json").toPath());
         assertTrue(plan.contains("without filtering, interpolation, invented samples or unit conversion"));
         assertTrue(plan.contains("not raw PPG")); assertTrue(plan.contains("quality metadata is separate"));
+    }
+    @Test public void ppgShortIsOptionalMigratesAndAppearsInPlan() throws Exception {
+        var store=store();
+        var template=store.createTemplate("PPG短测",false,List.of("HEART_RATE"),false,null,false,true);
+        assertTrue(template.ppg());
+        assertTrue(store.templates().get(0).ppg());
+        var session=store.start(template,1,2);
+        String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+        assertTrue(plan.contains("\"schema\":5"));
+        assertTrue(plan.contains("PPG_ON_DEMAND"));
+        assertTrue(plan.contains("100 Hz"));
+        assertTrue(plan.contains("\"ppg\":true"));
+    }
+    @Test public void independentPpgModesProduceCorrectPlanKinds() throws Exception {
+        var store=store();
+        var continuous=store.createTemplate("continuous",false,List.of("PPG"),false,null,false,false);
+        var onDemand=store.createTemplate("onDemand",false,List.of("HEART_RATE"),false,null,false,true);
+        var both=store.createTemplate("both",false,List.of("PPG"),false,null,false,true);
+        assertTrue(continuous.coreSources().contains("PPG")); assertFalse(continuous.ppg());
+        assertTrue(onDemand.ppg()); assertFalse(onDemand.coreSources().contains("PPG"));
+        assertTrue(both.ppg()); assertTrue(both.coreSources().contains("PPG"));
+        String c=Files.readString(new File(store.start(continuous,1,2).folder,"plan.json").toPath());
+        assertTrue(c.contains("\"PPG\":\"Samsung SDK raw green, infrared and red PPG"));
+        assertFalse(c.contains("PPG_ON_DEMAND"));
+        String o=Files.readString(new File(store.start(onDemand,3,4).folder,"plan.json").toPath());
+        assertTrue(o.contains("PPG_ON_DEMAND"));
+        assertFalse(o.contains("\"PPG\":\"Samsung SDK raw green"));
+        String b=Files.readString(new File(store.start(both,5,6).folder,"plan.json").toPath());
+        assertTrue(b.contains("\"PPG\":\"Samsung SDK raw green"));
+        assertTrue(b.contains("PPG_ON_DEMAND"));
+    }
+    @Test public void legacyTemplateWithoutPpgFieldDefaultsToFalse() throws Exception {
+        File folder=new File(temp.getRoot(),"templates");Files.createDirectories(folder.toPath());
+        Files.writeString(new File(folder,"legacy.json").toPath(),
+            "{\"id\":\"legacy\",\"name\":\"旧模板\",\"ecg\":false,\"coreSources\":[\"HEART_RATE\"],\"spo2\":false,\"mfBia\":false}");
+        var loaded=store().templates().get(0);
+        assertFalse(loaded.ppg());
+        assertFalse(loaded.ecg());assertFalse(loaded.spo2());
     }
     @Test public void planAndStorageIncludeOnlySelectedNewStreams() throws Exception {
         var s=store().start(store().createTemplate("扩展",false,List.of("PPG","SKIN_TEMPERATURE","EDA")),1,2);

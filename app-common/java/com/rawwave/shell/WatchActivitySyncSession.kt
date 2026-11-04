@@ -2,6 +2,8 @@ package com.rawwave.shell
 
 import android.os.Handler
 import android.os.Looper
+import com.rawwave.core.ActivitySyncPolicy
+import com.rawwave.core.ActivityTransferBudget
 import java.util.UUID
 
 /** Application-retained watch sync owner so capture/UI lifecycles cannot cut a committed transfer in half. */
@@ -13,7 +15,11 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
     private var finished=false
     internal var transferFactory: () -> ActivityTransferWindow = {
         ActivityTransferWindow(app,app,{ text -> main.post { if(!finished && app.activeSyncOwner == owner) publish(true,false,text) } },
-            { success,text -> main.post { finish(success,text) } }, trigger=trigger)
+            { success,text -> main.post { finish(success,text) } }, trigger=trigger,
+            onArchiveSizeKnown = { bytes ->
+                val extension = ActivityTransferBudget.leaseExtensionMs(bytes)
+                if (extension > 0L) lease?.extendBy(extension)
+            })
     }
     fun start() {
         if(BuildConfig.DEVICE_ROLE != "watch" || app.activeSyncOwner != null) { finish(false,"已有工作正在进行，活动数据稍后再同步。"); return }
@@ -26,8 +32,13 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
         publish(true,false,"正在准备活动原始数据…")
         try {
             transfer=transferFactory()
-            lease=SyncGuardService.open(app,cancel={ transfer?.cancel() },ready={ if(!finished) transfer?.start() },
-                ended={ reason -> finish(false,"同步在80秒内没有完成（$reason）；数据仍保留在手表。") })
+            // Start with the same short window as the transfer. The window extends this lease
+            // only after packaging proves the archive is large enough; a small or failed package
+            // therefore closes near the initial 80-second window instead of holding for 20 minutes.
+            lease=SyncGuardService.open(app,leaseMs=ActivityTransferBudget.initialLeaseMs(),
+                cancel={ transfer?.cancel() },
+                ready={ if(!finished) { lease?.extendBy(ActivityTransferBudget.initialLeaseMs()); transfer?.start() } },
+                ended={ reason -> finish(false,"同步在限定时间内没有完成（$reason）；数据仍保留在手表。") })
         } catch(error: Exception) {
             try { app.journal?.fault("ACTIVITY_WATCH_SYNC_START_FAILED",error) } catch (_: Exception) {}
             finish(false,"无法开始同步：${error.message}。数据仍保留在手表。")
@@ -49,6 +60,7 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
         val ownsStatus=app.activeSyncOwner == owner
         if(ownsStatus) {
             app.activeSyncOwner=null; app.stopBackgroundSync=null
+            app.pendingActivitySyncExit.set(completed && ActivitySyncPolicy.exitAfterSuccessfulSync(trigger))
             publish(false,completed,text)
         }
         if(app.activeWatchActivitySync === this) app.activeWatchActivitySync=null

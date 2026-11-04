@@ -1,6 +1,6 @@
 package com.rawwave.core;
 
-/** Power policy for idle UI and one sync attempt, never for an active recording. */
+/** Power policy for idle UI, one sync attempt, and the initial CORE no-data window. */
 public final class WorkBudget {
     private WorkBudget() {}
     public static final long IDLE_MS = 80_000;
