@@ -85,4 +85,6 @@ This project is **source-available** under the [PolyForm Noncommercial License 1
 - Because commercial use is restricted, this is not an OSI-approved open-source license. The source is public and available for personal/noncommercial collaboration.
 - Earlier releases published under MIT remain under MIT for copies obtained under that license; this license applies to this and future versions.
 
+For commercial licensing, contact the maintainer via GitHub: <https://github.com/xiaopingliangs>.
+
 Copyright (c) 2026 肖平亮 Sean. See [LICENSE](LICENSE) for the full terms.
