@@ -1,6 +1,6 @@
 # RawWave 原波
 
-RawWave 是一个公开源代码的手表数据采集软件（非商业许可），主要面向三星 Galaxy Watch（Wear OS Powered by Samsung）。
+RawWave 是一个开源的手表数据采集软件，主要面向三星 Galaxy Watch（Wear OS Powered by Samsung）。
 
 **目标：让用户自己决定采集哪些数据，并尽可能完整地保存和导出。**
 
@@ -49,7 +49,7 @@ RawWave 是一个公开源代码的手表数据采集软件（非商业许可）
 
 # RawWave
 
-RawWave is a source-available data collection app for Samsung Galaxy Watch (Wear OS Powered by Samsung), released under a noncommercial license.
+RawWave is an open-source data collection app for Samsung Galaxy Watch (Wear OS Powered by Samsung).
 
 **Our goal is simple: let users choose what data to collect, and save and export as much of it as possible.**
 
@@ -77,12 +77,4 @@ RawWave is still in development. Available features depend on the watch hardware
 
 ## License
 
-This project is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE).
-
-- Individuals may use, copy, modify, and share it for any **noncommercial** purpose.
-- You may build on it and add features, provided derivative distributions keep the same license and notices.
-- **Commercial use is not permitted.** Commercial use requires separate written permission from the copyright holder.
-- Because commercial use is restricted, this is not an OSI-approved open-source license. The source is public and available for personal/noncommercial collaboration.
-- Earlier releases published under MIT remain under MIT for copies obtained under that license; this license applies to this and future versions.
-
-Copyright (c) 2026 肖平亮 Sean. See [LICENSE](LICENSE) for the full terms.
+See [LICENSE](LICENSE).
