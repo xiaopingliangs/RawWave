@@ -96,6 +96,17 @@ public final class StreamQualityTracker {
                 && row.get("GAME_ROTATION_VECTOR_Y") instanceof Number
                 && row.get("GAME_ROTATION_VECTOR_Z") instanceof Number
                 && row.get("GAME_ROTATION_VECTOR_W") instanceof Number;
+            case "ROTATION_VECTOR" -> row.get("ROTATION_VECTOR_X") instanceof Number
+                && row.get("ROTATION_VECTOR_Y") instanceof Number
+                && row.get("ROTATION_VECTOR_Z") instanceof Number
+                && row.get("ROTATION_VECTOR_W") instanceof Number;
+            case "GEOMAGNETIC_ROTATION_VECTOR" -> row.get("GEOMAGNETIC_ROTATION_VECTOR_X") instanceof Number
+                && row.get("GEOMAGNETIC_ROTATION_VECTOR_Y") instanceof Number
+                && row.get("GEOMAGNETIC_ROTATION_VECTOR_Z") instanceof Number
+                && row.get("GEOMAGNETIC_ROTATION_VECTOR_W") instanceof Number;
+            case "GRAVITY" -> row.get("GRAVITY_X") instanceof Number
+                && row.get("GRAVITY_Y") instanceof Number && row.get("GRAVITY_Z") instanceof Number;
+            case "WRIST_TILT_GESTURE" -> row.get("WRIST_TILT_GESTURE") instanceof Number;
             case "PPG", "PPG_ON_DEMAND" -> row.get("PPG_GREEN") instanceof Number && row.get("PPG_IR") instanceof Number
                 && row.get("PPG_RED") instanceof Number;
             case "SKIN_TEMPERATURE" -> row.get("OBJECT_TEMPERATURE") instanceof Number

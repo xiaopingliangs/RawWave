@@ -130,6 +130,26 @@ public class SensorCatalogTest {
         rotation.observe(List.of(GameRotationVector.row(0.1f,0.2f,0.3f,0.9f,1L,3,1L,2L,1,0,1)));
         assertEquals(1L, rotation.summary().get("valueRows"));
     }
+    @Test public void absoluteOrientationGravityAndWristTiltAreCorePlatformSources() {
+        assertTrue(SensorCatalog.availableCoreSources().contains(SensorCatalog.ROTATION_VECTOR));
+        assertTrue(SensorCatalog.availableCoreSources().contains(SensorCatalog.WRIST_TILT_GESTURE));
+        assertTrue(SensorCatalog.isAndroidPlatformSource(SensorCatalog.ROTATION_VECTOR));
+        assertTrue(SensorCatalog.isAndroidPlatformSource(SensorCatalog.WRIST_TILT_GESTURE));
+        assertTrue(SensorCatalog.dataKind(SensorCatalog.ROTATION_VECTOR).contains("magnetometer"));
+        assertTrue(SensorCatalog.dataKind(SensorCatalog.WRIST_TILT_GESTURE).contains("on-change"));
+        var rotation = new StreamQualityTracker(SensorCatalog.ROTATION_VECTOR);
+        rotation.observe(List.of(RotationVector.row(0.1f,0.2f,0.3f,0.9f,0.05f,1L,3,1L,2L,1,0,1)));
+        assertEquals(1L, rotation.summary().get("valueRows"));
+        var tilt = new StreamQualityTracker(SensorCatalog.WRIST_TILT_GESTURE);
+        tilt.observe(List.of(WristTiltGesture.row(1f,1L,3,1L,2L,1,0,1)));
+        assertEquals(1L, tilt.summary().get("valueRows"));
+        var gravity = new StreamQualityTracker(SensorCatalog.GRAVITY);
+        gravity.observe(List.of(Gravity.row(0.1f,0.2f,9.8f,1L,3,1L,2L,1,0,1)));
+        assertEquals(1L, gravity.summary().get("valueRows"));
+        var geomagnetic = new StreamQualityTracker(SensorCatalog.GEOMAGNETIC_ROTATION_VECTOR);
+        geomagnetic.observe(List.of(GeomagneticRotationVector.row(0.1f,0.2f,0.3f,0.9f,1L,3,1L,2L,1,0,1)));
+        assertEquals(1L, geomagnetic.summary().get("valueRows"));
+    }
     @Test public void ambientLightIsACoreSourceWithLuxValueCheck() {
         assertTrue(SensorCatalog.availableCoreSources().contains(SensorCatalog.LIGHT));
         assertEquals(List.of("LIGHT"), SensorCatalog.normalizeCoreSources(List.of(SensorCatalog.LIGHT)));

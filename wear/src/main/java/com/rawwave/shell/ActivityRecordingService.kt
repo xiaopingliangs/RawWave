@@ -419,7 +419,9 @@ class ActivityRecordingService : Service() {
     }
     private fun placementWaiting() = phase.startsWith("READY_SPO2_") || phase.startsWith("READY_PPG_") || phase == "RESTORE_PRE"
     private fun beginPostShorts() {
-        if(bia) startBia(false) else if(ppg) preparePpg(false) else if(spo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        // Body composition is intentionally pre-activity only. Post-exercise BIA/MF-BIA
+        // is dominated by acute fluid shifts and is not comparable to the pre measurement.
+        if(ppg) preparePpg(false) else if(spo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun startBia(pre: Boolean) {
         biaModeIndex=0
@@ -1064,6 +1066,10 @@ class ActivityRecordingService : Service() {
         "ACCELEROMETER_UNCALIBRATED" -> "未校准加速度"
         "LINEAR_ACCELERATION" -> "线性加速度"
         "GAME_ROTATION_VECTOR" -> "姿态四元数"
+        "ROTATION_VECTOR" -> "绝对姿态"
+        "GEOMAGNETIC_ROTATION_VECTOR" -> "地磁姿态"
+        "GRAVITY" -> "重力矢量"
+        "WRIST_TILT_GESTURE" -> "抬腕手势"
         "PPG" -> "PPG"
         "PPG_ON_DEMAND" -> "PPG 100Hz"
         "SKIN_TEMPERATURE" -> "皮肤温度"

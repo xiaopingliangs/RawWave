@@ -148,6 +148,30 @@ class CaptureServiceTest {
         assertEquals(1L,r.session.counts()["CORE-1/LINEAR_ACCELERATION"])
         assertEquals(1L,r.session.counts()["CORE-1/GAME_ROTATION_VECTOR"])
     }
+    @Test fun absoluteRotationAndWristTiltRowsAreSavedAndDrained() {
+        val r=Rig(sources=listOf("ROTATION_VECTOR","WRIST_TILT_GESTURE"))
+        r.sensors.emit("ROTATION_VECTOR",listOf(
+            RotationVector.row(0.1f,0.2f,0.3f,0.9f,0.05f,1000L,3,2000L,3000L,1,0,1)))
+        r.sensors.emit("WRIST_TILT_GESTURE",listOf(
+            WristTiltGesture.row(1f,1000L,3,2000L,3000L,1,0,1)))
+        r.queue.runReady()
+        r.end();r.sensors.ack("ROTATION_VECTOR");r.sensors.ack("WRIST_TILT_GESTURE");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(1L,r.session.counts()["CORE-1/ROTATION_VECTOR"])
+        assertEquals(1L,r.session.counts()["CORE-1/WRIST_TILT_GESTURE"])
+    }
+    @Test fun gravityAndGeomagneticRotationRowsAreSavedAndDrained() {
+        val r=Rig(sources=listOf("GRAVITY","GEOMAGNETIC_ROTATION_VECTOR"))
+        r.sensors.emit("GRAVITY",listOf(
+            Gravity.row(0.1f,0.2f,9.8f,1000L,3,2000L,3000L,1,0,1)))
+        r.sensors.emit("GEOMAGNETIC_ROTATION_VECTOR",listOf(
+            GeomagneticRotationVector.row(0.1f,0.2f,0.3f,0.9f,1000L,3,2000L,3000L,1,0,1)))
+        r.queue.runReady()
+        r.end();r.sensors.ack("GRAVITY");r.sensors.ack("GEOMAGNETIC_ROTATION_VECTOR");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(1L,r.session.counts()["CORE-1/GRAVITY"])
+        assertEquals(1L,r.session.counts()["CORE-1/GEOMAGNETIC_ROTATION_VECTOR"])
+    }
     @Test fun ppgOnlyPostStillRunsAfterUnconfirmedCoreTail() {
         val r=Rig(ppg=true,sources=listOf("PRESSURE"))
         r.service.command("START_PPG");r.queue.runReady()
@@ -168,7 +192,7 @@ class CaptureServiceTest {
         r.service.command("SKIP_PPG");r.queue.runReady()
         assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
     }
-    @Test fun oxygenIsFirstAndLastWithBiaInsideAndOneRestore() {
+    @Test fun oxygenIsFirstAndLastWithBiaPreOnlyAndOneRestore() {
         val r=Rig(bia=true,spo2=true,sources=listOf("PRESSURE"))
         assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
         r.service.command("START_SPO2");r.queue.runReady()
@@ -182,15 +206,14 @@ class CaptureServiceTest {
         assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
         r.service.command("PLACEMENT_READY");r.queue.runReady()
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
-        assertEquals("POST-200",ActivityRecordingService.state.phase)
-        r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
-        r.sensors.ack("BIA");r.queue.runReady()
+        // BIA/MF-BIA are pre-activity only; the post queue starts with SpO2.
         assertEquals("READY_SPO2_POST",ActivityRecordingService.state.phase)
         r.service.command("START_SPO2");r.queue.runReady()
         r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 99)));r.queue.runReady()
         r.sensors.ack("SPO2");r.queue.runReady()
         assertTrue(r.seal().exists())
-        assertEquals(listOf("SPO2","BIA","PRESSURE","BIA","SPO2"),r.sensors.starts)
+        assertEquals(listOf("SPO2","BIA","PRESSURE","SPO2"),r.sensors.starts)
+        assertFalse(r.session.counts().containsKey("POST-200/BIA"))
     }
     @Test fun biaStatusOnlyCannotSucceedAndRetryKeepsEachAttempt() {
         val r=Rig(bia=true)
@@ -205,7 +228,7 @@ class CaptureServiceTest {
         assertEquals(1L,r.session.counts()["PRE-200/BIA"]);assertEquals(1L,r.session.counts()["PRE-201/BIA"])
         r.service.command("SKIP_BIA");r.queue.runReady();assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
     }
-    @Test fun biaPostStartsAfterPressureDrainAndCanBeSkipped() {
+    @Test fun biaIsNotStartedAfterCoreAndSessionFinishes() {
         val r=Rig(bia=true,sources=listOf("PRESSURE","GYROSCOPE"))
         r.service.command("SKIP_BIA");r.queue.runReady();r.sensors.ack("BIA");r.queue.runReady()
         assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
@@ -213,10 +236,10 @@ class CaptureServiceTest {
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("GYROSCOPE");r.queue.runReady()
-        assertEquals("POST-200",ActivityRecordingService.state.phase)
-        assertTrue(r.sensors.starts.contains("BIA"))
-        r.service.command("SKIP_BIA");r.queue.runReady();r.sensors.ack("BIA");r.queue.runReady()
-        assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
+        // BIA/MF-BIA are pre-activity only; no post BIA attempt is started.
+        assertTrue(r.seal().exists())
+        assertEquals(1,r.sensors.starts.count { it == "BIA" })
+        assertFalse(r.session.counts().containsKey("POST-200/BIA"))
     }
     @Test fun biaDiskFailureNeverAdvancesToCoreOrBloodOxygen() {
         val r=Rig(bia=true)

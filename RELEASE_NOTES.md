@@ -1,3 +1,80 @@
+## 2026-11-06 测试版：0.12.5 重力矢量 + 地磁姿态
+
+- 运行编号：`gravity-geomag-20261106-r01`
+- 版本：`0.12.5-step` / versionCode 79
+- 类型：测试版，不是稳定发布
+- 真机：已在 Galaxy Watch（One UI 9.0）上采集并自动同步成功
+
+### 本版新增
+
+- `GRAVITY` 重力矢量：Android `TYPE_GRAVITY`，平台融合重力 X/Y/Z，单位 m/s²，目标 25 Hz，原始时间戳/accuracy/回调元数据保留。
+- `GEOMAGNETIC_ROTATION_VECTOR` 地磁姿态四元数：Android `TYPE_GEOMAGNETIC_ROTATION_VECTOR`，四元数 X/Y/Z/W，磁力计 + 加速度计、不使用陀螺仪，目标 25 Hz。
+
+两项都在模板中可选，默认不勾选；不支持时自动禁用。
+
+### 同时包含 0.12.4
+
+- BIA / MF-BIA 改为只在活动前测量；活动后不再测体成分。
+- 新增 `ROTATION_VECTOR` 绝对姿态旋转矢量。
+- 新增 `WRIST_TILT_GESTURE` 抬腕手势事件。
+- 活动后顺序为 ECG → PPG（可选）→ SpO2（可选）。
+
+### 同时包含 0.12.3
+
+- BIA/MF-BIA 中断后显示进度、原因、第几次尝试，2 秒后自动重试。
+- 移除不支持的“未校准加速度”选项。
+- 手机自动接收/同步修复。
+
+### 0.12.5 真机数据
+
+- 11 分 49 秒，6,311 文件，78.2 MB 原始数据。
+- `GRAVITY` 11,010 行，25 Hz，accuracy 3。
+- `GEOMAGNETIC_ROTATION_VECTOR` 11,017 行，25 Hz，accuracy 3。
+- `ROTATION_VECTOR` 11,010 行，25 Hz，accuracy 3。
+- `WRIST_TILT_GESTURE` 13 次事件，值 1，accuracy 3。
+- BIA/MF-BIA 仅活动前且成功；活动后没有 POST-200/BIA。
+- 前置/后置 ECG 均连续 30 秒验证通过。
+- 后置 PPG 成功；手机第一次唤醒自动同步成功（10,087,573 字节 / 6,313 文件）。
+- SpO2 前置和后置均只收到 STATUS=0，30 秒超时；属于接触/血流质量问题，不是数据管线错误。
+- 心率有部分 STATUS=-10，原始行保留，未做过滤。
+
+### 数据源状态
+
+- 这块手表公开可用的标准平台源基本已接入完毕。
+- 剩余：`DEVICE_ORIENTATION`（屏幕方向，健康价值低）、三星私有 vendor 传感器（不接）、`SWEAT_LOSS`（仅跑步专项，依赖 Health Services）。
+- 后续不再无脑增加派生姿态/重力数据，转向 30 分钟长测、跑步专项或数据质量优化。
+
+### 安装
+
+手机：`RawWave-mobile-0.12.5-step-gravity-geomag-20261106-r01.apk`
+SHA256：`15353FAAB7BCEF4C2706F31370593074381A0F0691C4687DBA40A0513283966B`
+
+手表：`RawWave-wear-0.12.5-step-gravity-geomag-20261106-r01.apk`
+SHA256：`A13C96D1BF32CCE40E10CE8014D85BF9D021206B6C915018C9FBE0B5E03D2383`
+
+一起下载：`RawWave-0.12.5-step-gravity-geomag-20261106-r01.zip`
+SHA256：`6BC66875C1E57406366C75EC32D8B9D5F12AE5F9CEB665354F3B0B8A342B44EB`
+
+两端成对覆盖安装，保留原有数据，不需要先卸载。使用本地测试证书，不是公开发行包。
+
+---
+
+## 2026-11-06 测试版：0.12.4 BIA 活动前 only + 绝对姿态/抬腕手势
+
+- 运行编号：`bia-pre-only-20261106-r01`
+- 版本：`0.12.4-step` / versionCode 78
+- 类型：测试版，不是稳定发布
+
+### 本版更新
+
+- BIA / MF-BIA 改为只在活动前测量；活动后不再测体成分。
+- 新增 `ROTATION_VECTOR` 绝对姿态（3,315 行，25 Hz，accuracy 3）。
+- 新增 `WRIST_TILT_GESTURE` 抬腕手势事件（7 次事件）。
+- 活动后顺序：ECG → PPG（可选）→ SpO2（可选）。
+- 0.12.4 真机验证：BIA 第 3 次成功，MF-BIA 第 1 次成功；自动同步第一次唤醒成功；前置 ECG 两次 LEAD_OFF=5 后跳过，后置 ECG 正常。
+
+---
+
 ## 2026-11-06 测试版：0.12.3 BIA 重试提示 + 融合数据源
 
 - 运行编号：`bia-retry-20261106-r01`

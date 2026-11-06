@@ -24,6 +24,10 @@ public final class SensorCatalog {
     public static final String ACCELEROMETER_UNCALIBRATED = "ACCELEROMETER_UNCALIBRATED";
     public static final String LINEAR_ACCELERATION = "LINEAR_ACCELERATION";
     public static final String GAME_ROTATION_VECTOR = "GAME_ROTATION_VECTOR";
+    public static final String ROTATION_VECTOR = "ROTATION_VECTOR";
+    public static final String GEOMAGNETIC_ROTATION_VECTOR = "GEOMAGNETIC_ROTATION_VECTOR";
+    public static final String GRAVITY = "GRAVITY";
+    public static final String WRIST_TILT_GESTURE = "WRIST_TILT_GESTURE";
     public static final String PPG = "PPG";
     public static final String SKIN_TEMPERATURE = "SKIN_TEMPERATURE";
     public static final String EDA = "EDA";
@@ -31,6 +35,7 @@ public final class SensorCatalog {
 
     private static final List<String> CORE_ORDER = List.of(
         HEART_RATE, ACCELEROMETER, ACCELEROMETER_UNCALIBRATED, LINEAR_ACCELERATION, GAME_ROTATION_VECTOR,
+        ROTATION_VECTOR, GEOMAGNETIC_ROTATION_VECTOR, GRAVITY, WRIST_TILT_GESTURE,
         PPG, SKIN_TEMPERATURE, EDA, GYROSCOPE, GYROSCOPE_UNCALIBRATED,
         PRESSURE, MAGNETIC_FIELD, MAGNETIC_FIELD_UNCALIBRATED, LIGHT, GPS, STEP_COUNT, STEP_DETECTOR, OFFBODY);
     private static final List<String> DEFAULT_CORE = List.of(HEART_RATE, ACCELEROMETER);
@@ -55,6 +60,10 @@ public final class SensorCatalog {
         Map.entry(ACCELEROMETER_UNCALIBRATED, "Android TYPE_ACCELEROMETER_UNCALIBRATED uncalibrated acceleration X/Y/Z m/s² plus platform estimated bias X/Y/Z m/s²; original sensorTimestampNs and accuracy; no filtering or conversion"),
         Map.entry(LINEAR_ACCELERATION, "Android TYPE_LINEAR_ACCELERATION platform-fused linear acceleration X/Y/Z m/s² with gravity removed; original sensorTimestampNs and accuracy; platform output, no app filtering or gravity estimation"),
         Map.entry(GAME_ROTATION_VECTOR, "Android TYPE_GAME_ROTATION_VECTOR platform-fused orientation quaternion X/Y/Z/W using gyroscope and accelerometer without magnetometer; original sensorTimestampNs and accuracy; platform output, no app normalization or conversion"),
+        Map.entry(ROTATION_VECTOR, "Android TYPE_ROTATION_VECTOR platform-fused absolute orientation quaternion X/Y/Z/W using accelerometer, gyroscope and magnetometer; optional heading accuracy retained when the platform provides it; original sensorTimestampNs and accuracy; platform output, no app normalization or conversion"),
+        Map.entry(GEOMAGNETIC_ROTATION_VECTOR, "Android TYPE_GEOMAGNETIC_ROTATION_VECTOR platform-fused absolute orientation quaternion X/Y/Z/W using magnetometer and accelerometer without a gyroscope; original sensorTimestampNs and accuracy; platform output, no app normalization or conversion"),
+        Map.entry(GRAVITY, "Android TYPE_GRAVITY platform-fused gravity vector X/Y/Z m/s²; original sensorTimestampNs and accuracy; platform output, no app filtering or gravity estimation"),
+        Map.entry(WRIST_TILT_GESTURE, "Android TYPE_WRIST_TILT_GESTURE platform on-change wrist-tilt event; raw platform value, original sensorTimestampNs and accuracy; sparse events are expected; no app gesture inference"),
         Map.entry(PPG, "Samsung SDK raw green, infrared and red PPG values plus per-channel status"),
         Map.entry(SKIN_TEMPERATURE, "Samsung SDK processed object and ambient temperature; not body temperature"),
         Map.entry(EDA, "Samsung SDK raw skin conductance plus status"));
@@ -69,6 +78,8 @@ public final class SensorCatalog {
         return GYROSCOPE.equals(sensor) || GYROSCOPE_UNCALIBRATED.equals(sensor)
             || ACCELEROMETER_UNCALIBRATED.equals(sensor)
             || LINEAR_ACCELERATION.equals(sensor) || GAME_ROTATION_VECTOR.equals(sensor)
+            || ROTATION_VECTOR.equals(sensor) || WRIST_TILT_GESTURE.equals(sensor)
+            || GEOMAGNETIC_ROTATION_VECTOR.equals(sensor) || GRAVITY.equals(sensor)
             || PRESSURE.equals(sensor) || MAGNETIC_FIELD.equals(sensor)
             || MAGNETIC_FIELD_UNCALIBRATED.equals(sensor)
             || LIGHT.equals(sensor) || GPS.equals(sensor) || STEP_COUNT.equals(sensor)

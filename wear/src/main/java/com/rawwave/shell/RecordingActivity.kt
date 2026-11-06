@@ -411,9 +411,9 @@ class RecordingActivity : ComponentActivity() {
             text = "测试预设会清空其他采集项，便于最小对照；需要其他源时再手动勾选。先只选连续 PPG 60 秒；灯灭后再选两种都测。结束后观察红绿灯；若仍亮，导出系统 bugreport，不要重复 17 分钟活动。"
             setTextColor(Color.WHITE); textSize = 12f
         }
-        val bia = CheckBox(this).apply { text="活动前后各测体成分 BIA（算法结果，双指触键）"; setTextColor(Color.WHITE) }
-        val mfBia=CheckBox(this).apply { text="只测多频阻抗 MF-BIA（原始四频幅值/相位，不输出体脂/肌肉）";setTextColor(Color.WHITE);isChecked=existing?.mfBia()==true }
-        val biaBoth=CheckBox(this).apply { text="两种都测：前后各做两遍（先体成分 BIA，再多频阻抗 MF-BIA）";setTextColor(Color.WHITE);isChecked=existing?.biaBoth()==true }
+        val bia = CheckBox(this).apply { text="活动前测体成分 BIA（算法结果，双指触键；活动后不测）"; setTextColor(Color.WHITE) }
+        val mfBia=CheckBox(this).apply { text="活动前测多频阻抗 MF-BIA（原始四频幅值/相位；活动后不测）";setTextColor(Color.WHITE);isChecked=existing?.mfBia()==true }
+        val biaBoth=CheckBox(this).apply { text="活动前两种都测：先 BIA，再 MF-BIA（活动后不测）";setTextColor(Color.WHITE);isChecked=existing?.biaBoth()==true }
         val profileBox=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
         var openedPad: View? = null
         fun numberField(label:String, decimal:Boolean)=EditText(this).apply {
@@ -474,6 +474,10 @@ class RecordingActivity : ComponentActivity() {
             SensorCatalog.ACCELEROMETER to CheckBox(this).apply { text = "活动中：加速度（原始）"; isChecked = true; setTextColor(Color.WHITE) },
             SensorCatalog.LINEAR_ACCELERATION to CheckBox(this).apply { text = "活动中：线性加速度（平台去重力，无需手动校准，目标25Hz）"; setTextColor(Color.WHITE) },
             SensorCatalog.GAME_ROTATION_VECTOR to CheckBox(this).apply { text = "活动中：姿态四元数（平台融合，无需手动校准，目标25Hz）"; setTextColor(Color.WHITE) },
+            SensorCatalog.ROTATION_VECTOR to CheckBox(this).apply { text = "活动中：绝对姿态旋转矢量（含磁力计，平台融合，目标25Hz）"; setTextColor(Color.WHITE) },
+            SensorCatalog.GEOMAGNETIC_ROTATION_VECTOR to CheckBox(this).apply { text = "活动中：地磁姿态四元数（磁力计+加速度，无陀螺仪，目标25Hz）"; setTextColor(Color.WHITE) },
+            SensorCatalog.GRAVITY to CheckBox(this).apply { text = "活动中：重力矢量（平台融合，无需手动校准，目标25Hz）"; setTextColor(Color.WHITE) },
+            SensorCatalog.WRIST_TILT_GESTURE to CheckBox(this).apply { text = "活动中：抬腕手势（Android 平台事件，仅变化时回调）"; setTextColor(Color.WHITE) },
             SensorCatalog.SKIN_TEMPERATURE to CheckBox(this).apply { text = "活动中：皮肤温度（处理结果，不是体温）"; setTextColor(Color.WHITE) },
             SensorCatalog.EDA to CheckBox(this).apply { text = "活动中：皮肤电导 EDA（原始，部分型号支持）"; setTextColor(Color.WHITE) },
             SensorCatalog.MAGNETIC_FIELD to CheckBox(this).apply { text="活动中：三轴磁场（Android，微特斯拉，目标10Hz）";setTextColor(Color.WHITE) },
@@ -609,6 +613,10 @@ class RecordingActivity : ComponentActivity() {
         SensorCatalog.ACCELEROMETER_UNCALIBRATED -> "未校准加速度"
         SensorCatalog.LINEAR_ACCELERATION -> "线性加速度"
         SensorCatalog.GAME_ROTATION_VECTOR -> "姿态四元数"
+        SensorCatalog.ROTATION_VECTOR -> "绝对姿态"
+        SensorCatalog.GEOMAGNETIC_ROTATION_VECTOR -> "地磁姿态"
+        SensorCatalog.GRAVITY -> "重力矢量"
+        SensorCatalog.WRIST_TILT_GESTURE -> "抬腕手势"
         SensorCatalog.PPG -> "PPG 25Hz 连续"
         SensorCatalog.PPG_ON_DEMAND -> "PPG 100Hz 短测"
         SensorCatalog.SKIN_TEMPERATURE -> "皮肤温度"
@@ -694,6 +702,10 @@ class RecordingActivity : ComponentActivity() {
         SensorCatalog.ACCELEROMETER_UNCALIBRATED -> android.hardware.Sensor.TYPE_ACCELEROMETER_UNCALIBRATED
         SensorCatalog.LINEAR_ACCELERATION -> android.hardware.Sensor.TYPE_LINEAR_ACCELERATION
         SensorCatalog.GAME_ROTATION_VECTOR -> android.hardware.Sensor.TYPE_GAME_ROTATION_VECTOR
+        SensorCatalog.ROTATION_VECTOR -> android.hardware.Sensor.TYPE_ROTATION_VECTOR
+        SensorCatalog.GEOMAGNETIC_ROTATION_VECTOR -> android.hardware.Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR
+        SensorCatalog.GRAVITY -> android.hardware.Sensor.TYPE_GRAVITY
+        SensorCatalog.WRIST_TILT_GESTURE -> 26 // TYPE_WRIST_TILT_GESTURE is Wear OS, not a public SDK constant
         SensorCatalog.MAGNETIC_FIELD -> android.hardware.Sensor.TYPE_MAGNETIC_FIELD
         SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED -> android.hardware.Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED
         SensorCatalog.PRESSURE -> android.hardware.Sensor.TYPE_PRESSURE

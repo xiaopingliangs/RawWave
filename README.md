@@ -22,19 +22,28 @@ RawWave 是一个开源的手表数据采集软件，主要面向三星 Galaxy W
 
 ## 最新测试版（2026-11-06）
 
-- `bia-retry-20261106-r01` / `0.12.3-step` / versionCode 77
+- `gravity-geomag-20261106-r01` / `0.12.5-step` / versionCode 79
 - 这是测试版，不是稳定发布。
 - 安装包、SHA256 和更新说明见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，也可以到 [Releases](https://github.com/xiaopingliangs/RawWave/releases) 下载。
 
-本版包含：
+0.12.5 新增：
 
-- BIA / MF-BIA 中断后的进度、原因和重试提示；测量中显示剩余秒数
-- 活动前/后短测的自动接触、自动开始、80 秒保存退出
-- PPG / 血氧成功后自动完成
-- 线性加速度、姿态四元数、平台传感器清单
-- 手机自动接收和自动同步修复
+- `GRAVITY` 重力矢量（平台融合，25 Hz）
+- `GEOMAGNETIC_ROTATION_VECTOR` 地磁姿态四元数（磁力计 + 加速度，25 Hz）
 
-0.12.3 主要是交互修复，没有新增传感器；0.12.2 新增的线性加速度和姿态四元数已在 Galaxy Watch 上采到 25 Hz 数据。
+0.12.4 已完成：
+
+- BIA / MF-BIA 改为只在活动前测量，活动后不再测体成分
+- `ROTATION_VECTOR` 绝对姿态旋转矢量
+- `WRIST_TILT_GESTURE` 抬腕手势事件
+
+0.12.3 已完成：
+
+- BIA / MF-BIA 中断后显示进度、原因和第几次尝试
+- 2 秒后自动重试
+- 移除手表不支持的“未校准加速度”
+
+0.12.5 已在 Galaxy Watch 上验证：重力/地磁姿态均为 25 Hz；BIA/MF-BIA 仅活动前且成功；ECG 前后连续；后置 PPG 成功；自动同步第一次唤醒成功。SpO2 本轮的两次尝试均超时，属于接触/血流质量问题，不是数据管线错误。
 
 ---
 
@@ -62,11 +71,9 @@ RawWave is still in development. Available features depend on the watch hardware
 
 ### Latest test build (2026-11-06)
 
-`bia-retry-20261106-r01` / `0.12.3-step` / versionCode 77. Test build, not a stable release. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
+`gravity-geomag-20261106-r01` / `0.12.5-step` / versionCode 79. Test build, not a stable release. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
 
-This build includes BIA/MF-BIA retry progress, short-test auto contact/auto start/80-second save-and-exit, automatic completion after successful PPG/SpO2, linear acceleration, game rotation vector, platform sensor inventory, and phone receive/sync fixes.
-
-0.12.3 is mainly an interaction fix and does not add new sensors. The two fused sources added in 0.12.2 have been verified at 25 Hz on a Galaxy Watch.
+0.12.5 adds `GRAVITY` and `GEOMAGNETIC_ROTATION_VECTOR`. 0.12.4 made BIA/MF-BIA pre-activity only and added `ROTATION_VECTOR` and `WRIST_TILT_GESTURE`. 0.12.3 improved BIA retry feedback and removed the unsupported uncalibrated accelerometer.
 
 ## License
 
