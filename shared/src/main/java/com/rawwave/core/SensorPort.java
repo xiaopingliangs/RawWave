@@ -12,7 +12,9 @@ import java.util.Map;
  * stop returning means the listener-removal call returned, NOT SDK flush completion.
  * Already queued rows may still arrive on their original callback after stop: the owner
  * preserves their original phase. close suppresses further delivery; SDK tail is unknown.
- * Each instance belongs to one session; close is terminal. No reconnect or automatic retry.
+ * Android LocationManager GPS has no flush API, so GPS drain is DELIVERED_ONLY and the
+ * post-stop tail remains explicitly unknown. Each instance belongs to one session;
+ * close is terminal. No reconnect or automatic retry.
  */
 public interface SensorPort {
     int CONTRACT_VERSION = 3;

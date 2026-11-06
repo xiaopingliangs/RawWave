@@ -172,7 +172,7 @@ class SyncGuardService : Service() {
         val remaining = remainingMs.coerceAtLeast(1L)
         return Notification.Builder(this, "sync").setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("原波正在同步")
-            .setContentText("完成立即停止；本轮最多${budgetText(remaining)}，失败不自动重试")
+            .setContentText("完成立即停止；本轮最多${budgetText(remaining)}，失败自动重试一次")
             .setOngoing(true).build()
     }
     private fun evidence(event: String, owner: Lease) {
@@ -180,7 +180,7 @@ class SyncGuardService : Service() {
             "lease" to owner.id, "deadlineMs" to owner.deadline,
             "elapsedRealtimeMs" to SystemClock.elapsedRealtime(), "wakeLockHeld" to (wakeLock?.isHeld == true),
             "batteryOptimizationExempt" to getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName),
-            "noAutomaticRetry" to true)) } catch (_: Exception) {}
+            "noAutomaticRetry" to false, "boundedAutomaticRetry" to true)) } catch (_: Exception) {}
     }
     private fun release(owner: Lease?, reason: String, notify: Boolean) {
         if(owner == null) return

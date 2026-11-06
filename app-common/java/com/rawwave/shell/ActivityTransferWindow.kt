@@ -45,7 +45,7 @@ class ActivityTransferWindow(
     private val environment: () -> Map<String,Any> = { ConnectionEnvironment.inspect(context) },
     /** Called once when packaging or HELLO reveals the exact archive size. */
     private val onArchiveSizeKnown: (Long) -> Unit = {}
-) {
+) : ActivityTransferHandle {
     private val transport = transportPort ?: GoogleTransport(context) { event, detail -> log(event, mapOf("detail" to detail)) }
     private val executor = Executors.newSingleThreadExecutor()
     private val prepareDeadline = monotonicMs() + ActivityTransferBudget.INITIAL_MS
@@ -168,7 +168,7 @@ class ActivityTransferWindow(
             else -> "本轮同步时间已用完"
         }
         finished(false, if (cleanupFailure == null)
-            "活动数据同步未完成，停在：$lastStage\n原因：$why\n已采集数据仍保留在手表；本轮不再重试，下次打开原波可再试。"
+            "活动数据同步未完成，停在：$lastStage\n原因：$why\n已采集数据仍保留在手表；若手表自动重试仍未完成，下次打开原波可再试。"
         else "同步资源清理异常；数据保留，请查看问题报告。${cleanupFailure.javaClass.simpleName}")
     }
     private fun <T> await(task: CompletableFuture<T>): T {
@@ -282,7 +282,7 @@ class ActivityTransferWindow(
         }
     }
 
-    fun start() {
+    override fun start() {
         if (attemptState.isClosed()) return
         startWatchdog()
         try {
@@ -292,7 +292,7 @@ class ActivityTransferWindow(
                 await(transport.registerChannels(callback))
                 await(transport.registerMessages(listener))
                 registered=true
-                if(watch) send() else stage("ACTIVITY_RECEIVER_READY","手机已准备接收活动数据；完成即停止，失败不自动重试。")
+                if(watch) send() else stage("ACTIVITY_RECEIVER_READY","手机已准备接收活动数据；完成即停止，失败后手表会自动重试一次。")
                 if(!watch && initialNode != null && initialHello != null) offerHello(initialNode,initialHello)
                 synchronized(this) { queuedHello.also { queuedHello=null } }?.let { offerHello(it.first,it.second) }
             } }
@@ -407,7 +407,7 @@ class ActivityTransferWindow(
                 failure="${error.javaClass.simpleName}: ${error.message}"
                 try { app.journal?.fault("ACTIVITY_TRANSFER_FAILED",error); log("ACTIVITY_TRANSFER_FAILED",mapOf("lastStage" to lastStage,"error" to failure)) } catch (_: Exception) {}
                 val failedStep=if(lastStage == "ACTIVITY_ARCHIVE_PREPARING") "手表数据打包与校验（尚未发送）" else lastStage
-                complete(false,"活动数据同步未完成，停在：$failedStep\n原因：${error.message?.take(160) ?: error.javaClass.simpleName}\n已采集数据仍保留在手表；本轮不再重试，下次打开原波可再试。")
+                complete(false,"活动数据同步未完成，停在：$failedStep\n原因：${error.message?.take(160) ?: error.javaClass.simpleName}\n已采集数据仍保留在手表；若手表自动重试仍未完成，下次打开原波可再试。")
             }
         }
     }
@@ -417,7 +417,7 @@ class ActivityTransferWindow(
         finished(success && cleanupFailure == null, if(cleanupFailure == null) text else
             "同步资源清理异常；数据保留，请查看问题报告。${cleanupFailure.javaClass.simpleName}")
     }
-    fun cancel() {
+    override fun cancel() {
         if(!attemptState.close()) return
         cleanup()
     }

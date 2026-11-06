@@ -69,7 +69,15 @@ try {
     $captureHostFile = Join-Path $projectRoot 'wear/build/test-results/testDebugUnitTest/TEST-com.rawwave.shell.CaptureServiceTest.xml'
     if ((Get-Item -LiteralPath $captureHostFile).LastWriteTimeUtc -lt $started.UtcDateTime) { throw 'Stale capture host tests' }
     [xml]$captureHostTests = Get-Content -LiteralPath $captureHostFile -Raw
-    if ([int]$captureHostTests.testsuite.tests -lt 16 -or [int]$captureHostTests.testsuite.failures -ne 0 -or [int]$captureHostTests.testsuite.errors -ne 0 -or [int]$captureHostTests.testsuite.skipped -ne 0) { throw 'Capture host tests failed or missing' }
+    $corpusConfigured = -not [string]::IsNullOrWhiteSpace($env:RAWWAVE_REPLAY_INPUT)
+    $captureHostSkipped = [int]$captureHostTests.testsuite.skipped
+    $unexpectedCaptureSkips = @($captureHostTests.testsuite.testcase | Where-Object {
+        $_.skipped -and $_.name -ne 'privateThreeActivityCorpusPreservesEverySavedCoreField' })
+    if ($unexpectedCaptureSkips.Count -gt 0) { throw "Unexpected capture host skip: $($unexpectedCaptureSkips[0].name)" }
+    if ($corpusConfigured -and $captureHostSkipped -ne 0) { throw 'Private corpus configured but its replay was skipped' }
+    if (-not $corpusConfigured -and $captureHostSkipped -gt 1) { throw 'Unexpected capture host skip count' }
+    if ([int]$captureHostTests.testsuite.tests -lt 16 -or [int]$captureHostTests.testsuite.failures -ne 0 -or [int]$captureHostTests.testsuite.errors -ne 0) { throw 'Capture host tests failed or missing' }
+    $privateCorpusReplay = if ($corpusConfigured) { 'PASS' } else { 'NOT_RUN_PRIVATE_CORPUS_NOT_CONFIGURED' }
     Copy-Item -LiteralPath $captureHostFile -Destination (Join-Path $candidateRoot 'capture-host-tests.xml')
     $coordinatorFile = Join-Path $projectRoot 'mobile/build/test-results/testDebugUnitTest/TEST-com.rawwave.shell.ActivityCoordinatorTest.xml'
     if ((Get-Item -LiteralPath $coordinatorFile).LastWriteTimeUtc -lt $started.UtcDateTime) { throw 'Stale coordinator tests' }
@@ -101,6 +109,11 @@ try {
     [xml]$runtimeTests = Get-Content -LiteralPath $runtimeTestFile -Raw
     if ([int]$runtimeTests.testsuite.failures -ne 0 -or [int]$runtimeTests.testsuite.errors -ne 0 -or [int]$runtimeTests.testsuite.skipped -ne 0 -or [int]$runtimeTests.testsuite.tests -lt 18) { throw 'Runtime tests failed or missing' }
     Copy-Item -LiteralPath $runtimeTestFile -Destination (Join-Path $candidateRoot 'runtime-tests.xml')
+    $rateTestFile = Join-Path $projectRoot 'shared/build/test-results/test/TEST-com.rawwave.core.TransferRateMonitorTest.xml'
+    if ((Get-Item -LiteralPath $rateTestFile).LastWriteTimeUtc -lt $started.UtcDateTime) { throw 'Stale transfer rate test report' }
+    [xml]$rateTests = Get-Content -LiteralPath $rateTestFile -Raw
+    if ([int]$rateTests.testsuite.failures -ne 0 -or [int]$rateTests.testsuite.errors -ne 0 -or [int]$rateTests.testsuite.skipped -ne 0 -or [int]$rateTests.testsuite.tests -lt 6) { throw 'Transfer rate stability tests failed or missing' }
+    Copy-Item -LiteralPath $rateTestFile -Destination (Join-Path $candidateRoot 'transfer-rate-tests.xml')
     $wakeTestFile = Join-Path $projectRoot 'shared/build/test-results/test/TEST-com.rawwave.core.WakeHistoryTest.xml'
     if ((Get-Item -LiteralPath $wakeTestFile).LastWriteTimeUtc -lt $started.UtcDateTime) { throw 'Stale wake history report' }
     [xml]$wakeTests = Get-Content -LiteralPath $wakeTestFile -Raw
@@ -193,7 +206,7 @@ try {
         $permissions = @([regex]::Matches(($badging -join "`n"), "uses-permission: name='([^']+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
         $allowedPermissions = @('android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_DATA_SYNC','android.permission.WAKE_LOCK') | Sort-Object
         if ($module -eq 'wear') {
-            $allowedPermissions = @($allowedPermissions) + @('android.permission.FOREGROUND_SERVICE_HEALTH','android.permission.BODY_SENSORS','android.permission.health.READ_HEART_RATE','android.permission.health.READ_SKIN_TEMPERATURE','android.permission.health.READ_OXYGEN_SATURATION','android.permission.ACTIVITY_RECOGNITION','com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA') | Sort-Object
+            $allowedPermissions = @($allowedPermissions) + @('android.permission.FOREGROUND_SERVICE_HEALTH','android.permission.FOREGROUND_SERVICE_LOCATION','android.permission.ACCESS_FINE_LOCATION','android.permission.ACCESS_COARSE_LOCATION','android.permission.BODY_SENSORS','android.permission.health.READ_HEART_RATE','android.permission.health.READ_SKIN_TEMPERATURE','android.permission.health.READ_OXYGEN_SATURATION','android.permission.ACTIVITY_RECOGNITION','com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA') | Sort-Object
         }
         if (($permissions -join ',') -ne ($allowedPermissions -join ',')) { throw 'Unexpected final APK permissions' }
         $services = @([regex]::Matches($manifestText, '(?ms)^(\s*)E: service\b.*?(?=^\1E:|\z)'))
@@ -206,7 +219,7 @@ try {
             if ($name -eq 'com.rawwave.shell.SyncGuardService') {
                 if ($service.Value -notmatch 'android:exported[^=\r\n]*=false\b' -or $service.Value -notmatch 'android:foregroundServiceType[^=\r\n]*=0x0*1\b' -or $service.Value -match 'E: intent-filter') { throw 'Invalid bounded sync service declaration' }
             } elseif ($module -eq 'wear' -and $name -eq 'com.rawwave.shell.ActivityRecordingService') {
-                if ($service.Value -notmatch 'android:exported[^=\r\n]*=false\b' -or $service.Value -notmatch 'android:foregroundServiceType[^=\r\n]*=0x0*100\b' -or $service.Value -match 'E: intent-filter') { throw 'Invalid capture service declaration' }
+                if ($service.Value -notmatch 'android:exported[^=\r\n]*=false\b' -or $service.Value -notmatch 'android:foregroundServiceType[^=\r\n]*=0x0*108\b' -or $service.Value -match 'E: intent-filter') { throw 'Invalid capture service declaration' }
             } elseif ($module -eq 'mobile' -and $name -eq 'com.rawwave.shell.PhoneWakeService') {
                 if ($service.Value -notmatch 'android:exported[^=\r\n]*=true\b' -or $service.Value -notmatch 'com.google.android.gms.wearable.MESSAGE_RECEIVED' -or $service.Value -notmatch 'android:path[^\r\n]*="/rawwave/g2a/hello"' -or $service.Value -notmatch 'android:path[^\r\n]*="/rawwave/activity/v1/hello"' -or $service.Value -notmatch 'android:scheme[^\r\n]*="wear"' -or $service.Value -notmatch 'android:host[^\r\n]*="\*"') { throw 'Invalid phone-only wake filters' }
                 if (@([regex]::Matches($service.Value,'E: action\b')).Count -ne 3 -or @([regex]::Matches($service.Value,'E: data\b')).Count -ne 3) { throw 'Unexpected wake entry expansion' }
@@ -225,7 +238,7 @@ try {
             if (-not $types.Contains($required)) { throw "Missing transport resource contract $required" }
         }
         if ($module -eq 'wear') {
-            foreach ($required in @('Lcom/rawwave/core/SensorPort;','Lcom/rawwave/core/SensorRows;','Lcom/rawwave/shell/CaptureAssembly;')) {
+            foreach ($required in @('Lcom/rawwave/core/SensorPort;','Lcom/rawwave/core/SensorRows;','Lcom/rawwave/core/LocationFix;','Lcom/rawwave/core/StepCount;','Lcom/rawwave/core/StepDetector;','Lcom/rawwave/core/OffBody;','Lcom/rawwave/core/GyroscopeUncalibrated;','Lcom/rawwave/core/MagneticFieldUncalibrated;','Lcom/rawwave/core/AccelerometerUncalibrated;','Lcom/rawwave/core/LinearAcceleration;','Lcom/rawwave/core/GameRotationVector;','Lcom/rawwave/shell/CaptureAssembly;','Lcom/rawwave/shell/LocationSensorAdapter;','Lcom/rawwave/shell/StepCounterSensorAdapter;','Lcom/rawwave/shell/StepDetectorSensorAdapter;','Lcom/rawwave/shell/OffBodySensorAdapter;','Lcom/rawwave/shell/GyroscopeUncalibratedSensorAdapter;','Lcom/rawwave/shell/MagneticFieldUncalibratedSensorAdapter;','Lcom/rawwave/shell/AccelerometerUncalibratedSensorAdapter;','Lcom/rawwave/shell/LinearAccelerationSensorAdapter;','Lcom/rawwave/shell/GameRotationVectorSensorAdapter;')) {
                 if (-not $types.Contains($required)) { throw "Missing sensor handoff $required" }
             }
         }
@@ -238,7 +251,7 @@ try {
             if (-not $types.Contains($required)) { throw "Missing feedback module $required in $module" }
         }
         if ($module -eq 'wear') {
-            foreach ($required in @('Lcom/rawwave/shell/RecordingActivity;','Lcom/rawwave/shell/ActivityRecordingService;','Lcom/rawwave/shell/SamsungSensorAdapter;','Lcom/rawwave/core/ActivityStore;','Lcom/rawwave/core/SensorCatalog;','Lcom/rawwave/core/EcgBatchQuality;','Lcom/rawwave/core/EcgContinuityGate;','Lcom/rawwave/core/EcgRetryPolicy;','Lcom/rawwave/core/StreamQualityTracker;','Lcom/rawwave/core/ActivityArchive;','Lcom/rawwave/core/AutoSyncGate;','Lcom/rawwave/shell/WatchActivitySyncSession;','Lcom/samsung/android/service/health/tracking/HealthTrackingService;')) {
+            foreach ($required in @('Lcom/rawwave/shell/RecordingActivity;','Lcom/rawwave/shell/ActivityRecordingService;','Lcom/rawwave/shell/SamsungSensorAdapter;','Lcom/rawwave/core/ActivityStore;','Lcom/rawwave/core/SensorCatalog;','Lcom/rawwave/core/EcgBatchQuality;','Lcom/rawwave/core/EcgContinuityGate;','Lcom/rawwave/core/EcgRetryPolicy;','Lcom/rawwave/core/StreamQualityTracker;','Lcom/rawwave/core/ActivityArchive;','Lcom/rawwave/core/AutoSyncGate;','Lcom/rawwave/core/ActivityRetryPolicy;','Lcom/rawwave/shell/WatchActivitySyncSession;','Lcom/samsung/android/service/health/tracking/HealthTrackingService;')) {
                 if (-not $types.Contains($required)) { throw "Missing capture module $required" }
             }
             if (($badging -join "`n") -notmatch "launchable-activity: name='com.rawwave.shell.RecordingActivity'") { throw 'Capture launcher not connected' }
@@ -264,20 +277,23 @@ try {
 # Archive every executed suite, including newly added regression tests.
 $allResults = @()
 $totalTests = 0
+$totalSkipped = 0
 foreach ($module in @('shared','wear','mobile')) {
     $resultFolder = if ($module -eq 'shared') { 'test' } else { 'testDebugUnitTest' }
     foreach ($result in Get-ChildItem (Join-Path $projectRoot "$module/build/test-results/$resultFolder") -Filter 'TEST-*.xml') {
         [xml]$suite = Get-Content -LiteralPath $result.FullName
         if ([int]$suite.testsuite.failures -gt 0 -or [int]$suite.testsuite.errors -gt 0) { throw "Failed suite: $($result.Name)" }
         $totalTests += [int]$suite.testsuite.tests
+        $totalSkipped += [int]$suite.testsuite.skipped
         Copy-Item -LiteralPath $result.FullName -Destination (Join-Path $candidateRoot "$module-$($result.Name)")
         $allResults += "$module-$($result.Name)"
     }
 }
 $allResults | ConvertTo-Json | Set-Content (Join-Path $candidateRoot 'test-suite-index.json')
-[ordered]@{ runId=$RunId; startedAt=$started.ToString('o'); completedAt=[DateTimeOffset]::Now.ToString('o'); stage='BIA_SHORT_MEASUREMENT_PRESSURE_CONTINUOUS'; developerResult='PASS'; deviceResult='NOT_RUN_COMBINED_CHECK_PENDING'; tasks=$tasks; tests=$totalTests; toolchain=@{agp='9.1.1';gradle='9.3.1';compileSdk=36;buildTools='36.0.0'}; signing='LOCAL_ANDROID_TEST_CERTIFICATE_NOT_PUBLIC_RELEASE'; artifacts=$artifacts; sourceInputs=$sourceAfter } |
+$developerResult = if ($corpusConfigured) { 'PASS' } else { 'PASS_WITH_PRIVATE_CORPUS_NOT_RUN' }
+[ordered]@{ runId=$RunId; startedAt=$started.ToString('o'); completedAt=[DateTimeOffset]::Now.ToString('o'); stage='BIA_RETRY_UI_0_12_3'; developerResult=$developerResult; deviceResult='NOT_RUN_COMBINED_CHECK_PENDING'; privateCorpusReplay=$privateCorpusReplay; tasks=$tasks; tests=$totalTests; skippedTests=$totalSkipped; toolchain=@{agp='9.1.1';gradle='9.3.1';compileSdk=36;buildTools='36.0.0'}; signing='LOCAL_ANDROID_TEST_CERTIFICATE_NOT_PUBLIC_RELEASE'; artifacts=$artifacts; sourceInputs=$sourceAfter } |
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $candidateRoot 'build.json') -Encoding utf8
-    Write-Output "CANDIDATE_DEV_PASS: $candidateRoot; DEVICE_NOT_RUN"
+    Write-Output "CANDIDATE_DEV_PASS: $candidateRoot; DEVICE_NOT_RUN; privateCorpusReplay=$privateCorpusReplay"
 } catch {
     [ordered]@{runId=$RunId; developerResult='FAIL'; deviceResult='NOT_RUN'; error=$_.Exception.Message} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $candidateRoot 'FAILED.json') -Encoding utf8
     throw

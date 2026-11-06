@@ -1,6 +1,7 @@
 package com.rawwave.shell
 
 import android.content.Context
+import com.rawwave.core.SensorCatalog
 import com.rawwave.core.SensorPort
 
 /** Only composition point knows the concrete vendor adapter. No global mutable factory. */
@@ -16,7 +17,7 @@ object CaptureAssembly {
 private class CombinedSensors(private val samsung: SensorPort, private val android: SensorPort): SensorPort {
     override fun contractVersion()=SensorPort.CONTRACT_VERSION
     override fun implementationVersion()=samsung.implementationVersion()+";"+android.implementationVersion()
-    private fun port(sensor:String)=if(sensor=="GYROSCOPE" || sensor=="PRESSURE" || sensor=="MAGNETIC_FIELD") android else samsung
+    private fun port(sensor:String)=if(SensorCatalog.isAndroidPlatformSource(sensor)) android else samsung
     override fun connect(ready:Runnable, failed:SensorPort.Failure)=samsung.connect(ready,failed)
     override fun start(sensor:String, rows:SensorPort.Rows, failed:SensorPort.Failure)=port(sensor).start(sensor,rows,failed)
     override fun drain(sensor:String, done:SensorPort.Drain)=port(sensor).drain(sensor,done)
@@ -24,22 +25,48 @@ private class CombinedSensors(private val samsung: SensorPort, private val andro
     override fun close(){try{samsung.close()}finally{android.close()}}
 }
 
-/** Separate listeners/fences let gyro and pressure drain independently. */
+/** Separate listeners/fences let each platform source drain independently. */
 private class PlatformSensors(context: Context, dispatch: (() -> Unit) -> Unit): SensorPort {
     private val gyro = GyroscopeSensorAdapter(context, dispatch)
+    private val gyroUncalibrated = GyroscopeUncalibratedSensorAdapter(context, dispatch)
+    private val accelerometerUncalibrated = AccelerometerUncalibratedSensorAdapter(context, dispatch)
+    private val linearAcceleration = LinearAccelerationSensorAdapter(context, dispatch)
+    private val gameRotationVector = GameRotationVectorSensorAdapter(context, dispatch)
     private val magnetic = MagneticFieldSensorAdapter(context, dispatch)
+    private val magneticUncalibrated = MagneticFieldUncalibratedSensorAdapter(context, dispatch)
     private val pressure = PressureSensorAdapter(context, dispatch)
+    private val light = LightSensorAdapter(context, dispatch)
+    private val location = LocationSensorAdapter(context, dispatch)
+    private val steps = StepCounterSensorAdapter(context, dispatch)
+    private val stepDetector = StepDetectorSensorAdapter(context, dispatch)
+    private val offBody = OffBodySensorAdapter(context, dispatch)
     private fun port(sensor: String): SensorPort = when(sensor) {
         "GYROSCOPE" -> gyro
+        "GYROSCOPE_UNCALIBRATED" -> gyroUncalibrated
+        "ACCELEROMETER_UNCALIBRATED" -> accelerometerUncalibrated
+        "LINEAR_ACCELERATION" -> linearAcceleration
+        "GAME_ROTATION_VECTOR" -> gameRotationVector
         "PRESSURE" -> pressure
         "MAGNETIC_FIELD" -> magnetic
+        "MAGNETIC_FIELD_UNCALIBRATED" -> magneticUncalibrated
+        "LIGHT" -> light
+        "GPS" -> location
+        "STEP_COUNT" -> steps
+        "STEP_DETECTOR" -> stepDetector
+        "OFFBODY" -> offBody
         else -> error("UNKNOWN_PLATFORM_SENSOR:$sensor")
     }
     override fun contractVersion() = SensorPort.CONTRACT_VERSION
-    override fun implementationVersion() = gyro.implementationVersion()+";"+pressure.implementationVersion()+";"+magnetic.implementationVersion()
+    override fun implementationVersion() = gyro.implementationVersion()+";"+gyroUncalibrated.implementationVersion()+";"+accelerometerUncalibrated.implementationVersion()+";"+linearAcceleration.implementationVersion()+";"+gameRotationVector.implementationVersion()+";"+pressure.implementationVersion()+";"+magnetic.implementationVersion()+";"+magneticUncalibrated.implementationVersion()+";"+light.implementationVersion()+";"+location.implementationVersion()+";"+steps.implementationVersion()+";"+stepDetector.implementationVersion()+";"+offBody.implementationVersion()
     override fun connect(ready: Runnable, failed: SensorPort.Failure) = gyro.connect(ready,failed)
     override fun start(sensor:String, rows:SensorPort.Rows, failed:SensorPort.Failure)=port(sensor).start(sensor,rows,failed)
     override fun drain(sensor:String, done:SensorPort.Drain)=port(sensor).drain(sensor,done)
     override fun stop(sensor:String)=port(sensor).stop(sensor)
-    override fun close(){try{gyro.close()}finally{try{pressure.close()}finally{magnetic.close()}}}
+    override fun close(){
+        var failure: Throwable? = null
+        listOf(gyro, gyroUncalibrated, accelerometerUncalibrated, linearAcceleration, gameRotationVector, pressure, magnetic, magneticUncalibrated, light, location, steps, stepDetector, offBody).forEach {
+            try { it.close() } catch (t: Throwable) { if (failure == null) failure = t }
+        }
+        failure?.let { throw it }
+    }
 }

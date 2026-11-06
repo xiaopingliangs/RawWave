@@ -69,8 +69,30 @@ public class ReportModulesTest {
         assertEquals(0,report.includedWatchReports());
         assertEquals("NOT_COLLECTED_OR_NOT_VERIFIED",status(report.file()).get("otherDevice").getAsString());
         assertEquals("NOT_COLLECTED",status(report.file()).get("systemPowerEvidence").getAsString());
+        assertEquals("NOT_COLLECTED",status(report.file()).get("systemDump").getAsString());
+        assertEquals("INCLUDED_APP_JOURNAL_ONLY",status(report.file()).get("appLevelPostconditions").getAsString());
         assertTrue(new String(entry(report.file(),"diagnostic-feedback.txt"),StandardCharsets.UTF_8).contains("仅本机证据"));
         assertFalse(new String(entry(report.file(),"summary.md"),StandardCharsets.UTF_8).contains("尚未接入同步"));
+    }
+    @Test public void reportIncludesManifestPostconditionsAndUserObservation() throws Exception {
+        journal.event("CAPTURE_VENDOR_CLEANUP",Map.of("stage","TRACKER_CREATED","sensor","PPG"));
+        journal.event("CAPTURE_VENDOR_CLEANUP",Map.of("stage","FINAL_UNSET_RETURNED","sensor","PPG"));
+        journal.event("CAPTURE_VENDOR_CLEANUP",Map.of("stage","DISCONNECT_REQUEST","sensor","ALL"));
+        journal.event("CAPTURE_VENDOR_CLEANUP",Map.of("stage","DISCONNECT_RETURNED","sensor","ALL"));
+        journal.event("CAPTURE_VENDOR_CLEANUP",Map.of("stage","DISCONNECT_RECHECK","sensor","ALL","detail","retained=0"));
+        journal.event("CAPTURE_VENDOR_CLEANUP",Map.of("stage","OWNER_CLOSED","sensor","ALL","detail","failure="));
+        journal.event("CAPTURE_SESSION_END",Map.of("session","s-1","detail","USER_COMPLETED"));
+        journal.observation("DIAGNOSTIC_CAPTURE",Map.of("diagnosticCaptureId","cap-1",
+            "symptoms",List.of("LED_PERSISTENT"),"led","ON","watchExit","NOT_EXITED","rebootState","NOT_RECORDED"));
+        ReportBuilder.Report report=builder.build(1);
+        JsonObject manifest=JsonParser.parseString(new String(entry(report.file(),"diagnostic-manifest.json"),StandardCharsets.UTF_8)).getAsJsonObject();
+        JsonObject post=JsonParser.parseString(new String(entry(report.file(),"postconditions.json"),StandardCharsets.UTF_8)).getAsJsonObject();
+        assertEquals("RAWWAVE_DIAGNOSTIC_MANIFEST",manifest.get("kind").getAsString());
+        assertEquals(1,manifest.getAsJsonObject("coverage").get("observationCount").getAsInt());
+        assertEquals("APP_LEVEL_POSTCONDITIONS",post.get("kind").getAsString());
+        assertTrue(post.getAsJsonArray("checks").toString().contains("tracker_final_unset"));
+        assertTrue(new String(entry(report.file(),"phone/diagnostic-observations.jsonl"),StandardCharsets.UTF_8).contains("cap-1"));
+        assertTrue(new String(entry(report.file(),"summary.md"),StandardCharsets.UTF_8).contains("postconditions.json"));
     }
     @Test public void independentSummaryIsExportedAndMarkedAsCachedPartial() throws Exception {
         File summary = new File(temp.newFolder(),"latest.json");

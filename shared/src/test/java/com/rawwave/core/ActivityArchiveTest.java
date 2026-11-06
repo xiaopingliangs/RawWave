@@ -173,7 +173,7 @@ public class ActivityArchiveTest {
 
     @Test public void unknownStreamsAndUnsafePathsRemainRejected() throws Exception {
         String prefix="sessions/12345678-1234-1234-1234-123456789abc/";
-        for(String name:List.of(prefix+"00000001-CORE-1-UNKNOWN.json",prefix+"00000001-CORE-1-PPG.json.part",
+        for(String name:List.of(prefix+"00000001-CORE-1-PPG.json.part",
                 prefix+"../plan.json",prefix+"00000001-OTHER-1-EDA.json")) {
             File archive=new File(temp.newFolder(),"12345678-1234-1234-1234-123456789abc.zip");
             try(ZipOutputStream zip=new ZipOutputStream(new FileOutputStream(archive))) {
@@ -181,6 +181,60 @@ public class ActivityArchiveTest {
             }
             assertEquals("UNSAFE_ACTIVITY_ENTRY",assertThrows(IOException.class,()->ActivityArchive.verify(archive)).getMessage());
         }
+    }
+
+    @Test public void declaredFutureSourceIsAcceptedButUndeclaredUnknownSourceIsRejected() throws Exception {
+        File declared=archiveWithSource("FUTURE_SENSOR",true);
+        assertEquals(List.of("22222222-2222-4222-8222-222222222222"),
+            ActivityArchive.verify(declared).sessionIds());
+        File undeclared=archiveWithSource("FUTURE_SENSOR",false);
+        IOException failure=assertThrows(IOException.class,()->ActivityArchive.verify(undeclared));
+        assertTrue(failure.getMessage().startsWith("UNDECLARED_ACTIVITY_SENSOR:"));
+    }
+
+    private File archiveWithSource(String sensor, boolean declared) throws Exception {
+        String sessionId="22222222-2222-4222-8222-222222222222";
+        String batchId="11111111-1111-4111-8111-111111111111";
+        File folder=temp.newFolder();
+        File archive=new File(folder,batchId+".zip");
+        String declaredCore=declared?",\""+sensor+"\"":"";
+        String declaredKind=declared?",\""+sensor+"\":\"future source declared by plan\"":"";
+        byte[] plan=("{\"schema\":5,\"sessionId\":\""+sessionId+"\",\"coreSources\":[\"ACCELEROMETER\""+declaredCore+
+            "],\"dataKinds\":{\"ACCELEROMETER\":\"test\""+declaredKind+"}}").getBytes(StandardCharsets.UTF_8);
+        byte[] block=("{\"phase\":\"CORE-1\",\"sensor\":\""+sensor+
+            "\",\"samples\":[{\"sdkTimestamp\":1}]}").getBytes(StandardCharsets.UTF_8);
+        Map<String,byte[]> files=new LinkedHashMap<>();
+        files.put("sessions/"+sessionId+"/plan.json",plan);
+        files.put("sessions/"+sessionId+"/00000001-CORE-1-"+sensor+".json",block);
+        StringBuilder manifest=new StringBuilder("{");
+        boolean first=true;
+        for(Map.Entry<String,byte[]> item:files.entrySet()) {
+            if(!first) manifest.append(',');
+            first=false;
+            manifest.append('"').append(item.getKey()).append("\":{\"bytes\":").append(item.getValue().length)
+                .append(",\"sha256\":\"").append(DiagnosticArchive.hash(item.getValue())).append("\"}");
+        }
+        manifest.append('}');
+        byte[] bundle=("{\"schemaVersion\":1,\"kind\":\"RAWWAVE_ACTIVITY_RAW_EXPORT\",\"batchId\":\""+batchId+
+            "\",\"createdUtcMs\":1,\"sessions\":[{\"sessionId\":\""+sessionId+"\",\"sealed\":false,"+
+            "\"integrity\":\"UNSEALED_IMMUTABLE_BLOCK_SNAPSHOT_TAIL_UNKNOWN\"}],\"files\":"+manifest+"}")
+            .getBytes(StandardCharsets.UTF_8);
+        try(ZipOutputStream zip=new ZipOutputStream(new FileOutputStream(archive),StandardCharsets.UTF_8)) {
+            for(Map.Entry<String,byte[]> item:files.entrySet()) {
+                zip.putNextEntry(new ZipEntry(item.getKey()));zip.write(item.getValue());zip.closeEntry();
+            }
+            zip.putNextEntry(new ZipEntry("bundle.json"));zip.write(bundle);zip.closeEntry();
+        }
+        return archive;
+    }
+
+    @Test public void unsealedSessionIsCountedUntilSealed() throws Exception {
+        File root=temp.newFolder("activities");
+        ActivityStore store=store(root);
+        ActivityStore.Session source=store.start(store.createTemplate("unsealed",false),1,2);
+        assertEquals(1,ActivityArchive.unsealedCount(root));
+        source.seal("DONE",3);
+        assertEquals(0,ActivityArchive.unsealedCount(root));
     }
 
     @Test public void durableAckSuppressesSession() throws Exception {

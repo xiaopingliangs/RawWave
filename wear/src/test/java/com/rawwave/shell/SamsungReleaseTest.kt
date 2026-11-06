@@ -18,6 +18,19 @@ class SamsungReleaseTest {
         override fun connect(ready:()->Unit, ended:()->Unit, failed:(String)->Unit) = if(delay){delayedReady=ready}else ready()
         override fun create(sensor:String):SamsungTracker {creates++;return Tracker().also{trackers[sensor]=it}}
         override fun disconnect(){disconnects++;if(failDisconnect)error("disconnect failure")}
+        override fun capability():Map<String,Any> = mapOf(
+            "healthSensorServiceVersion" to "test-service-version",
+            "supportedHealthTrackerTypes" to "PPG_CONTINUOUS,ECG_ON_DEMAND")
+    }
+    @Test fun capabilitySnapshotIsRecordedAtConnectionSuccess() {
+        val b=Backend();val records=mutableListOf<Pair<String,Map<String,Any>>>()
+        val a=SamsungSensorAdapter(b,{it()},{kind,fields->records.add(kind to fields)},{1L},{1L})
+        a.connect({}, {fail(it)})
+        val capability=records.firstOrNull{it.first=="SDK_CAPABILITY"}?.second
+        assertNotNull(capability)
+        assertEquals("test-service-version",capability!!["healthSensorServiceVersion"])
+        assertEquals("PPG_CONTINUOUS,ECG_ON_DEMAND",capability["supportedHealthTrackerTypes"])
+        a.close()
     }
     @Test fun disconnectFailureStillFinalizesOwnerAndCloseIsIdempotent() {
         val b=Backend();b.failDisconnect=true;val stages=mutableListOf<String>()

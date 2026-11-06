@@ -377,6 +377,46 @@ public class ActivityStoreTest {
             try(var paths=Files.walk(folder.toPath())) {for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}
         }
     }
+    @Test public void gpsPlanRecordsPlatformLocationAndDeliveredOnlyDrainIsAccepted() throws Exception {
+        var folder=Files.createTempDirectory("gps-plan-test").toFile();
+        try {
+            var store=new ActivityStore(folder,dir->{});
+            var template=store.createTemplate("gps",false,List.of("GPS"),false);
+            var session=store.start(template,1000,1);
+            String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+            assertTrue(plan.contains("gpsPolicy"));
+            assertTrue(plan.contains("not raw GNSS measurements"));
+            assertTrue(plan.contains("no delivered tail is provable after stop"));
+            var drain=new CaptureDrain(List.of("GPS","LIGHT"));
+            drain.complete("GPS",SensorPort.DrainStatus.DELIVERED_ONLY,"no LocationManager flush");
+            drain.complete("LIGHT",SensorPort.DrainStatus.FLUSHED,"sensor flush");
+            assertTrue(drain.succeeded());
+            var lightOnly=new CaptureDrain(List.of("LIGHT"));
+            lightOnly.complete("LIGHT",SensorPort.DrainStatus.DELIVERED_ONLY,"must not be accepted");
+            assertFalse(lightOnly.succeeded());
+        } finally {
+            try(var paths=Files.walk(folder.toPath())) {for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}
+        }
+    }
+    @Test public void stepCountPlanRecordsPlatformCounterAndDeliveredOnlyIsRejected() throws Exception {
+        var folder=Files.createTempDirectory("step-count-plan-test").toFile();
+        try {
+            var store=new ActivityStore(folder,dir->{});
+            var template=store.createTemplate("steps",false,List.of(SensorCatalog.STEP_COUNT),false);
+            var session=store.start(template,1000,1);
+            String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+            assertTrue(plan.contains("stepCountPolicy"));
+            assertTrue(plan.contains("not raw motion"));
+            assertTrue(plan.contains("not a per-step event stream"));
+            assertTrue(plan.contains("long gaps while stationary are expected"));
+            var drain=new CaptureDrain(List.of(SensorCatalog.STEP_COUNT));
+            drain.complete(SensorCatalog.STEP_COUNT,SensorPort.DrainStatus.DELIVERED_ONLY,"must not be accepted");
+            assertFalse(drain.succeeded());
+            assertTrue(drain.failures().get(SensorCatalog.STEP_COUNT).startsWith("SDK_FLUSH_REQUIRED:"));
+        } finally {
+            try(var paths=Files.walk(folder.toPath())) {for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}
+        }
+    }
     @Test public void drainPersistenceFailureNeverReleasesNormalNextPhase() {
         var drain=new CaptureDrain(List.of("ECG"));
         drain.complete("ECG",SensorPort.DrainStatus.DELIVERED_ONLY,"measurement checked separately");
@@ -704,6 +744,49 @@ public class ActivityStoreTest {
         String raw=Files.readString(new File(s.folder,"00000001-PRE-1-ECG.json").toPath());
         assertTrue(raw.contains("-0.25"));assertTrue(raw.contains("\"LEAD_OFF\":5")); assertEquals(Long.valueOf(1),s.counts().get("PRE-1/ECG"));
     }
+    @Test public void stepDetectorPlanRecordsPerStepEventAndDeliveredOnlyIsRejected() throws Exception {
+        var folder=Files.createTempDirectory("step-detector-plan-test").toFile();
+        var store=new ActivityStore(folder,dir->{});
+        var template=store.createTemplate("step-detector",false,List.of(SensorCatalog.STEP_DETECTOR),false);
+        var session=store.start(template,1,2);
+        String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+        assertTrue(plan.contains("stepDetectorPolicy"));
+        assertTrue(plan.contains("per-step event"));
+        assertTrue(plan.contains("not raw motion"));
+        assertTrue(plan.contains("STEP_DETECTOR"));
+        var drain=new CaptureDrain(List.of(SensorCatalog.STEP_DETECTOR));
+        drain.complete(SensorCatalog.STEP_DETECTOR,SensorPort.DrainStatus.DELIVERED_ONLY,"must not be accepted");
+        assertTrue(drain.failures().get(SensorCatalog.STEP_DETECTOR).startsWith("SDK_FLUSH_REQUIRED:"));
+    }
+    @Test public void offBodyPlanRecordsPlatformStateAndDeliveredOnlyIsRejected() throws Exception {
+        var folder=Files.createTempDirectory("offbody-plan-test").toFile();
+        var store=new ActivityStore(folder,dir->{});
+        var template=store.createTemplate("offbody",false,List.of(SensorCatalog.OFFBODY),false);
+        var session=store.start(template,1,2);
+        String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+        assertTrue(plan.contains("offBodyPolicy"));
+        assertTrue(plan.contains("on-body"));
+        assertTrue(plan.contains("not raw optical"));
+        assertTrue(plan.contains("OFFBODY"));
+        var drain=new CaptureDrain(List.of(SensorCatalog.OFFBODY));
+        drain.complete(SensorCatalog.OFFBODY,SensorPort.DrainStatus.DELIVERED_ONLY,"must not be accepted");
+        assertTrue(drain.failures().get(SensorCatalog.OFFBODY).startsWith("SDK_FLUSH_REQUIRED:"));
+    }
+    @Test public void uncalibratedImuPlanRecordsRawAndBiasAndDeliveredOnlyIsRejected() throws Exception {
+        var folder=Files.createTempDirectory("uncalibrated-imu-plan-test").toFile();
+        var store=new ActivityStore(folder,dir->{});
+        var template=store.createTemplate("uncalibrated",false,
+            List.of(SensorCatalog.GYROSCOPE_UNCALIBRATED,SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED),false);
+        var session=store.start(template,1,2);
+        String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+        assertTrue(plan.contains("gyroscopeUncalibratedPolicy"));
+        assertTrue(plan.contains("magneticFieldUncalibratedPolicy"));
+        assertTrue(plan.contains("estimated bias"));
+        assertTrue(plan.contains("hard-iron bias"));
+        var drain=new CaptureDrain(List.of(SensorCatalog.GYROSCOPE_UNCALIBRATED));
+        drain.complete(SensorCatalog.GYROSCOPE_UNCALIBRATED,SensorPort.DrainStatus.DELIVERED_ONLY,"must not be accepted");
+        assertTrue(drain.failures().get(SensorCatalog.GYROSCOPE_UNCALIBRATED).startsWith("SDK_FLUSH_REQUIRED:"));
+    }
     @Test public void planSeparatesSdkRawValuesFromComputedQuality() throws Exception {
         var s=store().start(store().createTemplate("测试",true),1,2);
         String plan=Files.readString(new File(s.folder,"plan.json").toPath());
@@ -757,6 +840,16 @@ public class ActivityStoreTest {
         assertTrue(plan.contains("raw green, infrared and red PPG"));
         assertTrue(plan.contains("not body temperature")); assertTrue(plan.contains("raw skin conductance"));
         assertFalse(plan.contains("HEART_RATE\":\"Samsung SDK"));
+    }
+    @Test public void ambientLightIsPersistedAsARawCoreStream() throws Exception {
+        var s=store().start(store().createTemplate("环境光",false,List.of(SensorCatalog.LIGHT)),1,2);
+        s.append("CORE-1",SensorCatalog.LIGHT,List.of(Map.of("sensorTimestampNs",123L,"LIGHT_LUX",42.5f,"accuracy",3)));
+        s.seal("USER_COMPLETED",3);
+        String plan=Files.readString(new File(s.folder,"plan.json").toPath());
+        assertTrue(plan.contains("\"LIGHT\""));
+        assertTrue(plan.contains("ambient illuminance in lux"));
+        assertEquals(Long.valueOf(1),s.counts().get("CORE-1/LIGHT"));
+        assertTrue(Files.readString(new File(s.folder,"00000001-CORE-1-LIGHT.json").toPath()).contains("\"LIGHT_LUX\":42.5"));
     }
     @Test public void unsealedDataSurvivesNewStore() throws Exception {var s=store().start(store().createTemplate("运动",false),1,2);s.append("CORE-1","HEART_RATE",List.of(Map.of("HEART_RATE",70)));assertTrue(store().history().get(0).contains("尾部未知"));assertEquals(2,s.folder.listFiles().length);}
     @Test public void sealVerifiesAndRejectsLaterWrites() throws Exception {var s=store().start(store().createTemplate("运动",false),1,2);s.append("CORE-1","EVENT",List.of(Map.of("reason","SENSOR_FAILED")));s.seal("PARTIAL",3);assertTrue(new File(s.folder,"seal.json").exists());assertThrows(IOException.class,()->s.append("CORE-1","EVENT",List.of(Map.of("x",1))));}

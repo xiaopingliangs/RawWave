@@ -36,6 +36,8 @@ class ProbeActivity : ComponentActivity() {
     }
     private val activitySyncObserver: (ProbeApplication.ActivitySyncStatus) -> Unit = { sync ->
         if (!exiting && ::status.isInitialized) status.text = sync.text
+        if (sync.running) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (!exiting && transfer == null) {
             if (sync.running) holdIdleForActivitySync() else releaseIdleForActivitySync()
         }
@@ -69,7 +71,7 @@ class ProbeActivity : ComponentActivity() {
         }.also { body.addView(it) }
         label("原波 · RawWave", if (watch) 20f else 28f)
         label((if (watch) "问题报告工具" else "手机数据中心") + "\n${BuildConfig.VERSION_NAME}\n${BuildConfig.BUILD_RUN}", 13f)
-        label(if (watch) "问题报告与活动数据分开传输。此页面不传活动原始数据。" else "手表会自动唤醒手机接收活动数据。\n同步完成立即停止，失败不自动重试。\n活动原始数据与问题报告分开保存。", 15f)
+        label(if (watch) "问题报告与活动数据分开传输。此页面不传活动原始数据。" else "手表会自动唤醒手机接收活动数据。\n同步完成立即停止；失败后手表会自动重试一次。\n活动原始数据与问题报告分开保存。", 15f)
         status = label(initialStatus(), 15f)
         powerNote = label("", 13f)
         fun button(title: String, action: () -> Unit) {
@@ -81,6 +83,7 @@ class ProbeActivity : ComponentActivity() {
         if (!watch) button("导出活动原始数据") { exportActivityData() }
         if (!watch) button("导出最近3次活动（一个压缩包）") { exportActivityData(recent = true) }
         button("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
+        button("记录问题现场") { recordDiagnosticCapture() }
         button("导出问题报告") { exportReport() }
         button(if (watch) "发送报告到手机" else "仅接收问题报告（不接收活动数据）") { startTransfer() }
         button("后台同步设置") {
@@ -95,6 +98,75 @@ class ProbeActivity : ComponentActivity() {
         record("ACTIVITY_CREATED", mapOf("screenRound" to resources.configuration.isScreenRound))
         try { app.journal?.mark("RUNNING") } catch (error: Exception) { showError(error) }
         scheduleIdle()
+    }
+
+    private fun recordDiagnosticCapture() {
+        if (working || exiting) return
+        val symptoms = linkedMapOf(
+            "LED_PERSISTENT" to "红/绿灯持续亮",
+            "WATCH_NOT_EXITED" to "手表没有退出/没有回表盘",
+            "DATA_NOT_ARRIVED" to "活动数据没有到手机",
+            "APP_CRASH_OR_FREEZE" to "应用崩溃/卡死/被系统停止",
+            "OTHER_OR_UNKNOWN" to "其他/不确定"
+        )
+        val keys = symptoms.keys.toList()
+        val labels = symptoms.values.toTypedArray()
+        val checked = BooleanArray(labels.size)
+        android.app.AlertDialog.Builder(this)
+            .setTitle("记录问题现场（可多选）")
+            .setMultiChoiceItems(labels, checked) { _, index, value -> checked[index] = value }
+            .setPositiveButton("保存") { _, _ ->
+                val selected = keys.filterIndexed { index, _ -> checked[index] }
+                saveDiagnosticCapture(selected)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun saveDiagnosticCapture(selected: List<String>) {
+        val journal = app.journal
+        if (journal == null) { status.text = app.journalFailure ?: "诊断存储未初始化，无法记录问题现场。"; return }
+        val captureId = java.util.UUID.randomUUID().toString()
+        val led = if ("LED_PERSISTENT" in selected) "ON" else "NOT_OBSERVED"
+        val watchExit = if ("WATCH_NOT_EXITED" in selected) "NOT_EXITED" else "NOT_OBSERVED"
+        val dataArrival = if ("DATA_NOT_ARRIVED" in selected) "NOT_ARRIVED" else "NOT_OBSERVED"
+        val crash = if ("APP_CRASH_OR_FREEZE" in selected) "REPORTED" else "NOT_OBSERVED"
+        val details = linkedMapOf<String, Any>(
+            "diagnosticCaptureId" to captureId,
+            "symptoms" to selected,
+            "led" to led,
+            "watchExit" to watchExit,
+            "dataArrival" to dataArrival,
+            "appCrashOrFreeze" to crash,
+            "rebootState" to "NOT_RECORDED",
+            "role" to BuildConfig.DEVICE_ROLE,
+            "versionCode" to BuildConfig.VERSION_CODE,
+            "versionName" to BuildConfig.VERSION_NAME,
+            "buildRun" to BuildConfig.BUILD_RUN,
+            "utcMs" to System.currentTimeMillis(),
+            "elapsedRealtimeMs" to SystemClock.elapsedRealtime(),
+            "uptimeMs" to SystemClock.uptimeMillis(),
+            "activeSyncOwner" to app.activeSyncOwner.orEmpty(),
+            "activitySyncRunning" to app.activitySyncStatus.running,
+            "activitySyncTrigger" to app.activitySyncStatus.trigger,
+            "lastStopReason" to app.lastStopReason.orEmpty(),
+            "processState" to (try { journal.previousState() } catch (_: Exception) { "UNKNOWN" })
+        )
+        try {
+            journal.observation("DIAGNOSTIC_CAPTURE", details)
+            journal.event("DIAGNOSTIC_CAPTURE_RECORDED", mapOf(
+                "diagnosticCaptureId" to captureId,
+                "symptoms" to selected,
+                "led" to led,
+                "watchExit" to watchExit,
+                "dataArrival" to dataArrival,
+                "appCrashOrFreeze" to crash))
+            status.text = "已记录问题现场。\nID ${captureId.take(8)}\n症状：${selected.joinToString("、").ifEmpty { "未选择" }}\n" +
+                "导出问题报告会包含此记录；系统层证据需按“诊断详情”里的说明另抓 dump。"
+        } catch (failure: Exception) {
+            showError(failure)
+            status.append("\n问题现场没有保存成功；请拍照本页并保留。")
+        }
     }
 
     private fun initialStatus(): String {
@@ -187,11 +259,28 @@ class ProbeActivity : ComponentActivity() {
     private fun holdIdleForActivitySync(): Boolean {
         if (exiting || transfer != null || working) return false
         if (runtime.isClosed()) {
-            if (!app.activitySyncStatus.running) return false
+            // The page deadline may already have fired while a previous sync suppressed
+            // the exit, leaving this Activity alive with a closed runtime. A genuine
+            // watch-initiated transfer is exactly the case that must be able to re-arm
+            // one bounded idle window; otherwise the phone rejects every wake until the
+            // user manually reopens the app.
+            if (exiting || working || transfer != null) return false
             runtime = newIdleRuntime().also { it.touchIdle() }
+            record("IDLE_REARMED_FOR_ACTIVITY_SYNC", runtime.evidence() + mapOf("previousState" to "CLOSED"))
         }
         if (runtime.isIdleHeld()) return true
-        val held = runtime.holdIdle()
+        var held = runtime.holdIdle()
+        if (!held) {
+            // A backgrounded page parks its idle timer. The absolute deadline can expire
+            // while parked, and RunDeadlines correctly refuses to hold an expired idle
+            // window. A genuine watch transfer may still start one fresh bounded window;
+            // no operation, export or transfer is active here.
+            if (exiting || working || transfer != null) return false
+            runtime = newIdleRuntime().also { it.touchIdle() }
+            record("IDLE_REARMED_FOR_ACTIVITY_SYNC",
+                runtime.evidence() + mapOf("previousState" to "EXPIRED_OR_UNHOLDABLE"))
+            held = runtime.holdIdle()
+        }
         record(if (held) "IDLE_HELD_FOR_ACTIVITY_SYNC" else "IDLE_HOLD_FAILED_FOR_ACTIVITY_SYNC",
             runtime.evidence() + mapOf("trigger" to app.activitySyncStatus.trigger))
         return held
@@ -291,7 +380,8 @@ class ProbeActivity : ComponentActivity() {
                     "appId" to packageName, "versionCode" to BuildConfig.VERSION_CODE,
                     "versionName" to BuildConfig.VERSION_NAME, "buildRun" to BuildConfig.BUILD_RUN,
                     "debuggable" to BuildConfig.DEBUG, "manufacturer" to Build.MANUFACTURER,
-                    "model" to Build.MODEL, "sdkInt" to Build.VERSION.SDK_INT, "fingerprint" to Build.FINGERPRINT), File(filesDir, "diagnostic-summary/latest.json")),
+                    "model" to Build.MODEL, "sdkInt" to Build.VERSION.SDK_INT, "fingerprint" to Build.FINGERPRINT,
+                    "release" to Build.VERSION.RELEASE, "display" to Build.DISPLAY), File(filesDir, "diagnostic-summary/latest.json")),
             DownloadsExportDestination(contentResolver), journal)
         if (worker.isShutdown) worker = Executors.newSingleThreadExecutor()
         worker.execute {

@@ -14,6 +14,8 @@ internal interface SamsungBackend {
     fun connect(ready: () -> Unit, ended: () -> Unit, failed: (String) -> Unit)
     fun create(sensor: String): SamsungTracker
     fun disconnect()
+    /** Best-effort snapshot after connection success; never used to decide acquisition. */
+    fun capability(): Map<String, Any> = emptyMap()
 }
 internal interface SamsungTracker {
     fun listen(listener: HealthTracker.TrackerEventListener)
@@ -27,13 +29,27 @@ internal class DeviceSamsungBackend(private val context: Context,
         const val DISCONNECT_MAIN_THREAD_TIMEOUT_MS = 2_000L
     }
     private var service: HealthTrackingService? = null
+    private var capabilitySnapshot: Map<String, Any> = emptyMap()
     override fun connect(ready: () -> Unit, ended: () -> Unit, failed: (String) -> Unit) {
         service = HealthTrackingService(object : ConnectionListener {
-            override fun onConnectionSuccess() = ready()
+            override fun onConnectionSuccess() {
+                capabilitySnapshot = try {
+                    val capability = service?.trackingCapability
+                    mapOf(
+                        "healthSensorServiceVersion" to (capability?.version ?: "UNKNOWN"),
+                        "supportedHealthTrackerTypes" to (capability?.supportHealthTrackerTypes
+                            ?.map { it.name }?.sorted()?.joinToString(",") ?: "UNKNOWN"),
+                        "capabilitySource" to "HealthTrackerCapability")
+                } catch (error: Throwable) {
+                    mapOf("capabilityError" to "${error.javaClass.simpleName}:${error.message}")
+                }
+                ready()
+            }
             override fun onConnectionEnded() = ended()
             override fun onConnectionFailed(error: HealthTrackerException) = failed("SDK_CONNECTION_FAILED:${error.errorCode}:${error.message}")
         }, context).also { it.connectService() }
     }
+    override fun capability(): Map<String, Any> = capabilitySnapshot
     /**
      * Samsung's connector is owned by the main thread. Clear the field first so this backend
      * cannot retain the vendor object, then run disconnectService() on main with a bounded wait.

@@ -1,7 +1,9 @@
 package com.rawwave.shell
 
+import android.Manifest
 import android.app.*
 import android.content.*
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.*
 import android.system.Os
@@ -26,9 +28,15 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Single-writer capture owner. Never automatically restarts sensors after process death. */
 class ActivityRecordingService : Service() {
     companion object {
+        private const val SHORT_BUDGET_MS = 80_000L
+        private const val NO_HAND_AUTOSTART_MS = 15_000L
+        private const val BIA_CONTACT_RETRY_MS = 2_000L
         data class State(val active: Boolean = false, val phase: String = "",
             val text: String = "", val remaining: Int = 0, val contact: Boolean = false,
-            val skipAllowed: Boolean = false, val failedAttempts: Int = 0, val shortSensor: String = "ECG")
+            val skipAllowed: Boolean = false, val failedAttempts: Int = 0, val shortSensor: String = "ECG",
+            val biaMode: String = "", val biaHasNext: Boolean = false, val biaContact: Boolean = false,
+            val biaRetrying: Boolean = false, val biaAttempt: Int = 0, val biaProgress: Int = -1,
+            val biaHint: String = "")
         @Volatile var state = State(); private set
         var observer: ((State) -> Unit)? = null // main thread; removed on Activity stop
         var idleExitObserver: (() -> Unit)? = null // main thread; retained only until Activity destroy
@@ -61,6 +69,16 @@ class ActivityRecordingService : Service() {
     private var postBiaAttempt = 199
     private var biaPhase = "PRE-200"
     private val biaResults = linkedMapOf<String,String>()
+    private val biaModeByPhase = linkedMapOf<String,String>()
+    private var biaModes: List<String> = emptyList()
+    private var biaModeIndex = 0
+    private var biaContactDetected = false
+    private var biaContactStartMs = 0L
+    private var shortBudgetStartMs = 0L
+    private var biaRetrying = false
+    private var biaAttempt = 0
+    private var biaProgress = -1
+    private var biaHint = ""
     private var biaSummary = ""
     private var spo2 = false
     private var spo2Pre = true
@@ -120,7 +138,16 @@ class ActivityRecordingService : Service() {
             renewCaptureLock()
             persistence?.check()
             flush()
-            running.filter { it != "SPO2" && it != "BIA" && it != "MF_BIA" && it != "PPG_ON_DEMAND" }.forEach { sensor ->
+            if (shortBudgetStartMs > 0L && shortSensor.isNotEmpty() && phase != "CORE-1" &&
+                !(shortSensor == "BIA" && biaContactDetected) &&
+                !(shortSensor == "ECG" && ecgGate.measuring() && (phase.startsWith("PRE") || phase.startsWith("POST"))) &&
+                clock() >= shortBudgetStartMs + SHORT_BUDGET_MS) {
+                event("SHORT_MEASUREMENT_TIMEOUT_80S", "sensor=$shortSensor; phase=$phase; elapsedMs=${clock()-shortBudgetStartMs}")
+                finish("SHORT_MEASUREMENT_TIMEOUT_80S", true)
+                return@guarded
+            }
+            // STEP_COUNT and STEP_DETECTOR are on-change: quiet while stationary is expected and is not a data alarm.
+            running.filter { it != "SPO2" && it != "BIA" && it != "MF_BIA" && it != "PPG_ON_DEMAND" && it != "STEP_COUNT" && it != "STEP_DETECTOR" && it != "OFFBODY" }.forEach { sensor ->
                 if (clock() - (lastData[sensor] ?: 0) > 15_000 && silent.add(sensor)) {
                     event("DATA_SILENCE_OBSERVED", "$sensor: no callback for 15s; SDK buffering versus missing data unknown")
                     notice = "$sensor 暂无新数据，原因未确认；其他采集继续。"
@@ -134,7 +161,20 @@ class ActivityRecordingService : Service() {
             }
             if (deadline > 0 && clock() >= deadline) {
                 event("CAPTURE_DEADLINE_OBSERVED", "phase=$phase; deadlineMs=$deadline; observedMs=${clock()}; lateMs=${clock()-deadline}; wakeLockHeld=${lock?.isHeld == true}; uptimeMs=${SystemClock.uptimeMillis()}")
-                if (phase.startsWith("ARM_BIA_")) { beginBia(); return@guarded }
+                if (phase.startsWith("READY_SPO2_")) { beginSpo2(spo2Pre); return@guarded }
+                if (phase.startsWith("READY_PPG_")) { beginPpg(ppgPre); return@guarded }
+                if (phase == "RESTORE_PRE") {
+                    event("NORMAL_PLACEMENT_CONFIRMED", "auto=${NO_HAND_AUTOSTART_MS / 1000}s; next=${if(ecg) "ECG" else "CORE"}")
+                    if(ecg) beginEcg("PRE-1") else beginCore()
+                    return@guarded
+                }
+                if (phase.startsWith("WAIT_BIA_")) {
+                    if (clock() >= biaContactStartMs + SHORT_BUDGET_MS) {
+                        event("BIA_CONTACT_TIMEOUT_80S", "mode=$bodySource; pre=$biaPre")
+                        finish("SHORT_MEASUREMENT_TIMEOUT_80S", true)
+                    } else beginBia()
+                    return@guarded
+                }
                 if (placementWaiting()) { finish("PLACEMENT_IDLE_TIMEOUT_80S", true); return@guarded }
                 if (phase == "CORE-1") {
                     // No non-empty row from any core source arrived inside the initial window.
@@ -195,7 +235,7 @@ class ActivityRecordingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "START" && !started) {
             started = true
-            state = State(true, "CONNECTING", "正在连接三星传感器…")
+            state = State(true, "CONNECTING", "正在准备传感器…")
             try {
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.createNotificationChannel(NotificationChannel("capture", "活动采集", NotificationManager.IMPORTANCE_LOW))
@@ -203,23 +243,30 @@ class ActivityRecordingService : Service() {
                 val stop = PendingIntent.getService(this, 1,
                     Intent(this, ActivityRecordingService::class.java).setAction("CANCEL"),
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-                startForeground(410, Notification.Builder(this, "capture").setSmallIcon(R.drawable.ic_rawwave)
+                val notification = Notification.Builder(this, "capture").setSmallIcon(R.drawable.ic_rawwave)
                     .setContentTitle("原波正在记录活动")
                     .setContentText("返回原波正常结束；也可停止采集并保存（不做活动后短测）")
                     .setContentIntent(pending).setOngoing(true)
-                    .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止采集（保存）", stop).build(),
+                    .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止采集（保存）", stop).build()
+                startForeground(410, notification,
                     if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH else 0)
                 lock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RawWave:Capture").apply {
                     setReferenceCounted(false); acquire(60_000)
                 }
                 lockRenewed = clock()
                 val id = intent.getStringExtra("template")
+                val store = store(this)
+                val template = store.templates().single { it.id() == id }
+                if (Build.VERSION.SDK_INT >= 34 && template.coreSources().contains(SensorCatalog.GPS) &&
+                    checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                    // Location foreground type is added only for a selected, granted GPS source.
+                    startForeground(410, notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                }
                 writer.post { guarded {
-                    val store = store(this)
-                    val template = store.templates().single { it.id() == id }
                     beginSession(store.start(template, System.currentTimeMillis(), clock()),template,
                         CaptureAssembly.sensors(this, ::enqueue,
-                            template.ecg() || template.spo2() || template.ppg() || template.bia() || template.coreSources().any { it != "GYROSCOPE" && it != "PRESSURE" && it != "MAGNETIC_FIELD" }, template.biaProfile(), ::enqueueRows))
+                            template.ecg() || template.spo2() || template.ppg() || template.bia() || template.coreSources().any { !SensorCatalog.isAndroidPlatformSource(it) }, template.biaProfile(), ::enqueueRows))
                 } }
             } catch (e: Exception) { writer.post { fail(e) } }
         } else if (started) {
@@ -233,18 +280,27 @@ class ActivityRecordingService : Service() {
         session = value
         if (useDiskOwner) persistence = com.rawwave.core.CapturePersistence(value)
         ecg = template.ecg(); coreSources = template.coreSources().toList()
-        spo2 = template.spo2(); bia = template.bia(); ppg = template.ppg(); bodySource=if(template.mfBia()) "MF_BIA" else "BIA"
+        spo2 = template.spo2(); bia = template.bia(); ppg = template.ppg()
+        biaModes = when {
+            !bia -> emptyList()
+            template.biaBoth() -> listOf("BIA","MF_BIA")
+            template.mfBia() -> listOf("MF_BIA")
+            else -> listOf("BIA")
+        }
+        biaModeIndex = 0
+        bodySource = biaModes.firstOrNull() ?: "BIA"
         sessionStartedMs = clock()
         event("CAPTURE_START", "build=${BuildConfig.BUILD_RUN}; template=${template.id()}")
         phase = "CONNECTING"; deadline = clock() + 20_000
         adapter = SensorPort.requireCompatible(sensors)
         event("SENSOR_CONTRACT_BOUND", "contract=${adapter!!.contractVersion()}; implementation=${adapter!!.implementationVersion()}")
+        emitPlatformSensorInventory()
         adapter!!.connect({
             if (draining != null || stopping || destroyed || fatalPending.get() != null) return@connect
             if (phase != "CONNECTING") return@connect
             if (clock() >= deadline) { finish("SDK_CONNECT_TIMEOUT"); return@connect }
             writer.removeCallbacks(tick)
-            if (spo2) prepareSpo2(true) else if (ppg) preparePpg(true) else if (bia) prepareBia(true) else if (ecg) beginEcg("PRE-1") else beginCore()
+            if (spo2) prepareSpo2(true) else if (ppg) preparePpg(true) else if (bia) startBia(true) else if (ecg) beginEcg("PRE-1") else beginCore()
         }, { finish(it) })
         writer.post(tick)
     }
@@ -256,16 +312,20 @@ class ActivityRecordingService : Service() {
                     if (action == "CANCEL") finish("USER_INTERRUPTED")
                     return@guarded
                 }
-                if (placementWaiting() && clock() >= deadline) {
-                    finish("PLACEMENT_IDLE_TIMEOUT_80S", true); return@guarded
-                }
                 if ((shortSensor == "SPO2" || shortSensor == "BIA" || shortSensor == "PPG_ON_DEMAND") && phase.startsWith("REVIEW_") && clock() >= deadline) {
                     finish("${shortSensor}_REVIEW_IDLE_TIMEOUT_80S", true); return@guarded
                 }
                 when (action) {
                     "END" -> if (phase == "CORE-1") {
                         event("USER_ENDED_CORE", "Post measurements follow the template, not a new choice")
-                        drainSources(allowPartialPost = ecg || spo2 || bia || ppg) {
+                        // Keep the continuous PPG tracker alive through post ECG. Samsung's
+                        // post-ECG HRM start re-enables the shared 25 Hz stream; stopping PPG
+                        // before ECG makes our later final unset a second, ineffective unset.
+                        // Holding PPG makes it the last 25 Hz client and gives the vendor stop
+                        // request one real chance after ECG has ended.
+                        val holdPpg = ecg && coreSources.contains("PPG")
+                        drainSources(keep = if (holdPpg) setOf("PPG") else emptySet(),
+                            allowPartialPost = ecg || spo2 || bia || ppg) {
                         when(CapturePhasePolicy.coreEnded(ecg)) {
                             CapturePhasePolicy.Next.POST_ECG -> beginEcg("POST-1")
                             else -> beginPostShorts()
@@ -273,13 +333,8 @@ class ActivityRecordingService : Service() {
                         }
                     }
                     "CANCEL" -> finish("USER_INTERRUPTED")
-                      "START_BIA" -> if(phase.startsWith("READY_BIA_")) armBia()
-                      "RETRY_BIA" -> if(phase.startsWith("REVIEW_BIA_")) prepareBia(biaPre)
-                      "SKIP_BIA" -> if(phase.startsWith("REVIEW_BIA_") || phase.startsWith("READY_BIA_")) {
-                          shortFailure=true
-                          if(phase.startsWith("REVIEW_")) biaResults[biaPhase]="未取得有效结果，已跳过"
-                          event("USER_SKIPPED_BIA","pre=$biaPre"); afterBia()
-                      }
+                      "RETRY_BIA" -> if(phase.startsWith("REVIEW_BIA_")) retryBia()
+                      "SKIP_BIA" -> if(shortSensor == "BIA" && phase != "CORE-1") skipBia()
                       "START_SPO2" -> if (phase.startsWith("READY_SPO2_")) beginSpo2(spo2Pre)
                       "START_PPG" -> if (phase.startsWith("READY_PPG_")) beginPpg(ppgPre)
                       "PLACEMENT_READY" -> if (phase == "RESTORE_PRE") {
@@ -304,6 +359,9 @@ class ActivityRecordingService : Service() {
                         beginEcg(if (phase == "REVIEW_PRE") "PRE-${++preAttempt}" else "POST-${++postAttempt}")
                     }
                     "SKIP_ECG" -> if (shortSensor == "ECG" && (phase.startsWith("REVIEW_") || phase.startsWith("PRE") || phase.startsWith("POST"))) skipEcg()
+                    // Diagnostic-only escape hatch for the CORE+post-ECG LED test:
+                    // pre-ECG contact can be skipped even before two failed attempts.
+                    "TEST_SKIP_PRE_ECG" -> if (shortSensor == "ECG" && (phase.startsWith("PRE") || phase == "REVIEW_PRE")) forceSkipPreEcg()
                 }
             } }
     }
@@ -343,11 +401,12 @@ class ActivityRecordingService : Service() {
         notice = ""; contact = false; ecgTotalRows = 0
         lastContactMs = 0; ecgGate = EcgContinuityGate(); ecgUpdate = null
         // Wait for a valid batch. A later invalid batch resets the strict continuous segment.
+        shortBudgetStartMs = clock()
         deadline = EcgWaitBudget.initialDeadline(next == "PRE-1" && !spo2 && !bia,sessionStartedMs,clock())
         event("PHASE_START", next); startSource("ECG"); restartTick()
     }
     private fun beginCore() {
-        shortSensor = ""
+        shortSensor = ""; shortBudgetStartMs = 0L
         phase = "CORE-1"; notice = ""; coreDataObserved = false
         // If the user starts an activity and is then interrupted before any raw row arrives,
         // end the session and exit instead of holding the watch awake indefinitely.
@@ -358,46 +417,80 @@ class ActivityRecordingService : Service() {
         startingSources = false
         if (running.isEmpty()) finish("ALL_CORE_SOURCES_FAILED") else restartTick()
     }
-    private fun placementWaiting() = phase.startsWith("READY_BIA_") || phase.startsWith("READY_SPO2_") || phase.startsWith("READY_PPG_") || phase == "RESTORE_PRE"
+    private fun placementWaiting() = phase.startsWith("READY_SPO2_") || phase.startsWith("READY_PPG_") || phase == "RESTORE_PRE"
     private fun beginPostShorts() {
-        if(bia) prepareBia(false) else if(ppg) preparePpg(false) else if(spo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        if(bia) startBia(false) else if(ppg) preparePpg(false) else if(spo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
-    private fun prepareBia(pre: Boolean) {
-        shortSensor="BIA"; biaPre=pre
-        phase=if(pre) "READY_BIA_PRE" else "READY_BIA_POST"
-        notice="手表向肘部上移并贴紧。中指轻触上键、无名指轻触下键；双手不要相碰，抬起手臂使腋下张开。保持触键直到测量结束。\n确认活动管理中的身高、体重、年龄和性别正确；调整时间不计入测量。80秒不操作则停止。"
-        deadline=clock()+80_000
-        event("BIA_PLACEMENT_PREPARATION","pre=$pre; sensorsNotStarted=true")
-        holdDecisionWindow();restartTick()
+    private fun startBia(pre: Boolean) {
+        biaModeIndex=0
+        startBiaMode(pre)
     }
-    private fun armBia() {
-        phase=if(biaPre) "ARM_BIA_PRE" else "ARM_BIA_POST"
-        deadline=clock()+5_000
-        notice="5秒后自动开始。现在将双指轻放两键，不要按下；双手和手指不要碰表框或另一只手。"
-        event("BIA_CONTACT_COUNTDOWN", "sensorsNotStarted=true; preparationMs=5000")
-        holdDecisionWindow();restartTick()
+    private fun startBiaMode(pre: Boolean) {
+        if(biaModes.isEmpty()) { afterBiaPhase(); return }
+        if(biaModeIndex !in biaModes.indices) biaModeIndex=0
+        bodySource=biaModes[biaModeIndex]
+        biaPre=pre
+        biaContactStartMs=clock()
+        shortBudgetStartMs=biaContactStartMs
+        biaContactDetected=false
+        biaRetrying=false; biaAttempt=0; biaProgress=-1; biaHint=""
+        beginBia()
     }
+    private fun biaModeLabel()=when(bodySource){"MF_BIA"->"多频阻抗";"BIA"->"体成分";else->"体成分"}
     private fun beginBia() {
         shortSensor="BIA"
         phase=if(biaPre) "PRE-${++preBiaAttempt}" else "POST-${++postBiaAttempt}"
-        biaPhase=phase;biaSummary="";biaResults[phase]="测量中，尚无完整有效结果"
+        biaPhase=phase;biaSummary="";biaContactDetected=false
+        biaRetrying=false;biaHint="";biaProgress=-1;biaAttempt++
+        biaResults[phase]="正在等待双指接触，尚无完整有效结果";biaModeByPhase[phase]=bodySource
         deadline=clock()+60_000
-        notice="保持双指轻触两键，双手不要相碰。有效结果收到后立即保存；最多等待60秒。"
-        event("BIA_MEASUREMENT_STARTED","source=$bodySource; pre=$biaPre; deadlineMs=$deadline; profileInPlan=true")
+        notice="准备：${biaModeLabel()}。手表向肘部上移并贴紧。中指轻触上键、无名指轻触下键；双手不要相碰，抬起手臂使腋下张开。\n正在等待双指接触；检测到后自动开始；接触错误会立即自动重试；最多80秒。"
+        event("BIA_CONTACT_WAIT_STARTED","source=$bodySource; pre=$biaPre; mode=$bodySource; deadlineMs=$deadline; profileInPlan=true")
         startSource(bodySource);restartTick()
+    }
+    private fun retryBia() {
+        biaContactStartMs=clock(); shortBudgetStartMs=clock(); biaContactDetected=false
+        biaRetrying=false; biaHint=""; biaProgress=-1; biaAttempt=0
+        beginBia()
+    }
+    private fun isBiaRetryable(reason: String)=reason in setOf(
+        "SDK_STATUS_4","SDK_STATUS_7","SDK_STATUS_8","SDK_STATUS_9","SDK_STATUS_10",
+        "SDK_STATUS_11","SDK_STATUS_13","SDK_STATUS_14","SDK_STATUS_15","SDK_STATUS_17","SDK_STATUS_19")
+    private fun biaRetryHint(reason: String)=when(reason) {
+        "SDK_STATUS_4","SDK_STATUS_10" -> "请检查手表背面贴紧皮肤"
+        "SDK_STATUS_7","SDK_STATUS_8","SDK_STATUS_9" -> "中指、无名指分别轻触上下键"
+        "SDK_STATUS_11" -> "手指过干，请稍微改善接触"
+        "SDK_STATUS_13" -> "接触不稳定，请保持手臂不动"
+        "SDK_STATUS_14","SDK_STATUS_15" -> "双手不要相碰，手指不要碰表框"
+        "SDK_STATUS_17" -> "请保持双臂自然张开"
+        "SDK_STATUS_19" -> "信号质量低，请贴紧手表、抬高手臂"
+        else -> "请调整姿势和接触"
     }
     private fun endBia(success:Boolean, reason:String) {
         if(draining!=null || stopping)return
+        if(!success) biaContactDetected=false
         drainSources {
             biaResults[biaPhase]=if(success) "成功：$biaSummary" else "未成功，未取得完整有效结果"
-            event("BIA_MEASUREMENT_SAVED","success=$success; reason=$reason; pre=$biaPre")
-            if(success) afterBia() else {
+            event("BIA_MEASUREMENT_SAVED","success=$success; reason=$reason; pre=$biaPre; mode=$bodySource; attempt=$biaAttempt; progress=$biaProgress")
+            if(success) { biaRetrying=false; biaHint=""; afterBia() } else if(isBiaRetryable(reason) && clock() < biaContactStartMs + SHORT_BUDGET_MS) {
+                biaContactDetected=false
+                biaRetrying=true
+                biaHint=biaRetryHint(reason)
+                phase=if(biaPre) "WAIT_BIA_PRE" else "WAIT_BIA_POST"
+                deadline=minOf(biaContactStartMs + SHORT_BUDGET_MS, clock() + BIA_CONTACT_RETRY_MS)
+                val reached=if(biaProgress>0) "已到 $biaProgress%" else "未检测到稳定接触"
+                val extra=if(!biaPre && bodySource=="MF_BIA" && biaAttempt>=2 && biaProgress>=80)
+                    "\n活动后 MF-BIA 多次在最后一步信号不足；可继续保持接触重试，或点“跳过体成分，继续”。" else ""
+                notice="测量中断：$reached（$biaHint）。请保持双指接触，${BIA_CONTACT_RETRY_MS/1000}秒后自动重试（第 ${biaAttempt+1} 次，最多80秒）。$extra"
+                event("BIA_CONTACT_RETRY_WAIT","reason=$reason; attempt=$biaPhase; nextAttempt=${biaAttempt+1}; progress=$biaProgress; mode=$bodySource")
+                holdDecisionWindow();restartTick()
+            } else if(isBiaRetryable(reason)) {
+                biaRetrying=false
+                finish("SHORT_MEASUREMENT_TIMEOUT_80S", true)
+            } else {
+                biaRetrying=false
                 phase=if(biaPre) "REVIEW_BIA_PRE" else "REVIEW_BIA_POST"
                 val guide=when(reason) {
-                    "SDK_STATUS_4", "SDK_STATUS_10" -> "检查手表背面贴紧皮肤"
-                    "SDK_STATUS_7", "SDK_STATUS_8", "SDK_STATUS_9" -> "中指和无名指分别轻触两键"
-                    "SDK_STATUS_11" -> "手指过干，请改善接触后重试"
-                    "SDK_STATUS_14", "SDK_STATUS_15" -> "双手不要相碰，手指不要接触表框"
                     "SDK_STATUS_18" -> "请在活动管理中检查个人资料"
                     else -> "请检查姿势和接触，也可跳过继续活动"
                 }
@@ -406,7 +499,27 @@ class ActivityRecordingService : Service() {
             }
         }
     }
+    private fun skipBia() {
+        if(draining!=null || stopping) return
+        shortFailure=true; biaContactDetected=false; biaRetrying=false
+        event("USER_SKIPPED_BIA","pre=$biaPre; mode=$bodySource; phase=$phase")
+        drainSources {
+            biaResults[biaPhase]="未取得有效结果，已跳过"
+            if(biaModeIndex + 1 < biaModes.size) {
+                biaModeIndex++
+                startBiaMode(biaPre)
+            } else afterBiaPhase()
+        }
+    }
     private fun afterBia() {
+        if(biaModeIndex + 1 < biaModes.size) {
+            biaModeIndex++
+            startBiaMode(biaPre)
+            return
+        }
+        afterBiaPhase()
+    }
+    private fun afterBiaPhase() {
         if(biaPre) restorePlacement()
         else if(ppg) preparePpg(false)
         else if(spo2) prepareSpo2(false)
@@ -415,9 +528,10 @@ class ActivityRecordingService : Service() {
     private fun prepareSpo2(pre: Boolean) {
         shortSensor = "SPO2"; spo2Pre = pre
         phase = if(pre) "READY_SPO2_PRE" else "READY_SPO2_POST"
-        notice = "请将手表向肘部上移并贴合皮肤，手肘放在桌上，手腕靠近心脏，保持静止。\n调整好后点开始；准备时间不计入测量。80秒不操作则停止。"
-        deadline = clock() + 80_000
-        event("SPO2_PLACEMENT_PREPARATION", "pre=$pre; sensorsNotStarted=true")
+        shortBudgetStartMs = clock()
+        notice = "请将手表向肘部上移并贴合皮肤，手肘放在桌上，手腕靠近心脏，保持静止。\n${NO_HAND_AUTOSTART_MS / 1000}秒后自动开始；也可提前点开始。80秒内没有有效结果会保存并退出。"
+        deadline = clock() + NO_HAND_AUTOSTART_MS
+        event("SPO2_PLACEMENT_PREPARATION", "pre=$pre; autostartMs=$NO_HAND_AUTOSTART_MS; sensorsNotStarted=true")
         holdDecisionWindow(); restartTick()
     }
     private fun beginSpo2(pre: Boolean) {
@@ -450,15 +564,16 @@ class ActivityRecordingService : Service() {
         }
     }
     private fun afterSpo2() {
-        if(spo2Pre) { if(ppg) preparePpg(true) else if(bia) prepareBia(true) else restorePlacement() }
+        if(spo2Pre) { if(ppg) preparePpg(true) else if(bia) startBia(true) else restorePlacement() }
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun preparePpg(pre: Boolean) {
         shortSensor = "PPG_ON_DEMAND"; ppgPre = pre
         phase = if(pre) "READY_PPG_PRE" else "READY_PPG_POST"
-        notice = "请正常佩戴手表并保持贴合，手臂静止。\n点开始后采集30秒原始 PPG（绿/红外/红，100Hz）；准备时间不计入测量。80秒不操作则停止。"
-        deadline = clock() + 80_000
-        event("PPG_PLACEMENT_PREPARATION", "pre=$pre; sensorsNotStarted=true")
+        shortBudgetStartMs = clock()
+        notice = "请正常佩戴手表并保持贴合，手臂静止。\n${NO_HAND_AUTOSTART_MS / 1000}秒后自动开始；也可提前点开始。80秒内没有有效结果会保存并退出。"
+        deadline = clock() + NO_HAND_AUTOSTART_MS
+        event("PPG_PLACEMENT_PREPARATION", "pre=$pre; autostartMs=$NO_HAND_AUTOSTART_MS; sensorsNotStarted=true")
         holdDecisionWindow(); restartTick()
     }
     private fun beginPpg(pre: Boolean) {
@@ -485,15 +600,15 @@ class ActivityRecordingService : Service() {
         }
     }
     private fun afterPpg() {
-        if(ppgPre) { if(bia) prepareBia(true) else restorePlacement() }
+        if(ppgPre) { if(bia) startBia(true) else restorePlacement() }
         else if(spo2) prepareSpo2(false)
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun restorePlacement() {
-            phase = "RESTORE_PRE"; shortSensor = ""
-            notice = "请将手表调回平时运动位置，保持贴合。\n确认后${if(ecg) "测量 ECG，再开始活动" else "开始活动采集"}；调整期间不采集。80秒不操作则停止。"
-            deadline = clock() + 80_000
-            event("NORMAL_PLACEMENT_REQUESTED", "sensorsNotStarted=true")
+            phase = "RESTORE_PRE"; shortSensor = ""; shortBudgetStartMs = 0L
+            notice = "请将手表调回平时运动位置，保持贴合。\n${NO_HAND_AUTOSTART_MS / 1000}秒后自动继续；也可点“已恢复佩戴”。"
+            deadline = clock() + NO_HAND_AUTOSTART_MS
+            event("NORMAL_PLACEMENT_REQUESTED", "autostartMs=$NO_HAND_AUTOSTART_MS; sensorsNotStarted=true")
             holdDecisionWindow(); restartTick()
     }
     /** Any non-empty raw row from a core source disarms the no-data watchdog. Not a clinical validity judgment. */
@@ -519,6 +634,10 @@ class ActivityRecordingService : Service() {
             if (phase != origin || !captureRuns.current(run)) {
                 // Preserve late delivered samples under their originating phase, never relabel them.
                 appendRows(origin, sensor, rows)
+                // A held core PPG keeps delivering after CORE-1 ends; that is still live
+                // data, not silence. Stops that already removed the source from running
+                // do not get this refresh.
+                if (rows.isNotEmpty() && running.contains(sensor)) lastData[sensor] = clock()
                 event("LATE_CALLBACK_SAVED", "$origin/$sensor:${rows.size}")
             } else {
                 if (rows.isNotEmpty()) {
@@ -529,16 +648,28 @@ class ActivityRecordingService : Service() {
                 buffers.getOrPut(sensor) { mutableListOf() }.addAll(rows)
                 if (sensor == bodySource && rows.isNotEmpty() && draining == null) {
                     if(clock() >= deadline) { endBia(false,"MEASUREMENT_TIMEOUT_60S"); return@start }
+                    val progress=(rows.lastOrNull()?.get("PROGRESS") as? Number)?.toDouble()
+                    val percent=progress?.let { if(bodySource=="BIA") it*100 else it }
                     val result = rows.firstOrNull { if(bodySource=="MF_BIA") com.rawwave.core.BiaResult.multiFrequencyComplete(it) else com.rawwave.core.BiaResult.complete(it) }
                     val failure = rows.firstOrNull { ((it["STATUS"] as? Number)?.toInt() ?: 0).let { status -> status > 0 && !(bodySource=="MF_BIA" && status==23) } }
+                    if(percent!=null && percent.isFinite() && percent in 0.0..100.0 && (failure==null || percent>0.0))
+                        biaProgress=percent.toInt().coerceIn(0,100)
                     if(result != null) {
                         biaSummary=if(bodySource=="MF_BIA") "四频阻抗及相位已取得" else "体脂率 ${result["BODY_FAT_RATIO"]}%，骨骼肌 ${result["SKELETAL_MUSCLE_MASS"]} kg"
                         biaResults[biaPhase]="已取得结果，正在保存"
                         endBia(true,"SDK_STATUS_0_VALID_RESULT")
                     } else if(failure != null) endBia(false,"SDK_STATUS_${failure["STATUS"]}")
                     else {
-                        val progress=(rows.lastOrNull()?.get("PROGRESS") as? Number)?.toDouble()
-                        val percent=progress?.let { if(bodySource=="BIA") it*100 else it }
+                        if(!biaContactDetected) {
+                            val contactStatus=rows.mapNotNull { (it["STATUS"] as? Number)?.toInt() }
+                                .firstOrNull { it==0 || (bodySource=="MF_BIA" && it==23) }
+                            if(contactStatus!=null) {
+                                biaContactDetected=true
+                                biaRetrying=false; biaHint=""
+                                notice="已检测到接触，测量中；保持双指轻触两键，双手不要相碰。"
+                                event("BIA_CONTACT_DETECTED","mode=$bodySource; status=$contactStatus")
+                            }
+                        }
                         biaResults[biaPhase]=if(percent!=null && percent.isFinite() && percent in 0.0..100.0)
                             "测量中：${percent.toInt()}%，请保持接触" else "等待完整有效结果，请保持接触"
                         publish()
@@ -640,7 +771,8 @@ class ActivityRecordingService : Service() {
     }
     private fun endEcg() {
         if (draining != null || stopping) return
-        drainSources { completeEcg() }
+        // A held core PPG must survive the ECG drain; it is stopped only after post ECG.
+        drainSources(keep = setOf("PPG")) { completeEcg() }
     }
     private fun completeEcg() {
         deadline = 0
@@ -664,7 +796,7 @@ class ActivityRecordingService : Service() {
         } else {
             if (update != null && ecgTotalRows > update.continuousSamples())
                 event("ECG_RAW_INCLUDES_INVALID_SEGMENTS", "rawRows=$ecgTotalRows; acceptedContinuousSamples=${update.continuousSamples()}; all rows retained")
-            if (!wasPre) beginPostShorts()
+            if (!wasPre) continueAfterPostEcg { beginPostShorts() }
             else if (next == CapturePhasePolicy.Next.CORE) beginCore() else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
         }
     }
@@ -679,8 +811,24 @@ class ActivityRecordingService : Service() {
             return
         }
         if (phase.startsWith("PRE") || phase.startsWith("POST")) {
-            drainSources { completeSkip(wasPre, policy.failures()) }
+            // Keep a held core PPG alive until the post-ECG skip path releases it last.
+            drainSources(keep = setOf("PPG")) { completeSkip(wasPre, policy.failures()) }
         } else completeSkip(wasPre, policy.failures())
+    }
+    /** Test-only: skip a failing pre ECG and proceed to CORE while keeping post ECG enabled. */
+    private fun forceSkipPreEcg() {
+        if (!(phase.startsWith("PRE") || phase == "REVIEW_PRE")) return
+        event("TEST_FORCED_SKIP_PRE_ECG", "phase=$phase; rawRows=$ecgTotalRows")
+        if (phase.startsWith("PRE")) {
+            drainSources { completeForcedSkipPreEcg() }
+        } else completeForcedSkipPreEcg()
+    }
+    private fun completeForcedSkipPreEcg() {
+        deadline = 0
+        event("ECG_ATTEMPT_END", "userSkipped=true; rawRows=$ecgTotalRows; failures=${preRetryPolicy.failures()}; TEST_FORCED_SKIP_PRE_ECG")
+        event("USER_SKIPPED_FAILED_ECG", "$ecgPhase; failures=${preRetryPolicy.failures()}; TEST_FORCED_SKIP_PRE_ECG")
+        shortFailure = true
+        beginCore()
     }
     private fun completeSkip(wasPre: Boolean, failures: Int) {
         if (phase.startsWith("PRE") || phase.startsWith("POST")) {
@@ -689,7 +837,11 @@ class ActivityRecordingService : Service() {
         }
         event("USER_SKIPPED_FAILED_ECG", "$ecgPhase; failures=$failures")
         shortFailure = true
-        if (wasPre) beginCore() else beginPostShorts()
+        if (wasPre) beginCore() else continueAfterPostEcg { beginPostShorts() }
+    }
+    /** Release a core PPG held through post ECG before starting the remaining post shorts. */
+    private fun continueAfterPostEcg(next: () -> Unit) {
+        if (running.contains("PPG")) drainSources { next() } else next()
     }
     private fun restartTick() {
         renewCaptureLock()
@@ -708,23 +860,29 @@ class ActivityRecordingService : Service() {
             if (!it.isHeld || now - lockRenewed >= 30_000) { it.acquire(60_000); lockRenewed = now }
         }
     }
-    private fun stopSources() {
+    private fun stopSources(sources: List<String>) {
         val origin = phase
         var failure: Exception? = null
-        running.toList().forEach { sensor ->
+        // Keep the continuous PPG as the last 25 Hz client when both it and ECG are
+        // being torn down together (for example a user cancel during post ECG).
+        sources.sortedBy { if (it == "PPG") 1 else 0 }.forEach { sensor ->
+            if (!running.remove(sensor)) return@forEach
             captureRuns.endSensor(sensor)
             try { adapter?.stop(sensor) } catch (e: Exception) { failure = e }
             // A diagnostic write failure must not skip stopping the remaining sensors.
             try { event("SENSOR_STOP_REQUEST", sensor); emitQuality(origin, sensor) }
             catch (e: Exception) { failure = e }
         }
-        running.clear()
         failure?.let { throw it }
     }
-    /** Keep the originating phase and data delivery alive until every source hands off. */
-    private fun drainSources(allowPartialPost: Boolean = false, next: () -> Unit) {
+    /**
+     * Keep the originating phase and data delivery alive until every drained source hands off.
+     * [keep] is used only for the post-ECG LED case: the core PPG stays live while the ECG
+     * drains, so its final unset is a real first unset after the vendor HRM re-open.
+     */
+    private fun drainSources(keep: Set<String> = emptySet(), allowPartialPost: Boolean = false, next: () -> Unit) {
         if (draining != null || stopping) return
-        val sources = running.toList()
+        val sources = running.toList().filterNot { it in keep }
         val drain = CaptureDrain(sources)
         draining = drain
         writer.removeCallbacks(tick)
@@ -733,14 +891,14 @@ class ActivityRecordingService : Service() {
             if (draining === drain) guarded {
                 drain.timeout()
                 // Emergency cleanup is not evidence of a complete tail.
-                try { stopSources() }
-                finally { writer.post { guarded { completeDrain(drain, next, allowPartialPost) } } }
+                try { stopSources(sources) }
+                finally { writer.post { guarded { completeDrain(drain, sources, next, allowPartialPost) } } }
             }
         }
         // Separate bounded cleanup budget, not a restarted 80-second user wait.
         writer.postDelayed(timeout, 5_000)
         renewCaptureLock()
-        event("DRAIN_REQUESTED", "phase=$phase; sources=$sources; cleanupBudgetMs=5000")
+        event("DRAIN_REQUESTED", "phase=$phase; sources=$sources; keep=$keep; cleanupBudgetMs=5000")
         publish()
         for (sensor in sources) {
             try {
@@ -751,7 +909,7 @@ class ActivityRecordingService : Service() {
                         captureRuns.endSensor(sensor); running.remove(sensor)
                         event("SOURCE_DRAIN_COMPLETED", "$sensor; status=$status; detail=$detail")
                         emitQuality(phase, sensor)
-                        completeDrain(drain, next, allowPartialPost)
+                        completeDrain(drain, sources, next, allowPartialPost)
                     }
                 }
             } catch (e: Exception) {
@@ -759,13 +917,13 @@ class ActivityRecordingService : Service() {
             }
         }
         // Also covers no active sources and inline completion/throw from a replacement.
-        writer.post { guarded { completeDrain(drain, next, allowPartialPost) } }
+        writer.post { guarded { completeDrain(drain, sources, next, allowPartialPost) } }
     }
-    private fun completeDrain(drain: CaptureDrain, next: () -> Unit, allowPartialPost: Boolean) {
+    private fun completeDrain(drain: CaptureDrain, sources: List<String>, next: () -> Unit, allowPartialPost: Boolean) {
         if (draining !== drain) return
         drain.persist({
             // Data callbacks preceding each completion have already run on this writer.
-            stopSources()
+            stopSources(sources)
             persistence?.barrier()
             flush()
             persistence?.barrier()
@@ -790,6 +948,19 @@ class ActivityRecordingService : Service() {
         }
         })
     }
+    private fun emitPlatformSensorInventory() {
+        try {
+            val manager = getSystemService(android.hardware.SensorManager::class.java)
+            if (manager == null) { event("PLATFORM_SENSOR_INVENTORY_FAILED", "SensorManager unavailable"); return }
+            val sensors = manager.getSensorList(android.hardware.Sensor.TYPE_ALL)
+            val detail = sensors.joinToString("|") { s ->
+                "${s.type}:${s.stringType}:${s.name}:${s.vendor}:v${s.version}:minDelayUs=${s.minDelay}:wakeUp=${s.isWakeUpSensor}"
+            }
+            event("PLATFORM_SENSOR_INVENTORY", "count=${sensors.size}; fields=type:stringType:name:vendor:version:minDelayUs:wakeUp; data=$detail")
+        } catch (e: Exception) {
+            event("PLATFORM_SENSOR_INVENTORY_FAILED", "${e.javaClass.simpleName}:${e.message}")
+        }
+    }
     private fun emitQuality(origin: String, sensor: String) {
         qualityTrackers.remove("$origin/$sensor")?.let {
             event("STREAM_QUALITY", "$origin/$sensor:${it.summary()}; computed metadata only; raw rows unchanged")
@@ -799,8 +970,8 @@ class ActivityRecordingService : Service() {
         buffers.forEach { (sensor, rows) -> if (rows.isNotEmpty()) { appendRows(streamPhase(), sensor, rows); rows.clear() } }
     }
     private fun streamPhase() = when (phase) {
-        "ARM_BIA_PRE", "CONNECTING", "READY_BIA_PRE", "READY_SPO2_PRE", "READY_PPG_PRE", "RESTORE_PRE" -> "PRE-1"
-        "ARM_BIA_POST", "READY_BIA_POST", "READY_SPO2_POST", "READY_PPG_POST" -> "POST-1"
+        "CONNECTING", "WAIT_BIA_PRE", "READY_SPO2_PRE", "READY_PPG_PRE", "RESTORE_PRE" -> "PRE-1"
+        "WAIT_BIA_POST", "READY_SPO2_POST", "READY_PPG_POST" -> "POST-1"
         "REVIEW_PRE", "REVIEW_POST" -> ecgPhase
         "REVIEW_BIA_PRE", "REVIEW_BIA_POST" -> biaPhase
         "REVIEW_SPO2_PRE", "REVIEW_SPO2_POST" -> spo2Phase
@@ -819,7 +990,7 @@ class ActivityRecordingService : Service() {
         val count = countText()
         val title = when {
             phase == "RESTORE_PRE" -> "恢复运动佩戴位置"
-            shortSensor == "BIA" -> if(biaPre) "活动前 $bodySource" else "活动后 $bodySource"
+            shortSensor == "BIA" -> if(biaPre) "活动前 ${biaModeLabel()}" else "活动后 ${biaModeLabel()}"
             shortSensor == "SPO2" -> if(spo2Pre) "活动前血氧 SpO₂" else "活动后血氧 SpO₂"
             shortSensor == "PPG_ON_DEMAND" -> if(ppgPre) "活动前 PPG 100Hz" else "活动后 PPG 100Hz"
             phase == "CONNECTING" -> "正在连接三星传感器"
@@ -844,10 +1015,13 @@ class ActivityRecordingService : Service() {
             else ""
         val next = State(true, if (draining != null) "DRAINING" else phase,
             if (draining != null) "正在收尾并保存各传感器数据，请稍候（最多5秒收尾等待）\n$count"
-            else "$title\n$notice$idleHint$postLedHint" + (if(shortSensor == "BIA" || shortSensor == "SPO2" || shortSensor == "PPG_ON_DEMAND" || placementWaiting()) "\n${if(placementWaiting() || phase.startsWith("REVIEW_")) "等待操作" else if(phase.startsWith("ARM_BIA_")) "距离开始" else "最多等待"} $remaining 秒" else "") +
+            else "$title\n$notice$idleHint$postLedHint" + (if(shortSensor == "BIA" || shortSensor == "SPO2" || shortSensor == "PPG_ON_DEMAND" || placementWaiting()) "\n${when { shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") && biaRetrying -> "测量中断，正在重试"; shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") -> "等待双指接触"; shortSensor == "BIA" && !phase.startsWith("REVIEW_") -> "测量中，请保持接触"; placementWaiting() || phase.startsWith("REVIEW_") -> "等待操作 $remaining 秒"; else -> "最多等待 $remaining 秒" }}" else "") +
                 (if (incompleteTail.isEmpty()) "" else "\n部分活动传感器尾部未确认，已收数据已保存；继续活动后短测。") + "\n采集记录：\n$count", remaining,
             contact && clock() - lastContactMs < 2000,
-            policy.skipAllowed(), policy.failures(), shortSensor)
+            policy.skipAllowed(), policy.failures(), shortSensor,
+            if(shortSensor == "BIA") biaModeLabel() else "", biaModeIndex + 1 < biaModes.size, biaContactDetected,
+            biaRetrying && shortSensor == "BIA" && phase.startsWith("WAIT_BIA_"), biaAttempt, biaProgress,
+            if(shortSensor == "BIA") biaHint else "")
         state = next; main.post { observer?.invoke(next) }
     }
     private fun countText(): String {
@@ -862,7 +1036,8 @@ class ActivityRecordingService : Service() {
             "$label 血氧第${number}次：$result"
         }
         val body = biaResults.map { (attempt,result) ->
-            "${if(attempt.startsWith("PRE")) "活动前" else "活动后"} 体成分第${attempt.substringAfter('-').toInt()-199}次：$result"
+            val mode=if(biaModeByPhase[attempt]=="MF_BIA") "多频阻抗" else "体成分"
+            "${if(attempt.startsWith("PRE")) "活动前" else "活动后"} ${mode}第${attempt.substringAfter('-').toInt()-199}次：$result"
         }
         val ppgLines = ppgResults.map { (attempt,result) ->
             "${if(attempt.startsWith("PRE")) "活动前" else "活动后"} PPG 100Hz第${attempt.substringAfter('-').toInt()-299}次：$result"
@@ -873,11 +1048,22 @@ class ActivityRecordingService : Service() {
         "ECG" -> "ECG"
         "SPO2" -> "血氧"
         "BIA" -> "体成分"
+        "MF_BIA" -> "多频阻抗"
         "MAGNETIC_FIELD" -> "三轴磁场"
+        "MAGNETIC_FIELD_UNCALIBRATED" -> "未校准磁场"
+        "LIGHT" -> "环境光"
+        "GPS" -> "GPS 轨迹"
+        "STEP_COUNT" -> "步数（平台累计）"
+        "STEP_DETECTOR" -> "每步事件"
+        "OFFBODY" -> "佩戴状态"
         "PRESSURE" -> "气压"
         "GYROSCOPE" -> "陀螺仪"
+        "GYROSCOPE_UNCALIBRATED" -> "未校准陀螺仪"
         "HEART_RATE" -> "心率"
         "ACCELEROMETER" -> "加速度"
+        "ACCELEROMETER_UNCALIBRATED" -> "未校准加速度"
+        "LINEAR_ACCELERATION" -> "线性加速度"
+        "GAME_ROTATION_VECTOR" -> "姿态四元数"
         "PPG" -> "PPG"
         "PPG_ON_DEMAND" -> "PPG 100Hz"
         "SKIN_TEMPERATURE" -> "皮肤温度"
@@ -901,7 +1087,20 @@ class ActivityRecordingService : Service() {
     }
     private fun finishNow(reason: String, idleExit: Boolean = false) {
         if (stopping) return
-        stopping = true; writer.removeCallbacks(tick)
+        stopping = true; shortBudgetStartMs = 0L; writer.removeCallbacks(tick)
+        if (reason.startsWith("SHORT_") || reason.contains("CONTACT_TIMEOUT") || reason.contains("PLACEMENT_IDLE_TIMEOUT_80S")) {
+            val stage = when(shortSensor) {
+                "BIA" -> "体成分"
+                "SPO2" -> "血氧"
+                "PPG_ON_DEMAND" -> "PPG 100Hz"
+                "ECG" -> "ECG"
+                else -> "前置/后置短测"
+            }
+            try {
+                getSharedPreferences("capture-notice",MODE_PRIVATE).edit()
+                    .putString("last","上次活动在${stage}阶段未检测到有效数据，已保存并退出。").commit()
+            } catch (_: Exception) {}
+        }
         biaResults.replaceAll { _,result ->
             if(result.contains("正在保存")) "已取得结果，保存是否完成请查看记录"
             else if(result.contains("测量中")) "已停止，未取得完整有效结果" else result
@@ -916,7 +1115,7 @@ class ActivityRecordingService : Service() {
         }
         var result = reason + (if (incompleteTail.isEmpty()) "" else ";CORE_TAIL_UNCONFIRMED:$incompleteTail") +
             if(shortFailure) ";SHORT_MEASUREMENT_SKIPPED" else ""
-        try { stopSources() } catch (e: Exception) { result += ";STOP_FAILURE:${e.message}" }
+        try { stopSources(running.toList()) } catch (e: Exception) { result += ";STOP_FAILURE:${e.message}" }
         try { adapter?.close() } catch (e: Exception) { result += ";CLEANUP_FAILURE:${e.message}" }
         var sealed = false
         try {

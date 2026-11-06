@@ -60,6 +60,17 @@ public class BiaPressureTest {
         assertTrue(store.templates().get(0).mfBia());
         assertEquals(List.of("MAGNETIC_FIELD"),store.templates().get(0).coreSources());
     }
+    @Test public void bothBiaModesArePersistedAndDeclaredInPlan() throws Exception {
+        var root=temp.newFolder();var store=new ActivityStore(root,d->{});
+        var profile=new BiaProfile(170,63,31,1);
+        var t=store.createTemplate("both",false,List.of("MAGNETIC_FIELD"),false,profile,false,false,true);
+        assertTrue(t.biaBoth());
+        var run=store.start(t,1000,1);
+        var plan=Files.readString(new File(run.folder,"plan.json").toPath());
+        assertTrue(plan.contains("\"BIA\""));
+        assertTrue(plan.contains("\"MF_BIA\""));
+        assertTrue(store.templates().get(0).biaBoth());
+    }
     @Test public void pressureNeedsFlushButBiaAcceptsDeliveredRows() {
         var drain=new CaptureDrain(List.of("BIA","PRESSURE"));
         drain.complete("BIA",SensorPort.DrainStatus.DELIVERED_ONLY,"on demand");

@@ -53,7 +53,9 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         json(payload, "summary-collection.json", Map.of("status", summaryStatus, "retention", "LATEST_ONLY", "notFullWatchReport", true));
         payload.put("summary.md", ("# 原波 G2a 问题报告\n\n设备角色：" + role + "\n构建：" + build.get("buildRun") + "\n" +
             "活动数据与问题报告独立打包和传输；本报告不含活动原始数据，不能单独证明活动完整性。\n上次状态：" + journal.previousState() +
-            "\n应用日志不能证明退出后无耗电；系统观察未收集。\n查找 FAULT 事件及 first-fault/last-fault；TEST_FIXTURE 为人工测试，不是真实健康数据。\n").getBytes(StandardCharsets.UTF_8));
+            "\n应用日志不能证明退出后无耗电；系统观察未收集。\n查找 FAULT 事件及 first-fault/last-fault；TEST_FIXTURE 为人工测试，不是真实健康数据。\n" +
+            "诊断清单：diagnostic-manifest.json；应用层后置条件：postconditions.json；用户问题现场：diagnostic-observations.jsonl。\n" +
+            "PASS/UNKNOWN 都只代表应用层证据；L3-L7 需要用户另抓系统 dump，并由 PC 分析器读取。\n").getBytes(StandardCharsets.UTF_8));
         json(payload, "build.json", build);
         json(payload, "module-contracts.json", ModuleVersions.contracts());
         List<File> received = zipFiles(receivedFolder, false);
@@ -75,13 +77,33 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
                 included.add(file.getName());
             } catch (Exception failure) { rejected.add(file.getName() + ": " + failure.getClass().getSimpleName() + ": " + failure.getMessage()); }
         }
-        json(payload, "collection-status.json", Map.of("localLogs", "AVAILABLE", "otherDevice", included.isEmpty() ?
-            "NOT_COLLECTED_OR_NOT_VERIFIED" : "CACHED_RECEIVED_LAST_3_NOT_CURRENT_WINDOW_PROOF", "receivedCount", received.size(),
-            "included", included, "rejected", rejected, "omittedOlderCount", Math.max(0, received.size()-3),
-            "systemPowerEvidence", "NOT_COLLECTED", "healthData", "NOT_INCLUDED_IN_THIS_REPORT_EXPORT_SEPARATELY"));
-        json(payload, "assessment.json", Map.of("facts", List.of("此报告仅含诊断，不含手表活动原始数据；CAPTURE事件记录采集阶段与失败", "同步有一次性限时服务和有超时的CPU锁；活动采集由独立health服务持锁，无Job/Alarm/自动重试"),
-            "unknown", List.of("实际退出后的PID与系统资源", "整机耗电根因"),
-            "nextCheck", "核对双端transferId、接收字节、COMMITTED、回执和退出；旧手表附件不代表本轮成功"));
+        Map<String, Object> collection = new LinkedHashMap<>();
+        collection.put("localLogs", "AVAILABLE");
+        collection.put("otherDevice", included.isEmpty() ? "NOT_COLLECTED_OR_NOT_VERIFIED" : "CACHED_RECEIVED_LAST_3_NOT_CURRENT_WINDOW_PROOF");
+        collection.put("receivedCount", received.size());
+        collection.put("included", included);
+        collection.put("rejected", rejected);
+        collection.put("omittedOlderCount", Math.max(0, received.size() - 3));
+        collection.put("systemPowerEvidence", "NOT_COLLECTED");
+        collection.put("healthData", "NOT_INCLUDED_IN_THIS_REPORT_EXPORT_SEPARATELY");
+        collection.put("systemDump", "NOT_COLLECTED");
+        collection.put("appLevelPostconditions", "INCLUDED_APP_JOURNAL_ONLY");
+        collection.put("sensorCapability", "SEE_EVENTS_OR_NOT_COLLECTED");
+        json(payload, "collection-status.json", collection);
+        try {
+            payload.put("postconditions.json", DiagnosticPostconditions.create(payload, role));
+            payload.put("diagnostic-manifest.json", DiagnosticManifest.create(payload, role, build, included.size(), received.size(), included));
+        } catch (Exception failure) {
+            payload.put("postconditions.json", ("{\"schemaVersion\":1,\"kind\":\"APP_LEVEL_POSTCONDITIONS\",\"error\":\""
+                + failure.getClass().getSimpleName() + "\",\"status\":\"UNKNOWN\"}").getBytes(StandardCharsets.UTF_8));
+            payload.put("diagnostic-manifest.json", ("{\"schemaVersion\":1,\"kind\":\"RAWWAVE_DIAGNOSTIC_MANIFEST\",\"error\":\""
+                + failure.getClass().getSimpleName() + "\",\"status\":\"UNKNOWN\"}").getBytes(StandardCharsets.UTF_8));
+        }
+        json(payload, "assessment.json", Map.of("facts", List.of("此报告仅含诊断，不含手表活动原始数据；CAPTURE事件记录采集阶段与失败",
+                "同步有一次性限时服务和有超时的CPU锁；活动采集由独立health服务持锁，无Job/Alarm/自动重试",
+                "postconditions.json 只列应用层观察；PASS 不等于硬件停止"),
+            "unknown", List.of("实际退出后的PID与系统资源", "整机耗电根因", "vendor 服务与 sensor hub 的停止状态"),
+            "nextCheck", "核对双端transferId、接收字节、COMMITTED、回执和退出；需要 L3-L7 结论时另抓系统 dump 并运行 Analyze-Diagnostics.ps1"));
         json(payload, "file-audit.json", Map.of("healthSessions", "NOT_VERIFIED_BY_THIS_REPORT", "reportValidation", "ZIP_REOPEN_AND_TARGET_SHA256"));
         payload.put("resources.jsonl", (new Gson().toJson(Map.of("owner", operation, "resource", "diagnostic_export_worker",
             "state", "ACTIVE_AT_SNAPSHOT", "systemVerification", "NOT_COLLECTED")) + "\n").getBytes(StandardCharsets.UTF_8));

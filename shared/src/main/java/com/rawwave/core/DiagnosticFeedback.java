@@ -68,9 +68,32 @@ public final class DiagnosticFeedback {
     }
     /** Five-photo default: the viewer prepends its version page to these four evidence pages. */
     public static List<String> quickPages(Map<String, byte[]> snapshot, String role) {
-        List<String> latestWindow = new ArrayList<>(), latestCapture = new ArrayList<>(), latestDiagnostic = new ArrayList<>();
+        List<String> latestWindow = new ArrayList<>(), latestCapture = new ArrayList<>(), latestDiagnostic = new ArrayList<>(), latestObservation = new ArrayList<>();
         String latestWindowKey = "", latestActivityResult = "未观察到", latestCaptureSession = "未观察到";
         int corrupt = 0, silence = 0, resumed = 0;
+        for (String name : List.of("diagnostic-observations.previous.jsonl", "diagnostic-observations.jsonl")) {
+            byte[] bytes = snapshot.get(role + "/" + name);
+            if (bytes == null) continue;
+            for (String line : new String(bytes, StandardCharsets.UTF_8).split("\n")) {
+                if (line.isBlank()) continue;
+                JsonObject e;
+                try {
+                    JsonElement parsed = STRICT.fromJson(line, JsonElement.class);
+                    if (parsed == null || !parsed.isJsonObject()) { corrupt++; continue; }
+                    e = parsed.getAsJsonObject();
+                } catch (RuntimeException bad) { corrupt++; continue; }
+                JsonElement raw = e.get("details");
+                JsonObject d = raw != null && raw.isJsonObject() ? raw.getAsJsonObject() : new JsonObject();
+                String compact = "问题现场\nUTC " + value(e.get("utc")) +
+                    "\nID " + shortValue(d,"diagnosticCaptureId",48) +
+                    "\n症状 " + shortValue(d,"symptoms",180) +
+                    "\nLED " + shortValue(d,"led",32) + " / 手表退出 " + shortValue(d,"watchExit",32) +
+                    "\n重启 " + shortValue(d,"rebootState",48) +
+                    "\n活动同步 " + shortValue(d,"activitySyncRunning",16);
+                latestObservation.add(compact);
+                if (latestObservation.size() > 3) latestObservation.remove(0);
+            }
+        }
         for (String name : List.of("events.previous.jsonl", "events.jsonl")) {
             byte[] bytes = snapshot.get(role + "/" + name);
             if (bytes == null) continue;
@@ -115,11 +138,14 @@ public final class DiagnosticFeedback {
         }
         String overview = "快速诊断 · " + role + "\n默认共5页，适合依次拍照；完整详情仍可查看。\n" +
             "只显示本机已观察证据，不把步骤开始当成功。\n字节写完不等于手机已保存；必须看到 REMOTE_COMMIT_CONFIRMED / FILE_COMMITTED 或摘要 SAVE_CONFIRMED。\n" +
+            "系统层证据不在本页：需用 Galaxy Wearable 隐藏菜单或 ADB 另抓 dump。\n" +
             "历史日志已轮转：" + snapshot.containsKey(role + "/rotation.json") + "\n无法解析事件：" + corrupt +
             "\n批量回调静默/恢复已聚合：" + silence + "/" + resumed +
             "\n这些提示不等于已证实丢样，完整原始事件仍在ZIP。";
         String capture = "最近采集与活动同步\n采集session: " + latestCaptureSession + "\n" +
             (latestCapture.isEmpty() ? "无采集事件\n" : String.join("\n---\n",latestCapture)) +
+            "\n\n最近问题现场\n" + (latestObservation.isEmpty() ? "无结构化记录；可在主页面点“记录问题现场”。" :
+                String.join("\n---\n", latestObservation)) +
             "\n\n最近活动同步结果\n" + latestActivityResult;
         String transfer = "最近传输窗口\nwindowId: " + (latestWindowKey.isEmpty() ? "无" : latestWindowKey) + "\n" +
             (latestWindow.isEmpty() ? "无传输阶段" : String.join("\n→\n", latestWindow));
@@ -194,6 +220,26 @@ public final class DiagnosticFeedback {
         for (String name : List.of("first-fault.json", "last-fault.json")) {
             byte[] content = snapshot.get(role + "/" + name);
             if (content != null) result.add(bounded("运行/故障证据 " + name + "（可能属于旧操作，不代表当前仍失败）\nCRASH_OBSERVED表示应用捕获到崩溃；无该标记不能排除系统终止。\n" + new String(content, StandardCharsets.UTF_8), 4096));
+        }
+        StringBuilder observations = new StringBuilder("问题现场与证据边界\n");
+        boolean hasObservation = false;
+        for (String name : List.of("diagnostic-observations.previous.jsonl", "diagnostic-observations.jsonl")) {
+            byte[] bytes = snapshot.get(role + "/" + name);
+            if (bytes == null) continue;
+            for (String line : new String(bytes, StandardCharsets.UTF_8).split("\n")) {
+                if (line.isBlank()) continue;
+                hasObservation = true;
+                observations.append(bounded(line, 2048)).append("\n");
+            }
+        }
+        if (hasObservation) {
+            observations.append("\n系统层证据抓取（App 不能自动执行）：\n")
+                .append("手表：Galaxy Wearable → 更多 → 设置 → 关于 Galaxy Wearable → 连续点标题5次 → Wearable Hidden Menu → Get DumpState → Run Watch dump。\n")
+                .append("输出在手表 Download/Log/GearLog/bundled-bugreport-project<date_time>.zip，再传到电脑。\n")
+                .append("有 ADB 时可用 adb bugreport。不要用 *#9900# 的 MID debug level；它会重启手表，破坏现场。\n")
+                .append("抓取前先点“记录问题现场”；把报告 ZIP、活动 ZIP、系统 dump 放进同一目录，运行 tools/Analyze-Diagnostics.ps1。\n")
+                .append("应用日志只能证明应用层；PASS/清理完成不等于 vendor 服务或 sensor hub 已停止。");
+            result.add(bounded(observations.toString(), 8192));
         }
         return List.copyOf(result);
     }

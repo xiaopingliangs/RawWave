@@ -191,16 +191,25 @@ class RecordingActivity : ComponentActivity() {
         else if (app.activitySyncStatus.running) holdIdleForSync()
         else ensureIdle()
         val measuringEcg = s.shortSensor == "ECG" && (s.phase.startsWith("PRE") || s.phase.startsWith("POST"))
-        guide.visibility = View.GONE
-        guide.animateContact = measuringEcg && resumed
-        if (measuringEcg || (s.active && (s.shortSensor == "SPO2" || s.shortSensor == "BIA" || s.shortSensor == "PPG_ON_DEMAND"))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val waitingBiaContact = s.shortSensor == "BIA" && !s.biaContact &&
+            (s.phase.startsWith("PRE") || s.phase.startsWith("POST") || s.phase.startsWith("WAIT_BIA_"))
+        val waitingEcgContact = measuringEcg && (s.remaining < 0 || !s.contact)
+        val waitingContact = waitingBiaContact || waitingEcgContact
+        guide.visibility = if (waitingContact) View.VISIBLE else View.GONE
+        guide.biaMode = waitingBiaContact
+        guide.animateContact = waitingContact && resumed
+        if (measuringEcg || (s.active && (s.shortSensor == "SPO2" || s.shortSensor == "BIA" || s.shortSensor == "PPG_ON_DEMAND")) || app.activitySyncStatus.running) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         measurementHeader.textSize = 19f
         measurementHeader.text = if (s.active) {
             val timer = when {
                 s.phase == "DRAINING" -> "正在保存…"
                 s.phase.startsWith("REVIEW") -> "本次测量已结束"
-                measuringEcg && s.remaining < 0 -> "等待接触"
+                s.shortSensor == "BIA" && !s.biaContact && s.biaRetrying -> "测量中断 · 正在重试"
+                s.shortSensor == "BIA" && !s.biaContact -> "等待检测接触"
+                s.shortSensor == "BIA" -> "测量中 · 剩余 ${s.remaining} 秒"
+                measuringEcg && (s.remaining < 0 || !s.contact) -> "等待检测接触"
+                measuringEcg -> "ECG 测量中 · 剩余 ${s.remaining} 秒"
                 s.remaining > 0 -> "${s.remaining} 秒"
                 else -> "正在记录"
             }
@@ -210,7 +219,12 @@ class RecordingActivity : ComponentActivity() {
                     "可以调整手臂，选择重测或继续" else "可以松开手指，选择重测或继续"
                 s.phase == "RESTORE_PRE" -> "恢复平时佩戴位置后继续"
                 s.shortSensor == "SPO2" -> "手臂放稳，与心脏大致同高\n测量期间保持静止"
-                s.shortSensor == "BIA" -> "两指分别接触两个按键\n手臂抬起，避免双手相碰"
+                s.shortSensor == "BIA" && !s.biaContact && s.biaRetrying ->
+                    "上次测量${if(s.biaProgress > 0) "在 ${s.biaProgress}% " else ""}中断（${s.biaHint}）\n请保持双指接触，稍后自动重试"
+                s.shortSensor == "BIA" && !s.biaContact ->
+                    "中指轻触上键、无名指轻触下键\n双手不要相碰，手臂抬起使腋下张开"
+                s.shortSensor == "BIA" ->
+                    "保持双指接触，双手不要相碰\n手臂抬起使腋下张开，直至测量完成"
                 s.shortSensor == "PPG_ON_DEMAND" -> "正常佩戴，保持贴合\n手臂静止，采集30秒"
                 measuringEcg -> "手指轻触 Home 键，不要按下\n保持接触，手臂静止"
                 s.phase == "CORE-1" -> "正常活动即可\n结束时点击下方按钮"
@@ -224,11 +238,11 @@ class RecordingActivity : ComponentActivity() {
         topPane.post { topPane.scrollTo(0, 0) }
         controls.removeAllViews()
         if (s.active) {
-            if (s.phase.startsWith("READY_BIA_")) {
-                button("已调整好，开始体成分") { command("START_BIA") }
-                button("跳过体成分，继续") { command("SKIP_BIA") }
-            } else if (s.phase.startsWith("REVIEW_BIA_")) {
-                button("重测体成分") { command("RETRY_BIA") }
+            if (s.phase.startsWith("REVIEW_BIA_")) {
+                val mode=if(s.biaMode.isEmpty()) "体成分" else s.biaMode
+                button("重测$mode") { command("RETRY_BIA") }
+                button(if(s.biaHasNext) "跳过当前，继续下一种" else "跳过体成分，继续") { command("SKIP_BIA") }
+            } else if (s.shortSensor == "BIA") {
                 button("跳过体成分，继续") { command("SKIP_BIA") }
             } else if (s.phase.startsWith("READY_SPO2_")) {
                 button("已调整好，开始血氧") { command("START_SPO2") }
@@ -249,6 +263,8 @@ class RecordingActivity : ComponentActivity() {
             }
             if (measuringEcg && s.skipAllowed)
                 button("跳过 ECG，继续本次活动") { command("SKIP_ECG") }
+            if (measuringEcg && s.phase.startsWith("PRE"))
+                button("测试：跳过前 ECG，直接 CORE（保留后 ECG）") { command("TEST_SKIP_PRE_ECG") }
             if (s.phase == "CORE-1") button("结束活动") { command("END") }
             button("中断并保留已有数据") {
                 android.app.AlertDialog.Builder(this).setMessage("中断本次记录？已保存的数据保留，并注明用户中断。")
@@ -290,8 +306,9 @@ class RecordingActivity : ComponentActivity() {
         cancelAutoSync("SYNC_RUNNING")
         if (sync.running) holdIdleForSync() else ensureIdle()
         guide.visibility = View.GONE; guide.animateContact = false
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        status.text = "活动数据同步\n${sync.text}\n采集文件在手机完整校验前不会从手表标记为已同步。"
+        if (sync.running) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        status.text = "活动数据同步\n${sync.text}\n同步期间保持亮屏；完成或失败后立即释放。\n采集文件在手机完整校验前不会从手表标记为已同步。"
         controls.removeAllViews()
         button("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
         if (sync.running) button("停止同步（数据仍保留）") {
@@ -349,10 +366,18 @@ class RecordingActivity : ComponentActivity() {
         button("创建活动") { createForm() }
         try {
             val templates = ActivityRecordingService.store(this).templates()
+            val unsealed = ActivityArchive.unsealedCount(File(filesDir, "activities"))
+            if (unsealed > 0) label("上次采集未完整封存，数据已保留。建议先重启手表。\n刚重启过可以忽略。", controls)
+            val noticePrefs=getSharedPreferences("capture-notice",MODE_PRIVATE)
+            val lastNotice=noticePrefs.getString("last","").orEmpty()
+            if(lastNotice.isNotEmpty()) {
+                label(lastNotice, controls)
+                noticePrefs.edit().remove("last").apply()
+            }
             if (templates.isEmpty()) label("还没有活动，点击上方创建。", controls)
             templates.forEach { t ->
                 val core = t.coreSources().joinToString("、", transform = ::sensorLabel)
-                val short = listOfNotNull(if(t.ecg()) "ECG" else null, if(t.spo2()) "血氧" else null, if(t.ppg()) "PPG 100Hz" else null, if(t.bia()) (if(t.mfBia()) "多频阻抗" else "体成分") else null)
+                val short = listOfNotNull(if(t.ecg()) "ECG" else null, if(t.spo2()) "血氧" else null, if(t.ppg()) "PPG 100Hz" else null, if(t.bia()) (when { t.biaBoth() -> "体成分+多频阻抗"; t.mfBia() -> "多频阻抗"; else -> "体成分" }) else null)
                     .joinToString("、").ifEmpty { "无" }
                 label("${t.name()}\n活动前后：$short\n活动中：$core", controls)
                 button("更改：${t.name()}") { createForm(t) }
@@ -386,8 +411,9 @@ class RecordingActivity : ComponentActivity() {
             text = "测试预设会清空其他采集项，便于最小对照；需要其他源时再手动勾选。先只选连续 PPG 60 秒；灯灭后再选两种都测。结束后观察红绿灯；若仍亮，导出系统 bugreport，不要重复 17 分钟活动。"
             setTextColor(Color.WHITE); textSize = 12f
         }
-        val bia = CheckBox(this).apply { text="活动前后各测体成分 BIA（处理结果，双指触键）"; setTextColor(Color.WHITE) }
-        val mfBia=CheckBox(this).apply { text="体成分短测改用多频阻抗 MF-BIA（四频幅值/相位，成功即结束）";setTextColor(Color.WHITE);isChecked=existing?.mfBia()==true }
+        val bia = CheckBox(this).apply { text="活动前后各测体成分 BIA（算法结果，双指触键）"; setTextColor(Color.WHITE) }
+        val mfBia=CheckBox(this).apply { text="只测多频阻抗 MF-BIA（原始四频幅值/相位，不输出体脂/肌肉）";setTextColor(Color.WHITE);isChecked=existing?.mfBia()==true }
+        val biaBoth=CheckBox(this).apply { text="两种都测：前后各做两遍（先体成分 BIA，再多频阻抗 MF-BIA）";setTextColor(Color.WHITE);isChecked=existing?.biaBoth()==true }
         val profileBox=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
         var openedPad: View? = null
         fun numberField(label:String, decimal:Boolean)=EditText(this).apply {
@@ -435,19 +461,38 @@ class RecordingActivity : ComponentActivity() {
             savedProfile.getFloat("height",170f),savedProfile.getFloat("weight",65f),
             savedProfile.getInt("age",30),savedProfile.getInt("gender",0)) else null
         (existing?.biaProfile() ?: remembered)?.let { p ->
-            bia.isChecked=existing?.bia()==true;height.setText(p.heightCm().toString());weight.setText(p.weightKg().toString());age.setText(p.age().toString())
+            bia.isChecked=existing?.bia()==true;biaBoth.isChecked=existing?.biaBoth()==true
+            height.setText(p.heightCm().toString());weight.setText(p.weightKg().toString());age.setText(p.age().toString())
             gender.check(if(p.gender()==0)female.id else male.id)
         }
         profileBox.visibility=if(bia.isChecked) android.view.View.VISIBLE else android.view.View.GONE
         bia.setOnCheckedChangeListener { _,checked -> profileBox.visibility=if(checked) android.view.View.VISIBLE else android.view.View.GONE }
+        mfBia.setOnCheckedChangeListener { _,checked -> if(checked) bia.isChecked=true }
+        biaBoth.setOnCheckedChangeListener { _,checked -> if(checked) bia.isChecked=true }
         val choices = linkedMapOf(
             SensorCatalog.HEART_RATE to CheckBox(this).apply { text = "活动中：心率（处理结果）"; isChecked = true; setTextColor(Color.WHITE) },
             SensorCatalog.ACCELEROMETER to CheckBox(this).apply { text = "活动中：加速度（原始）"; isChecked = true; setTextColor(Color.WHITE) },
+            SensorCatalog.LINEAR_ACCELERATION to CheckBox(this).apply { text = "活动中：线性加速度（平台去重力，无需手动校准，目标25Hz）"; setTextColor(Color.WHITE) },
+            SensorCatalog.GAME_ROTATION_VECTOR to CheckBox(this).apply { text = "活动中：姿态四元数（平台融合，无需手动校准，目标25Hz）"; setTextColor(Color.WHITE) },
             SensorCatalog.SKIN_TEMPERATURE to CheckBox(this).apply { text = "活动中：皮肤温度（处理结果，不是体温）"; setTextColor(Color.WHITE) },
             SensorCatalog.EDA to CheckBox(this).apply { text = "活动中：皮肤电导 EDA（原始，部分型号支持）"; setTextColor(Color.WHITE) },
             SensorCatalog.MAGNETIC_FIELD to CheckBox(this).apply { text="活动中：三轴磁场（Android，微特斯拉，目标10Hz）";setTextColor(Color.WHITE) },
+            SensorCatalog.LIGHT to CheckBox(this).apply { text = "活动中：环境光（Android，lux，目标5Hz）"; setTextColor(Color.WHITE) },
+            SensorCatalog.GPS to CheckBox(this).apply { text = "活动中：GPS 轨迹（Android 定位点，目标1Hz；需定位权限）"; setTextColor(Color.WHITE) },
+            SensorCatalog.STEP_COUNT to CheckBox(this).apply { text = "活动中：步数（Android 累计计步，仅变化时回调；非原始运动波形）"; setTextColor(Color.WHITE) },
+            SensorCatalog.STEP_DETECTOR to CheckBox(this).apply { text = "活动中：每步事件（Android）"; setTextColor(Color.WHITE) },
+            SensorCatalog.OFFBODY to CheckBox(this).apply { text = "活动中：佩戴状态（Android）"; setTextColor(Color.WHITE) },
+            SensorCatalog.GYROSCOPE_UNCALIBRATED to CheckBox(this).apply { text = "活动中：未校准陀螺仪（Android）"; setTextColor(Color.WHITE) },
+            SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED to CheckBox(this).apply { text = "活动中：未校准磁场（Android）"; setTextColor(Color.WHITE) },
             SensorCatalog.PRESSURE to CheckBox(this).apply { text = "活动中：气压（Android，hPa，目标1Hz）"; setTextColor(Color.WHITE) },
             SensorCatalog.GYROSCOPE to CheckBox(this).apply { text = "活动中：陀螺仪角速度（Android，目标25Hz）"; setTextColor(Color.WHITE) })
+        choices.forEach { (source, choice) ->
+            if (!platformSensorSupported(source)) {
+                choice.isChecked = false
+                choice.isEnabled = false
+                choice.text = choice.text.toString() + "（此手表不支持）"
+            }
+        }
         fun addPpgPresetRow(vararg presets: Triple<String, Boolean, Boolean>) {
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             presets.forEach { (label, continuous, short) ->
@@ -462,6 +507,7 @@ class RecordingActivity : ComponentActivity() {
                         spo2.isChecked = false
                         bia.isChecked = false
                         mfBia.isChecked = false
+                        biaBoth.isChecked = false
                         choices.values.forEach { it.isChecked = false }
                     }
                 }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -473,11 +519,11 @@ class RecordingActivity : ComponentActivity() {
         if (existing != null) {
             name.setText(existing.name()); ecg.isChecked = existing.ecg(); spo2.isChecked = existing.spo2(); ppgShort.isChecked = existing.ppg()
             ppgContinuous.isChecked = SensorCatalog.PPG in existing.coreSources()
-            choices.forEach { (source, choice) -> choice.isChecked = source in existing.coreSources() }
+            choices.forEach { (source, choice) -> choice.isChecked = source in existing.coreSources() && choice.isEnabled }
         }
         controls.addView(name); controls.addView(ppgTitle); controls.addView(ppgContinuous); controls.addView(ppgShort)
         controls.addView(ppgPresets); controls.addView(ppgNote)
-        controls.addView(ecg); controls.addView(spo2); controls.addView(bia);controls.addView(mfBia);controls.addView(profileBox); choices.values.forEach { controls.addView(it) }
+        controls.addView(ecg); controls.addView(spo2); controls.addView(bia);controls.addView(mfBia);controls.addView(biaBoth);controls.addView(profileBox); choices.values.forEach { controls.addView(it) }
         button(if (existing == null) "保存活动" else "修改并保存") {
             try {
                 val profile=if(bia.isChecked) com.rawwave.core.BiaProfile(
@@ -485,11 +531,11 @@ class RecordingActivity : ComponentActivity() {
                     weight.text.toString().trim().toFloatOrNull() ?: error("请填写体重（千克）"),
                     age.text.toString().trim().toIntOrNull() ?: error("请填写年龄（岁）"),
                     when(gender.checkedRadioButtonId) {female.id->0;male.id->1;else->error("请选择体成分算法所需性别")}) else null
-                val selected = choices.filterValues { it.isChecked }.keys.toMutableSet()
+                val selected = choices.filterValues { it.isChecked && it.isEnabled }.keys.toMutableSet()
                 if (ppgContinuous.isChecked) selected.add(SensorCatalog.PPG)
                 val store = ActivityRecordingService.store(this)
-                if (existing == null) store.createTemplate(name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked, ppgShort.isChecked)
-                else store.updateTemplate(existing.id(), name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked, ppgShort.isChecked)
+                if (existing == null) store.createTemplate(name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked, ppgShort.isChecked, bia.isChecked && biaBoth.isChecked)
+                else store.updateTemplate(existing.id(), name.text.toString(), ecg.isChecked, selected, spo2.isChecked, profile, bia.isChecked && mfBia.isChecked, ppgShort.isChecked, bia.isChecked && biaBoth.isChecked)
                 if(profile!=null) check(savedProfile.edit().putFloat("height",profile.heightCm())
                     .putFloat("weight",profile.weightKg()).putInt("age",profile.age()).putInt("gender",profile.gender()).commit()) {
                     "活动已保存，但个人资料复用设置保存失败，请重试"
@@ -516,8 +562,9 @@ class RecordingActivity : ComponentActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 42) {
             val t = pending; pending = null
-            if (t != null && grantResults.isNotEmpty()) start(t)
-            else status.text = "未获得所需权限，本次没有开始。允许传感器权限后可重新开始。"
+            val allGranted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+            if (t != null && allGranted) start(t)
+            else status.text = "未获得所需权限，本次没有开始。允许所需权限后可重新开始。"
         }
     }
     private fun start(t: ActivityStore.Template) {
@@ -535,7 +582,14 @@ class RecordingActivity : ComponentActivity() {
         val result = linkedSetOf<String>()
         t.coreSources().forEach { sensor ->
             when {
-                sensor == SensorCatalog.MAGNETIC_FIELD || sensor == SensorCatalog.PRESSURE || sensor == SensorCatalog.ACCELEROMETER || sensor == SensorCatalog.GYROSCOPE -> result += Manifest.permission.ACTIVITY_RECOGNITION
+                sensor == SensorCatalog.GPS -> {
+                    result += Manifest.permission.ACCESS_FINE_LOCATION
+                    result += Manifest.permission.ACCESS_COARSE_LOCATION
+                }
+                sensor == SensorCatalog.LIGHT -> Unit
+                sensor == SensorCatalog.OFFBODY -> Unit
+                sensor == SensorCatalog.GYROSCOPE_UNCALIBRATED || sensor == SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED -> Unit
+                sensor == SensorCatalog.MAGNETIC_FIELD || sensor == SensorCatalog.PRESSURE || sensor == SensorCatalog.ACCELEROMETER || sensor == SensorCatalog.GYROSCOPE || sensor == SensorCatalog.STEP_COUNT || sensor == SensorCatalog.STEP_DETECTOR -> result += Manifest.permission.ACTIVITY_RECOGNITION
                 Build.VERSION.SDK_INT < 36 -> result += Manifest.permission.BODY_SENSORS
                 sensor == SensorCatalog.HEART_RATE -> result += "android.permission.health.READ_HEART_RATE"
                 sensor == SensorCatalog.SKIN_TEMPERATURE -> result += "android.permission.health.READ_SKIN_TEMPERATURE"
@@ -552,13 +606,23 @@ class RecordingActivity : ComponentActivity() {
     private fun sensorLabel(sensor: String) = when (sensor) {
         SensorCatalog.HEART_RATE -> "心率"
         SensorCatalog.ACCELEROMETER -> "加速度"
+        SensorCatalog.ACCELEROMETER_UNCALIBRATED -> "未校准加速度"
+        SensorCatalog.LINEAR_ACCELERATION -> "线性加速度"
+        SensorCatalog.GAME_ROTATION_VECTOR -> "姿态四元数"
         SensorCatalog.PPG -> "PPG 25Hz 连续"
         SensorCatalog.PPG_ON_DEMAND -> "PPG 100Hz 短测"
         SensorCatalog.SKIN_TEMPERATURE -> "皮肤温度"
         SensorCatalog.EDA -> "皮肤电导"
         SensorCatalog.MAGNETIC_FIELD -> "三轴磁场"
+        SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED -> "未校准磁场"
+        SensorCatalog.LIGHT -> "环境光"
+        SensorCatalog.GPS -> "GPS 轨迹"
+        SensorCatalog.STEP_COUNT -> "步数（平台累计）"
+        SensorCatalog.STEP_DETECTOR -> "每步事件"
+        SensorCatalog.OFFBODY -> "佩戴状态"
         SensorCatalog.PRESSURE -> "气压"
         SensorCatalog.GYROSCOPE -> "陀螺仪"
+        SensorCatalog.GYROSCOPE_UNCALIBRATED -> "未校准陀螺仪"
         else -> sensor
     }
     private fun confirmStopCapture() {
@@ -624,6 +688,27 @@ class RecordingActivity : ComponentActivity() {
             setOnClickListener { cancelAutoSync("BUTTON_${text.take(40)}"); action() }
         })
     }
+    private fun platformSensorType(sensor: String): Int? = when(sensor) {
+        SensorCatalog.GYROSCOPE -> android.hardware.Sensor.TYPE_GYROSCOPE
+        SensorCatalog.GYROSCOPE_UNCALIBRATED -> android.hardware.Sensor.TYPE_GYROSCOPE_UNCALIBRATED
+        SensorCatalog.ACCELEROMETER_UNCALIBRATED -> android.hardware.Sensor.TYPE_ACCELEROMETER_UNCALIBRATED
+        SensorCatalog.LINEAR_ACCELERATION -> android.hardware.Sensor.TYPE_LINEAR_ACCELERATION
+        SensorCatalog.GAME_ROTATION_VECTOR -> android.hardware.Sensor.TYPE_GAME_ROTATION_VECTOR
+        SensorCatalog.MAGNETIC_FIELD -> android.hardware.Sensor.TYPE_MAGNETIC_FIELD
+        SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED -> android.hardware.Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED
+        SensorCatalog.PRESSURE -> android.hardware.Sensor.TYPE_PRESSURE
+        SensorCatalog.LIGHT -> android.hardware.Sensor.TYPE_LIGHT
+        SensorCatalog.STEP_COUNT -> android.hardware.Sensor.TYPE_STEP_COUNTER
+        SensorCatalog.STEP_DETECTOR -> android.hardware.Sensor.TYPE_STEP_DETECTOR
+        SensorCatalog.OFFBODY -> android.hardware.Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT
+        else -> null
+    }
+    private fun platformSensorSupported(sensor: String): Boolean {
+        val type = platformSensorType(sensor) ?: return true
+        return try {
+            getSystemService(android.hardware.SensorManager::class.java)?.getDefaultSensor(type) != null
+        } catch (_: Exception) { false }
+    }
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
 }
 
@@ -632,10 +717,16 @@ private class HomeKeyGuide(context: android.content.Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     var animateContact = false
         set(value) { field = value; if (value) invalidate() }
+    var biaMode = false
+        set(value) { if (field != value) { field = value; invalidate() } }
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        if (biaMode) drawBia(canvas) else drawEcg(canvas)
+        if (animateContact && isShown) postInvalidateDelayed(80)
+    }
+    private fun drawEcg(canvas: Canvas) {
         val x = width * .42f; val y = height * .48f; val r = height * .30f
-        paint.color = Color.LTGRAY; paint.style = Paint.Style.STROKE; paint.strokeWidth = 4f
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = 4f; paint.color = Color.LTGRAY
         canvas.drawCircle(x, y, r, paint)
         paint.style = Paint.Style.FILL; paint.color = Color.CYAN
         canvas.drawRoundRect(x+r, y-r*.6f, x+r+12, y-r*.15f, 4f, 4f, paint)
@@ -644,6 +735,38 @@ private class HomeKeyGuide(context: android.content.Context) : View(context) {
         canvas.drawRoundRect(x+r+15+pulse*15, y-r*.6f, width*.94f, y-r*.1f, 12f, 12f, paint)
         paint.color = Color.WHITE; paint.textSize = height*.13f; paint.textAlign = Paint.Align.CENTER
         canvas.drawText("手指轻触 Home 键（示意）", width*.5f, height*.95f, paint)
-        if (animateContact && isShown) postInvalidateDelayed(80)
+    }
+    /** Watch body, two side keys and two pulsing fingertips: middle finger upper, ring finger lower. */
+    private fun drawBia(canvas: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        val bodyLeft = w*.05f; val bodyRight = w*.33f
+        val bodyTop = h*.12f; val bodyBottom = h*.88f
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = 3f; paint.color = Color.LTGRAY
+        canvas.drawRoundRect(bodyLeft, bodyTop, bodyRight, bodyBottom, 12f, 12f, paint)
+        // Strap stubs make the rectangle read as a watch rather than a button.
+        canvas.drawLine(0f, h*.5f, bodyLeft, h*.5f, paint)
+        canvas.drawLine(bodyRight, h*.5f, bodyRight + w*.02f, h*.5f, paint)
+        paint.style = Paint.Style.FILL; paint.color = Color.CYAN
+        val keyTop = h*.30f; val keyBottom = h*.68f; val keyHalf = h*.10f
+        val keyRight = bodyRight + w*.03f
+        canvas.drawRoundRect(bodyRight, keyTop-keyHalf, keyRight, keyTop+keyHalf, 4f, 4f, paint)
+        canvas.drawRoundRect(bodyRight, keyBottom-keyHalf, keyRight, keyBottom+keyHalf, 4f, 4f, paint)
+        val pulse = if (animateContact) ((SystemClock.uptimeMillis() % 1200) / 1200f) else 0f
+        val fingerX = keyRight + w*.075f + pulse*w*.018f
+        paint.color = Color.rgb(255, 208, 162)
+        canvas.drawOval(fingerX-w*.055f, keyTop-h*.15f, fingerX+w*.055f, keyTop+h*.15f, paint)
+        canvas.drawOval(fingerX-w*.045f, keyBottom-h*.13f, fingerX+w*.065f, keyBottom+h*.13f, paint)
+        if (animateContact) {
+            paint.style = Paint.Style.STROKE; paint.strokeWidth = 2f
+            paint.color = Color.argb((210*(1f-pulse)).toInt().coerceIn(0,255), 0, 235, 235)
+            canvas.drawCircle(keyRight, keyTop, h*.12f + pulse*h*.14f, paint)
+            canvas.drawCircle(keyRight, keyBottom, h*.12f + pulse*h*.14f, paint)
+            paint.style = Paint.Style.FILL
+        }
+        paint.color = Color.WHITE; paint.textSize = h*.19f; paint.textAlign = Paint.Align.LEFT
+        canvas.drawText("中指", fingerX + w*.065f, keyTop + h*.07f, paint)
+        canvas.drawText("无名指", fingerX + w*.065f, keyBottom + h*.07f, paint)
+        paint.textAlign = Paint.Align.CENTER; paint.textSize = h*.15f; paint.color = Color.LTGRAY
+        canvas.drawText("中指上键 · 无名指下键", w*.5f, h*.99f, paint)
     }
 }

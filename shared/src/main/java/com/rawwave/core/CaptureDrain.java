@@ -4,6 +4,9 @@ import java.util.*;
 
 /** Serial-owner barrier. Register all sources before invoking possibly inline completions. */
 public final class CaptureDrain {
+    /** GPS is included because Android LocationManager has no flush API; delivered rows are all that is provable. */
+    private static final Set<String> DELIVERED_ONLY_ALLOWED =
+        Set.of("ECG", "SPO2", "BIA", "MF_BIA", "PPG_ON_DEMAND", "GPS");
     private final Set<String> pending;
     private final Map<String,String> failures = new LinkedHashMap<>();
     private boolean claimed;
@@ -14,8 +17,7 @@ public final class CaptureDrain {
             failures.put(sensor, String.valueOf(detail));
         else if (status == SensorPort.DrainStatus.END_TIME_COVERED && !sensor.equals("EDA"))
             failures.put(sensor,"END_TIME_COVERAGE_NOT_SUPPORTED:" + detail);
-        else if (status == SensorPort.DrainStatus.DELIVERED_ONLY && !sensor.equals("ECG") && !sensor.equals("SPO2")
-                && !sensor.equals("BIA") && !sensor.equals("MF_BIA") && !sensor.equals("PPG_ON_DEMAND"))
+        else if (status == SensorPort.DrainStatus.DELIVERED_ONLY && !DELIVERED_ONLY_ALLOWED.contains(sensor))
             failures.put(sensor,"SDK_FLUSH_REQUIRED:" + detail);
         return true;
     }

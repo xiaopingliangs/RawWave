@@ -24,7 +24,7 @@ class CaptureServiceTest {
         assertEquals("REVIEW_PRE",ActivityRecordingService.state.phase)
         assertTrue(ActivityRecordingService.state.text.contains("15秒没有新数据"))
         assertEquals(10L,r.session.counts()["PRE-1/ECG"])
-        r.queue.advance(79999);assertFalse(r.seal().exists())
+        r.queue.advance(64999);assertFalse(r.seal().exists())
         r.queue.advance(1001)
         assertTrue(r.seal().exists());assertEquals(listOf("ECG"),r.sensors.starts)
         assertEquals(1,r.sensors.closes)
@@ -80,6 +80,74 @@ class CaptureServiceTest {
         assertEquals(10L,r.session.counts()["POST-300/PPG_ON_DEMAND"])
         assertEquals(listOf("PPG_ON_DEMAND","PPG","PPG_ON_DEMAND"),r.sensors.starts)
     }
+    @Test fun continuousPpgIsHeldThroughPostEcgAndStoppedLast() {
+        val r=Rig(ecg=true,sources=listOf("PPG"))
+        r.preComplete();r.sensors.ack("ECG");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        r.sensors.emit("PPG",ppgRows(4));r.queue.runReady()
+        r.end()
+        assertEquals("POST-1",ActivityRecordingService.state.phase)
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        // The held stream keeps delivering while post ECG runs; rows stay under CORE-1.
+        r.sensors.emit("PPG",ppgRows(2));r.queue.runReady()
+        assertEquals(6L,r.session.counts()["CORE-1/PPG"])
+        r.preComplete();r.sensors.ack("ECG");r.queue.runReady()
+        assertEquals("DRAINING",ActivityRecordingService.state.phase)
+        // PPG is drained only after the post-ECG drain has completed.
+        assertTrue(r.sensors.drains.containsKey("PPG"))
+        r.sensors.ack("PPG");r.queue.runReady()
+        assertTrue(r.seal().exists())
+    }
+    @Test fun stepDetectorRowsAreSavedAndSparseCallbacksDoNotTriggerSilence() {
+        val r=Rig(sources=listOf("STEP_DETECTOR"))
+        r.sensors.emit("STEP_DETECTOR",listOf(StepDetector.row(1f,1000L,3,2000L,3000L,1,0,1)))
+        r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        r.queue.advance(60000)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
+        r.end();r.sensors.ack("STEP_DETECTOR");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(1L,r.session.counts()["CORE-1/STEP_DETECTOR"])
+    }
+    @Test fun offBodyStateRowsAreSavedAndSparseCallbacksDoNotTriggerSilence() {
+        val r=Rig(sources=listOf("OFFBODY"))
+        r.sensors.emit("OFFBODY",listOf(OffBody.row(1f,1000L,3,2000L,3000L,1,0,1)))
+        r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        r.queue.advance(60000)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
+        r.sensors.emit("OFFBODY",listOf(OffBody.row(0f,2000L,3,3000L,4000L,2,0,1)))
+        r.queue.runReady()
+        r.end();r.sensors.ack("OFFBODY");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(2L,r.session.counts()["CORE-1/OFFBODY"])
+    }
+    @Test fun uncalibratedImuRowsAreSavedAndDrained() {
+        val r=Rig(sources=listOf("GYROSCOPE_UNCALIBRATED","MAGNETIC_FIELD_UNCALIBRATED"))
+        r.sensors.emit("GYROSCOPE_UNCALIBRATED",listOf(
+            GyroscopeUncalibrated.row(0.1f,0.2f,0.3f,0.01f,0.02f,0.03f,1000L,3,2000L,3000L,1,0,1)))
+        r.sensors.emit("MAGNETIC_FIELD_UNCALIBRATED",listOf(
+            MagneticFieldUncalibrated.row(1f,2f,3f,0.1f,0.2f,0.3f,1000L,3,2000L,3000L,1,0,1)))
+        r.queue.runReady()
+        r.end();r.sensors.ack("GYROSCOPE_UNCALIBRATED");r.sensors.ack("MAGNETIC_FIELD_UNCALIBRATED");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(1L,r.session.counts()["CORE-1/GYROSCOPE_UNCALIBRATED"])
+        assertEquals(1L,r.session.counts()["CORE-1/MAGNETIC_FIELD_UNCALIBRATED"])
+    }
+    @Test fun fusedLinearAccelerationAndGameRotationRowsAreSavedAndDrained() {
+        val r=Rig(sources=listOf("LINEAR_ACCELERATION","GAME_ROTATION_VECTOR"))
+        r.sensors.emit("LINEAR_ACCELERATION",listOf(
+            LinearAcceleration.row(0.1f,-0.2f,0.3f,1000L,3,2000L,3000L,1,0,1)))
+        r.sensors.emit("GAME_ROTATION_VECTOR",listOf(
+            GameRotationVector.row(0.1f,0.2f,0.3f,0.9f,1000L,3,2000L,3000L,1,0,1)))
+        r.queue.runReady()
+        r.end();r.sensors.ack("LINEAR_ACCELERATION");r.sensors.ack("GAME_ROTATION_VECTOR");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(1L,r.session.counts()["CORE-1/LINEAR_ACCELERATION"])
+        assertEquals(1L,r.session.counts()["CORE-1/GAME_ROTATION_VECTOR"])
+    }
     @Test fun ppgOnlyPostStillRunsAfterUnconfirmedCoreTail() {
         val r=Rig(ppg=true,sources=listOf("PRESSURE"))
         r.service.command("START_PPG");r.queue.runReady()
@@ -106,8 +174,7 @@ class CaptureServiceTest {
         r.service.command("START_SPO2");r.queue.runReady()
         r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 97)));r.queue.runReady()
         r.sensors.ack("SPO2");r.queue.runReady()
-        assertEquals("READY_BIA_PRE",ActivityRecordingService.state.phase)
-        r.service.command("START_BIA");r.queue.runReady();r.queue.advance(5000)
+        assertEquals("PRE-200",ActivityRecordingService.state.phase)
         r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("BIA");r.queue.runReady()
@@ -115,8 +182,7 @@ class CaptureServiceTest {
         assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
         r.service.command("PLACEMENT_READY");r.queue.runReady()
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
-        assertEquals("READY_BIA_POST",ActivityRecordingService.state.phase)
-        r.service.command("START_BIA");r.queue.runReady();r.queue.advance(5000)
+        assertEquals("POST-200",ActivityRecordingService.state.phase)
         r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
         r.sensors.ack("BIA");r.queue.runReady()
         assertEquals("READY_SPO2_POST",ActivityRecordingService.state.phase)
@@ -128,39 +194,38 @@ class CaptureServiceTest {
     }
     @Test fun biaStatusOnlyCannotSucceedAndRetryKeepsEachAttempt() {
         val r=Rig(bia=true)
-        r.service.command("START_BIA");r.queue.runReady();r.queue.advance(5000)
         r.sensors.emit("BIA",listOf(mapOf("STATUS" to 0,"PROGRESS" to 0f)));r.queue.runReady()
         assertEquals("PRE-200",ActivityRecordingService.state.phase)
         r.queue.advance(60000);r.sensors.ack("BIA");r.queue.runReady()
         assertEquals("REVIEW_BIA_PRE",ActivityRecordingService.state.phase)
         r.service.command("RETRY_BIA");r.queue.runReady()
-        r.service.command("START_BIA");r.queue.runReady();r.queue.advance(5000)
         r.sensors.emit("BIA",listOf(bodyRow(9)));r.queue.runReady()
         r.sensors.ack("BIA");r.queue.runReady()
-        assertEquals("REVIEW_BIA_PRE",ActivityRecordingService.state.phase)
+        assertEquals("WAIT_BIA_PRE",ActivityRecordingService.state.phase)
         assertEquals(1L,r.session.counts()["PRE-200/BIA"]);assertEquals(1L,r.session.counts()["PRE-201/BIA"])
         r.service.command("SKIP_BIA");r.queue.runReady();assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
     }
-    @Test fun biaPostRunsAfterPressureDrainAndPreparationExpires() {
+    @Test fun biaPostStartsAfterPressureDrainAndCanBeSkipped() {
         val r=Rig(bia=true,sources=listOf("PRESSURE","GYROSCOPE"))
-        r.service.command("SKIP_BIA");r.queue.runReady()
+        r.service.command("SKIP_BIA");r.queue.runReady();r.sensors.ack("BIA");r.queue.runReady()
+        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
         r.service.command("PLACEMENT_READY");r.queue.runReady()
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("GYROSCOPE");r.queue.runReady()
-        assertEquals("READY_BIA_POST",ActivityRecordingService.state.phase)
-        r.queue.advance(80000);assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
+        assertEquals("POST-200",ActivityRecordingService.state.phase)
+        assertTrue(r.sensors.starts.contains("BIA"))
+        r.service.command("SKIP_BIA");r.queue.runReady();r.sensors.ack("BIA");r.queue.runReady()
+        assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
     }
     @Test fun biaDiskFailureNeverAdvancesToCoreOrBloodOxygen() {
         val r=Rig(bia=true)
-        r.service.command("START_BIA");r.queue.runReady();r.queue.advance(5000)
         r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
         r.failDisk=true;r.sensors.ack("BIA");r.queue.runReady()
         assertEquals(listOf("BIA"),r.sensors.starts);assertFalse(r.seal().exists())
     }
     @Test fun multiFrequencyProgressDoesNotFailAndSuccessEndsImmediately() {
         val r=Rig(bia=true,mf=true,sources=listOf("MAGNETIC_FIELD"))
-        r.service.command("START_BIA");r.queue.runReady();r.queue.advance(5000)
         r.sensors.emit("MF_BIA",listOf(mapOf("STATUS" to 23,"PROGRESS" to 50f)));r.queue.runReady()
         assertEquals("PRE-200",ActivityRecordingService.state.phase)
         assertTrue(ActivityRecordingService.state.text.contains("50%"))
@@ -177,14 +242,62 @@ class CaptureServiceTest {
         r.service.command("PLACEMENT_READY");r.queue.runReady()
         assertEquals(listOf("MF_BIA","MAGNETIC_FIELD"),r.sensors.starts)
     }
-    @Test fun bodyCountdownCanBeCancelledWithoutStartingHardware() {
+    @Test fun bothBiaModesRunTwiceInOnePhase() {
+        val r=Rig(bia=true,both=true,sources=listOf("MAGNETIC_FIELD"))
+        r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
+        r.sensors.ack("BIA");r.queue.runReady()
+        assertEquals("PRE-201",ActivityRecordingService.state.phase)
+        assertEquals("多频阻抗",ActivityRecordingService.state.biaMode)
+        val row=buildMap<String,Any> {
+            put("STATUS",0)
+            listOf("5K","10K","50K","250K").forEach { put("BODY_IMPEDANCE_MAGNITUDE_$it",500f);put("BODY_IMPEDANCE_PHASE_$it",-8f) }
+        }
+        r.sensors.emit("MF_BIA",listOf(row));r.queue.runReady()
+        r.sensors.ack("MF_BIA");r.queue.runReady()
+        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        assertEquals(1L,r.session.counts()["PRE-200/BIA"])
+        assertEquals(1L,r.session.counts()["PRE-201/MF_BIA"])
+    }
+    @Test fun biaContactErrorWaitsAndRetriesThenMeasures() {
         val r=Rig(bia=true)
-        r.service.command("START_BIA");r.queue.runReady()
-        assertEquals("ARM_BIA_PRE",ActivityRecordingService.state.phase)
-        assertTrue(r.sensors.starts.isEmpty())
-        r.queue.advance(4999);assertTrue(r.sensors.starts.isEmpty())
-        r.service.command("CANCEL");r.queue.runReady();r.queue.advance(10000)
-        assertTrue(r.sensors.starts.isEmpty());assertTrue(r.seal().exists())
+        r.sensors.emit("BIA",listOf(mapOf("STATUS" to 9,"PROGRESS" to 0f)));r.queue.runReady()
+        r.sensors.ack("BIA");r.queue.runReady()
+        assertEquals("WAIT_BIA_PRE",ActivityRecordingService.state.phase)
+        assertTrue(ActivityRecordingService.state.biaRetrying)
+        assertEquals(1,ActivityRecordingService.state.biaAttempt)
+        r.queue.advance(2000)
+        assertEquals("PRE-201",ActivityRecordingService.state.phase)
+        assertEquals(2,ActivityRecordingService.state.biaAttempt)
+        r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
+        r.sensors.ack("BIA");r.queue.runReady()
+        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        assertEquals(1L,r.session.counts()["PRE-200/BIA"]);assertEquals(1L,r.session.counts()["PRE-201/BIA"])
+    }
+    @Test fun biaMidMeasurementFailureKeepsLastProgressAndRetryState() {
+        val r=Rig(bia=true)
+        r.sensors.emit("BIA",listOf(mapOf("STATUS" to 0,"PROGRESS" to 0.2f)));r.queue.runReady()
+        assertEquals(20,ActivityRecordingService.state.biaProgress)
+        assertTrue(ActivityRecordingService.state.biaContact)
+        r.sensors.emit("BIA",listOf(mapOf("STATUS" to 9,"PROGRESS" to 0f)));r.queue.runReady()
+        r.sensors.ack("BIA");r.queue.runReady()
+        assertEquals("WAIT_BIA_PRE",ActivityRecordingService.state.phase)
+        assertTrue(ActivityRecordingService.state.biaRetrying)
+        assertEquals(20,ActivityRecordingService.state.biaProgress)
+        assertTrue(ActivityRecordingService.state.text.contains("20%"))
+    }
+    @Test fun biaNoContactExitsAtEightySecondBudget() {
+        val r=Rig(bia=true)
+        r.queue.advance(60000);r.sensors.ack("BIA");r.queue.runReady()
+        assertEquals("REVIEW_BIA_PRE",ActivityRecordingService.state.phase)
+        r.queue.advance(20000)
+        assertTrue(r.seal().exists())
+    }
+    @Test fun biaStartsImmediatelyWithoutCountdown() {
+        val r=Rig(bia=true)
+        assertEquals("PRE-200",ActivityRecordingService.state.phase)
+        assertEquals(listOf("BIA"),r.sensors.starts)
+        r.service.command("CANCEL");r.queue.runReady();r.sensors.ack("BIA");r.queue.runReady()
+        assertTrue(r.seal().exists())
     }
     @Test fun edaBoundaryCompletionPersistsTailBeforePostPhaseAndIgnoresLateFlush() {
         val r=Rig(spo2=true,sources=listOf("EDA","PRESSURE"))
@@ -229,11 +342,16 @@ class CaptureServiceTest {
         val rows=mutableMapOf<String,SensorPort.Rows>()
         val drains=mutableMapOf<String,SensorPort.Drain>()
         val starts=mutableListOf<String>();val stops=mutableListOf<String>()
+        val failStarts=mutableSetOf<String>()
         var closes=0;var throwDrain=false
         override fun contractVersion()=SensorPort.CONTRACT_VERSION
         override fun implementationVersion()="host-fake/2"
         override fun connect(ready:Runnable,failed:SensorPort.Failure){owner.enqueue {ready.run()}}
-        override fun start(sensor:String,data:SensorPort.Rows,failed:SensorPort.Failure){starts.add(sensor);rows[sensor]=data}
+        override fun start(sensor:String,data:SensorPort.Rows,failed:SensorPort.Failure){
+            starts.add(sensor)
+            if (sensor in failStarts) { owner.enqueue { failed.accept("fake start failure") }; return }
+            rows[sensor]=data
+        }
         override fun drain(sensor:String,done:SensorPort.Drain) {
             if(throwDrain)throw IOException("injected drain failure")
             check(!drains.containsKey(sensor));drains[sensor]=done
@@ -243,15 +361,15 @@ class CaptureServiceTest {
         fun emit(sensor:String,data:List<Map<String,Any?>>) {val receiver=rows.getValue(sensor);owner.enqueueRows(data) {receiver.accept(data)}}
         fun ack(sensor:String, status:SensorPort.DrainStatus?=null) {
             val done=drains.remove(sensor) ?: error("no pending drain")
-            owner.enqueue {done.accept(status ?: if(sensor=="MF_BIA" || sensor=="BIA" || sensor=="ECG" || sensor=="SPO2" || sensor=="PPG_ON_DEMAND")SensorPort.DrainStatus.DELIVERED_ONLY else SensorPort.DrainStatus.FLUSHED,"fake ack")}
+            owner.enqueue {done.accept(status ?: if(sensor=="MF_BIA" || sensor=="BIA" || sensor=="ECG" || sensor=="SPO2" || sensor=="PPG_ON_DEMAND" || sensor=="GPS")SensorPort.DrainStatus.DELIVERED_ONLY else SensorPort.DrainStatus.FLUSHED,"fake ack")}
         }
     }
-    private inner class Rig(ecg:Boolean=false,autoRun:Boolean=true,diskOwner:Boolean=false,spo2:Boolean=false,bia:Boolean=false,mf:Boolean=false,ppg:Boolean=false,sources:List<String> = listOf("HEART_RATE","PPG")) {
+    private inner class Rig(ecg:Boolean=false,autoRun:Boolean=true,diskOwner:Boolean=false,spo2:Boolean=false,bia:Boolean=false,mf:Boolean=false,ppg:Boolean=false,both:Boolean=false,sources:List<String> = listOf("HEART_RATE","PPG")) {
         val queue=Queue();val service=ActivityRecordingService();val sensors=Sensors(service)
         @Volatile var failDisk=false
         @Volatile var diskHook: (() -> Unit)? = null
         val store=ActivityStore(temp.newFolder()){diskHook?.invoke();if(failDisk)throw IOException("injected disk failure")}
-        val template=store.createTemplate("宿主收尾",ecg,sources,spo2,if(bia)BiaProfile(170f,65f,30,1)else null,mf,ppg)
+        val template=store.createTemplate("宿主收尾",ecg,sources,spo2,if(bia)BiaProfile(170f,65f,30,1)else null,mf,ppg,both)
         val session=store.start(template,1000,1)
         init {
             service.writer=queue;service.clock={queue.now};service.useDiskOwner=diskOwner
@@ -272,8 +390,8 @@ class CaptureServiceTest {
             assertEquals("DRAINING",ActivityRecordingService.state.phase)
         }
     }
-    @Test fun slowDiskWithEightSourcesDoesNotBlockCaptureOrLoseAcceptedSamples() {
-        val sources=listOf("HEART_RATE","PPG","ACCELEROMETER","EDA","SKIN_TEMPERATURE","GYROSCOPE","PRESSURE","MAGNETIC_FIELD")
+    @Test fun slowDiskWithElevenSourcesDoesNotBlockCaptureOrLoseAcceptedSamples() {
+        val sources=listOf("HEART_RATE","PPG","ACCELEROMETER","EDA","SKIN_TEMPERATURE","GYROSCOPE","PRESSURE","MAGNETIC_FIELD","LIGHT","GPS","STEP_COUNT")
         val r=Rig(diskOwner=true,sources=sources)
         val entered=java.util.concurrent.CountDownLatch(1)
         val release=java.util.concurrent.CountDownLatch(1)
@@ -468,8 +586,8 @@ class CaptureServiceTest {
         val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
         assertTrue(ActivityArchive.verify(batch.file()).allSealed())
     }
-    @Test fun eightSourceBurstsUseProductionDiskOwnerAndSealEveryAcceptedRow() {
-        val sources=listOf("HEART_RATE","PPG","ACCELEROMETER","EDA","SKIN_TEMPERATURE","GYROSCOPE","PRESSURE","MAGNETIC_FIELD")
+    @Test fun elevenSourceBurstsUseProductionDiskOwnerAndSealEveryAcceptedRow() {
+        val sources=listOf("HEART_RATE","PPG","ACCELEROMETER","EDA","SKIN_TEMPERATURE","GYROSCOPE","PRESSURE","MAGNETIC_FIELD","LIGHT","GPS","STEP_COUNT")
         val r=Rig(diskOwner=true,sources=sources)
         repeat(100) { burst ->
             // 200 callbacks per burst; all sources share the actual capture service FIFO.
@@ -528,6 +646,17 @@ class CaptureServiceTest {
         r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
         assertEquals(1,r.sensors.closes);assertFalse(ActivityRecordingService.state.active)
     }
+    @Test fun forcedSkipPreEcgStartsCoreAndKeepsPostEcg() {
+        val r=Rig(ecg=true,sources=listOf("PPG"))
+        assertEquals("PRE-1",ActivityRecordingService.state.phase)
+        r.service.command("TEST_SKIP_PRE_ECG");r.queue.runReady()
+        r.sensors.ack("ECG");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to 1)));r.queue.runReady()
+        r.end();r.queue.runReady()
+        assertEquals("POST-1",ActivityRecordingService.state.phase)
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+    }
     @Test fun preEcgCannotStartCoreUntilAcceptedTailIsSaved() {
         val r=Rig(true);r.preComplete();assertEquals(listOf("ECG"),r.sensors.starts)
         r.sensors.emit("ECG",listOf(mapOf("sdkTimestamp" to 30001L,"ECG_MV" to 0.2)))
@@ -566,12 +695,14 @@ class CaptureServiceTest {
         val r=Rig(true);r.queue.advance(80000)
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("ECG");r.queue.runReady()
-        assertTrue(r.seal().readText().contains("ECG_IDLE_TIMEOUT_80S"))
+        val seal=r.seal().readText()
+        assertTrue(seal.contains("ECG_IDLE_TIMEOUT_80S") || seal.contains("SHORT_MEASUREMENT_TIMEOUT_80S"))
         assertEquals(listOf("ECG"),r.sensors.starts);assertEquals(1,r.sensors.closes)
         assertFalse(ActivityRecordingService.state.active)
     }
     @Test fun missingCoreAckStillSavesRowsThenRunsPostEcgWithPersistentWarning() {
-        val r=Rig(true);r.preComplete();r.sensors.ack("ECG");r.queue.runReady()
+        val r=Rig(true,sources=listOf("HEART_RATE","PPG","GYROSCOPE"))
+        r.preComplete();r.sensors.ack("ECG");r.queue.runReady()
         r.end();r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 30002L,"PPG_GREEN" to 3)))
         r.sensors.ack("HEART_RATE");r.queue.advance(5000)
         assertEquals("POST-1",ActivityRecordingService.state.phase)
@@ -579,9 +710,11 @@ class CaptureServiceTest {
         assertTrue(ActivityRecordingService.state.text.contains("尾部未确认"))
         assertFalse(r.seal().exists())
         // Late completion belongs to the old core drain and cannot finish POST.
-        r.sensors.ack("PPG");r.queue.runReady()
+        r.sensors.ack("GYROSCOPE");r.queue.runReady()
         assertEquals("POST-1",ActivityRecordingService.state.phase)
         r.preComplete();r.sensors.ack("ECG");r.queue.runReady()
+        assertTrue(r.sensors.drains.containsKey("PPG"))
+        r.sensors.ack("PPG");r.queue.runReady()
         assertTrue(r.session.counts().getValue("POST-1/ECG") >= 15000)
         assertTrue(r.seal().readText().contains("CORE_TAIL_UNCONFIRMED"))
         assertEquals(1,r.sensors.closes)
@@ -626,7 +759,8 @@ class CaptureServiceTest {
         assertEquals("REVIEW_SPO2_PRE",ActivityRecordingService.state.phase)
         assertEquals(listOf("SPO2"),r.sensors.starts)
         r.queue.advance(80000)
-        assertTrue(r.seal().readText().contains("SPO2_REVIEW_IDLE_TIMEOUT"));assertEquals(1,r.sensors.closes)
+        val seal=r.seal().readText()
+        assertTrue(seal.contains("SHORT_MEASUREMENT_TIMEOUT_80S") || seal.contains("SPO2_REVIEW_IDLE_TIMEOUT"));assertEquals(1,r.sensors.closes)
     }
     @Test fun spo2FailedStatusIsSavedAndExplicitSkipContinues() {
         val r=Rig(spo2=true)
@@ -647,12 +781,17 @@ class CaptureServiceTest {
         assertEquals("REVIEW_SPO2_PRE",ActivityRecordingService.state.phase)
         assertFalse(r.sensors.starts.contains("HEART_RATE"))
     }
-    @Test fun preparationExpiresWithoutSensorsAndLateTapCannotStart() {
+    @Test fun preparationAutoStartsSpo2AndLateTapCannotRestart() {
         val r=Rig(spo2=true)
         assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
-        r.queue.advance(80000);r.service.command("START_SPO2");r.queue.runReady()
-        assertTrue(r.sensors.starts.isEmpty())
-        assertTrue(r.seal().readText().contains("PLACEMENT_IDLE_TIMEOUT"))
+        r.queue.advance(15000)
+        assertEquals(listOf("SPO2"),r.sensors.starts)
+        r.queue.advance(30000);r.sensors.ack("SPO2");r.queue.runReady()
+        assertEquals("REVIEW_SPO2_PRE",ActivityRecordingService.state.phase)
+        r.queue.advance(35000)
+        r.service.command("START_SPO2");r.queue.runReady()
+        assertEquals(1,r.sensors.starts.size)
+        assertTrue(r.seal().readText().contains("SHORT_MEASUREMENT_TIMEOUT_80S"))
     }
     @Test fun retryRequiresPreparationAndDuplicateStartDoesNotRestartSensor() {
         val r=Rig(spo2=true)
@@ -669,18 +808,110 @@ class CaptureServiceTest {
         r.queue.advance(15000)
         assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
     }
-    @Test fun restoreTimeoutNeverStartsCoreAndArchiveRemainsValid() {
+    @Test fun restoreAutoStartsCoreAfter15SecondsAndArchiveRemainsValid() {
         val r=Rig(spo2=true)
         r.service.command("START_SPO2");r.queue.runReady()
         r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 98)))
         r.queue.runReady();r.sensors.ack("SPO2");r.queue.runReady()
-        r.queue.advance(80000);r.service.command("PLACEMENT_READY");r.queue.runReady()
-        assertEquals(listOf("SPO2"),r.sensors.starts)
+        r.queue.advance(15000)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        assertTrue(r.sensors.starts.contains("HEART_RATE"))
+        r.service.command("CANCEL");r.queue.runReady()
+        r.sensors.ack("HEART_RATE");r.sensors.ack("PPG");r.queue.runReady()
         assertTrue(r.seal().exists())
         val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
         assertTrue(ActivityArchive.verify(batch.file()).allSealed())
     }
 
+    @Test fun gpsDeliveredOnlyDrainIsAcceptedWhileOtherSourcesFlushAndSeal() {
+        val r=Rig(sources=listOf("GPS","LIGHT","PRESSURE"))
+        r.sensors.emit("GPS",listOf(gpsRow(1000)))
+        r.sensors.emit("LIGHT",listOf(mapOf("sdkTimestamp" to 1000L,"LIGHT_LUX" to 20f)))
+        r.queue.runReady()
+        r.end()
+        r.sensors.ack("GPS",SensorPort.DrainStatus.DELIVERED_ONLY)
+        r.sensors.ack("LIGHT")
+        r.sensors.ack("PRESSURE")
+        r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(1L,r.session.counts()["CORE-1/GPS"])
+        assertFalse(r.seal().readText().contains("DRAIN_INCOMPLETE"))
+    }
+    @Test fun gpsFixAcceptedBeforeDeliveredOnlyCompletionIsPersistedUnderCorePhase() {
+        val r=Rig(sources=listOf("GPS","PRESSURE"))
+        r.sensors.emit("GPS",listOf(gpsRow(1000)))
+        r.queue.runReady()
+        r.end()
+        // A callback already accepted before the drain completion still belongs to CORE-1.
+        r.sensors.emit("GPS",listOf(gpsRow(2000)))
+        r.sensors.ack("GPS",SensorPort.DrainStatus.DELIVERED_ONLY)
+        r.sensors.ack("PRESSURE")
+        r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(2L,r.session.counts()["CORE-1/GPS"])
+        assertFalse(r.session.counts().keys.any { it.contains("POST") })
+    }
+    @Test fun gpsStartFailureLeavesOtherSourcesRunningAndDoesNotCorruptSeal() {
+        val r=Rig(autoRun=false,sources=listOf("GPS","LIGHT","PRESSURE"))
+        r.sensors.failStarts.add("GPS")
+        r.queue.runReady()
+        assertTrue(ActivityRecordingService.state.active)
+        assertEquals(setOf("GPS","LIGHT","PRESSURE"),r.sensors.starts.toSet())
+        r.sensors.emit("LIGHT",listOf(mapOf("sdkTimestamp" to 1L,"LIGHT_LUX" to 10f)))
+        r.queue.runReady()
+        r.end()
+        r.sensors.ack("LIGHT");r.sensors.ack("PRESSURE");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(1L,r.session.counts()["CORE-1/LIGHT"])
+        assertFalse(r.session.counts().containsKey("CORE-1/GPS"))
+    }
+    @Test fun stepCountFlushedDrainSealsWithCumulativeRowsAndKeepsLateRowsInCore() {
+        val r=Rig(sources=listOf("STEP_COUNT","PRESSURE"))
+        r.sensors.emit("STEP_COUNT",listOf(stepCountRow(1000,120f)))
+        r.queue.runReady()
+        r.end()
+        // Accepted before completion: still belongs to CORE-1.
+        r.sensors.emit("STEP_COUNT",listOf(stepCountRow(2000,128f)))
+        r.sensors.ack("STEP_COUNT")
+        r.sensors.ack("PRESSURE")
+        r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertEquals(2L,r.session.counts()["CORE-1/STEP_COUNT"])
+        assertFalse(r.seal().readText().contains("DRAIN_INCOMPLETE"))
+    }
+    @Test fun stepCountDeliveredOnlyIsExplicitFailureNotSilentSuccess() {
+        val r=Rig(sources=listOf("STEP_COUNT","PRESSURE"))
+        r.sensors.emit("STEP_COUNT",listOf(stepCountRow(1000,120f)))
+        r.queue.runReady()
+        r.end()
+        r.sensors.ack("STEP_COUNT",SensorPort.DrainStatus.DELIVERED_ONLY)
+        r.sensors.ack("PRESSURE")
+        r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertTrue(r.seal().readText().contains("SDK_FLUSH_REQUIRED"))
+        assertEquals(1L,r.session.counts()["CORE-1/STEP_COUNT"])
+    }
+    @Test fun sparseStepCounterCallbackIsNotReportedAsDataSilence() {
+        val r=Rig(sources=listOf("STEP_COUNT"))
+        r.queue.advance(20_000)
+        assertTrue(ActivityRecordingService.state.active)
+        assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
+        r.sensors.emit("STEP_COUNT",listOf(stepCountRow(21_000,121f)))
+        r.end();r.sensors.ack("STEP_COUNT");r.queue.runReady()
+        assertTrue(r.seal().exists())
+    }
+    private fun gpsRow(timestamp:Long,latitude:Double=31.2304)=mapOf<String,Any?>(
+        "sensorTimestampNs" to timestamp*1_000_000,
+        "sdkTimestamp" to timestamp,
+        "GPS_LATITUDE" to latitude,
+        "GPS_LONGITUDE" to 121.4737,
+        "provider" to "gps")
+    private fun stepCountRow(timestamp:Long,total:Float)=mapOf<String,Any?>(
+        "sensorTimestampNs" to timestamp*1_000_000,
+        "sdkTimestamp" to timestamp,
+        "STEP_COUNT_TOTAL" to total,
+        "accuracy" to 3,
+        "stepCountKind" to "PLATFORM_CUMULATIVE_COUNTER_SINCE_BOOT_NOT_RAW_MOTION")
     @Test fun spo2CalculationRowIsNotDisplayedAsSuccessfulResultAndTimeoutRemainsFailure() {
         val r=Rig(spo2=true)
         r.service.command("START_SPO2");r.queue.runReady()

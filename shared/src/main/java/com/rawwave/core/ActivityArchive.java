@@ -56,6 +56,12 @@ public final class ActivityArchive {
             && UUID.matcher(file.getName()).matches() && !isAcknowledged(activitiesRoot, file.getName()));
         return folders == null ? 0 : folders.length;
     }
+    /** Sessions left without seal.json after a process death/force-stop. */
+    public static int unsealedCount(File activitiesRoot) {
+        File[] folders = new File(activitiesRoot, "sessions").listFiles(file -> file.isDirectory()
+            && UUID.matcher(file.getName()).matches() && !new File(file, "seal.json").isFile());
+        return folders == null ? 0 : folders.length;
+    }
 
     public static void acknowledge(File activitiesRoot, File outgoing, Batch batch, long utcMs) throws IOException {
         Verified verified = verify(batch.file());
@@ -80,6 +86,7 @@ public final class ActivityArchive {
         Map<String, Map<String,Object>> actual = new TreeMap<>();
         byte[] bundleBytes = null;
         Map<String,byte[]> seals = new HashMap<>();
+        Map<String,byte[]> plans = new HashMap<>();
         long total = 0;
         try (ZipInputStream zip = new ZipInputStream(new FileInputStream(archive), StandardCharsets.UTF_8)) {
             ZipEntry entry;
@@ -89,7 +96,7 @@ public final class ActivityArchive {
                 if (entry.isDirectory() || actual.containsKey(name) || (bundleBytes != null && name.equals("bundle.json")))
                     throw new IOException("DUPLICATE_OR_DIRECTORY_ENTRY");
                 MessageDigest digest = digest();
-                boolean captureMetadata = name.equals("bundle.json") || name.endsWith("/seal.json");
+                boolean captureMetadata = name.equals("bundle.json") || name.endsWith("/seal.json") || name.endsWith("/plan.json");
                 ByteArrayOutputStream captured = captureMetadata ? new ByteArrayOutputStream() : null;
                 long bytes = 0; int count;
                 while ((count = zip.read(buffer)) != -1) {
@@ -106,6 +113,7 @@ public final class ActivityArchive {
                 else {
                     actual.put(name, Map.of("bytes", bytes, "sha256", hex(digest.digest())));
                     if (name.endsWith("/seal.json")) seals.put(name, captured.toByteArray());
+                    else if (name.endsWith("/plan.json")) plans.put(name, captured.toByteArray());
                 }
             }
         }
@@ -136,6 +144,7 @@ public final class ActivityArchive {
             if (!actual.containsKey("sessions/" + sessionId + "/plan.json")
                 || (sealed && !actual.containsKey("sessions/" + sessionId + "/seal.json")))
                 throw new IOException("ACTIVITY_SESSION_METADATA_MISSING");
+            verifyDeclaredSources(sessionId, plans.get("sessions/" + sessionId + "/plan.json"), actual);
             if (sealed) verifySealManifest(sessionId, seals.get("sessions/" + sessionId + "/seal.json"), actual);
             sessions.add(sessionId); allSealed &= sealed;
         }
@@ -259,12 +268,45 @@ public final class ActivityArchive {
         if (name.startsWith("/") || name.contains("\\") || name.contains(":")) throw new IOException("UNSAFE_ACTIVITY_ENTRY");
         String[] pieces = name.split("/", -1);
         if (pieces.length != 3 || !pieces[0].equals("sessions") || !UUID.matcher(pieces[1]).matches()
-            || !(pieces[2].equals("plan.json") || pieces[2].equals("seal.json") || isBlockName(pieces[2])))
+            || !(pieces[2].equals("plan.json") || pieces[2].equals("seal.json") || isBlockNamePattern(pieces[2])))
             throw new IOException("UNSAFE_ACTIVITY_ENTRY");
     }
     private static boolean isBlockName(String name) {
         var match = BLOCK.matcher(name);
         return match.matches() && SensorCatalog.acceptsStream(match.group(1));
+    }
+    /** Archive receive accepts a block shape from a newer watch; the plan must declare the source. */
+    private static boolean isBlockNamePattern(String name) {
+        return BLOCK.matcher(name).matches();
+    }
+    /**
+     * Forward-compatible receive: the phone may not know a newer watch source yet, but it still
+     * accepts the raw block when the session plan declares that source. Known sources remain
+     * accepted for legacy plans. Unknown, undeclared sources are rejected before storage.
+     */
+    private static void verifyDeclaredSources(String sessionId, byte[] planBytes,
+                                              Map<String,Map<String,Object>> actual) throws IOException {
+        if (planBytes == null) throw new IOException("ACTIVITY_PLAN_BYTES_MISSING:" + sessionId);
+        JsonObject plan;
+        try { plan = JsonParser.parseString(new String(planBytes, StandardCharsets.UTF_8)).getAsJsonObject(); }
+        catch (Exception error) { throw new IOException("INVALID_ACTIVITY_PLAN:" + sessionId, error); }
+        Set<String> declared = new HashSet<>();
+        JsonElement kinds = plan.get("dataKinds");
+        if (kinds != null && kinds.isJsonObject()) declared.addAll(kinds.getAsJsonObject().keySet());
+        JsonElement core = plan.get("coreSources");
+        if (core != null && core.isJsonArray()) for (JsonElement item : core.getAsJsonArray())
+            if (item.isJsonPrimitive()) declared.add(item.getAsString());
+        String prefix = "sessions/" + sessionId + "/";
+        for (String path : actual.keySet()) {
+            if (!path.startsWith(prefix)) continue;
+            String file = path.substring(prefix.length());
+            var match = BLOCK.matcher(file);
+            if (!match.matches()) continue;
+            String sensor = match.group(1);
+            if (sensor.equals(SensorCatalog.EVENT) || SensorCatalog.acceptsStream(sensor) || declared.contains(sensor))
+                continue;
+            throw new IOException("UNDECLARED_ACTIVITY_SENSOR:" + sessionId + ":" + sensor);
+        }
     }
     private static MessageDigest digest() {
         try { return MessageDigest.getInstance("SHA-256"); }

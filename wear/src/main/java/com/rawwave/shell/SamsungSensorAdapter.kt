@@ -62,6 +62,13 @@ class SamsungSensorAdapter internal constructor(
         cleanupEvidence("CONNECT_REQUEST", "ALL")
         backend.connect({
             cleanupEvidence("CONNECTION_SUCCESS", "ALL", "closed=$closed")
+            try {
+                evidence("SDK_CAPABILITY", backend.capability() + mapOf(
+                    "ownerId" to ownerId,
+                    "elapsedMs" to elapsed(),
+                    "implementationVersion" to implementationVersion(),
+                    "source" to "SamsungBackend.capability"))
+            } catch (_: Exception) {}
             dispatch { if (!closed) ready.run() }
         }, {
             // Record at callback entry, even when the serial owner is already closed.

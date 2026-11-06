@@ -71,14 +71,31 @@ public final class StreamQualityTracker {
         return switch(sensor) {
             case "MF_BIA" -> row.get("BODY_IMPEDANCE_MAGNITUDE_50K") instanceof Number;
             case "MAGNETIC_FIELD" -> row.get("MAGNETIC_FIELD_X") instanceof Number && row.get("MAGNETIC_FIELD_Y") instanceof Number && row.get("MAGNETIC_FIELD_Z") instanceof Number;
+            case "MAGNETIC_FIELD_UNCALIBRATED" -> row.get("MAGNETIC_FIELD_UNCALIBRATED_X") instanceof Number
+                && row.get("MAGNETIC_FIELD_UNCALIBRATED_Y") instanceof Number && row.get("MAGNETIC_FIELD_UNCALIBRATED_Z") instanceof Number;
+            case "LIGHT" -> row.get("LIGHT_LUX") instanceof Number;
+            case "GPS" -> row.get("GPS_LATITUDE") instanceof Number && row.get("GPS_LONGITUDE") instanceof Number;
+            case "STEP_COUNT" -> row.get("STEP_COUNT_TOTAL") instanceof Number;
+            case "STEP_DETECTOR" -> row.get("STEP_DETECTED") instanceof Number;
+            case "OFFBODY" -> row.get("OFF_BODY_STATE") instanceof Number;
             case "BIA" -> row.get("BODY_FAT_RATIO") instanceof Number && row.get("SKELETAL_MUSCLE_MASS") instanceof Number;
             case "PRESSURE" -> row.get("PRESSURE_HPA") instanceof Number;
             case "ECG" -> row.get("ECG_MV") instanceof Number;
             case "SPO2" -> row.get("SPO2") instanceof Number;
             case "GYROSCOPE" -> row.get("GYROSCOPE_X") instanceof Number && row.get("GYROSCOPE_Y") instanceof Number && row.get("GYROSCOPE_Z") instanceof Number;
+            case "GYROSCOPE_UNCALIBRATED" -> row.get("GYROSCOPE_UNCALIBRATED_X") instanceof Number
+                && row.get("GYROSCOPE_UNCALIBRATED_Y") instanceof Number && row.get("GYROSCOPE_UNCALIBRATED_Z") instanceof Number;
             case "HEART_RATE" -> row.get("HEART_RATE") instanceof Number;
             case "ACCELEROMETER" -> row.get("ACCELEROMETER_X") instanceof Number
                 && row.get("ACCELEROMETER_Y") instanceof Number && row.get("ACCELEROMETER_Z") instanceof Number;
+            case "ACCELEROMETER_UNCALIBRATED" -> row.get("ACCELEROMETER_UNCALIBRATED_X") instanceof Number
+                && row.get("ACCELEROMETER_UNCALIBRATED_Y") instanceof Number && row.get("ACCELEROMETER_UNCALIBRATED_Z") instanceof Number;
+            case "LINEAR_ACCELERATION" -> row.get("LINEAR_ACCELERATION_X") instanceof Number
+                && row.get("LINEAR_ACCELERATION_Y") instanceof Number && row.get("LINEAR_ACCELERATION_Z") instanceof Number;
+            case "GAME_ROTATION_VECTOR" -> row.get("GAME_ROTATION_VECTOR_X") instanceof Number
+                && row.get("GAME_ROTATION_VECTOR_Y") instanceof Number
+                && row.get("GAME_ROTATION_VECTOR_Z") instanceof Number
+                && row.get("GAME_ROTATION_VECTOR_W") instanceof Number;
             case "PPG", "PPG_ON_DEMAND" -> row.get("PPG_GREEN") instanceof Number && row.get("PPG_IR") instanceof Number
                 && row.get("PPG_RED") instanceof Number;
             case "SKIN_TEMPERATURE" -> row.get("OBJECT_TEMPERATURE") instanceof Number
@@ -91,11 +108,15 @@ public final class StreamQualityTracker {
         case "HEART_RATE" -> List.of("HEART_RATE_STATUS");
         case "PPG", "PPG_ON_DEMAND" -> List.of("GREEN_STATUS","IR_STATUS","RED_STATUS");
         case "MF_BIA", "BIA", "SKIN_TEMPERATURE", "EDA", "SPO2" -> List.of("STATUS");
-        case "MAGNETIC_FIELD", "PRESSURE", "GYROSCOPE" -> List.of("accuracy");
+        case "MAGNETIC_FIELD", "MAGNETIC_FIELD_UNCALIBRATED", "PRESSURE", "GYROSCOPE", "GYROSCOPE_UNCALIBRATED", "LIGHT", "STEP_COUNT", "STEP_DETECTOR", "OFFBODY" -> List.of("accuracy");
+        case "GPS" -> List.of("provider");
         default -> List.of();
     }; }
     private long gapThresholdMs(){return switch(sensor){
-        case "ECG"->100; case "ACCELEROMETER", "PPG", "PPG_ON_DEMAND"->200; default->5_000;
+        case "ECG"->100; case "ACCELEROMETER", "PPG", "PPG_ON_DEMAND", "GYROSCOPE_UNCALIBRATED"->200;
+        // On-change event sources: quiet periods while stationary are expected, not missing steps.
+        case "STEP_COUNT", "STEP_DETECTOR", "OFFBODY"->60_000;
+        default->5_000;
     };}
     private static Object nullableTime(long value){return value==Long.MIN_VALUE?null:value;}
 }

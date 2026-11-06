@@ -11,6 +11,7 @@ import java.util.*;
 /** Low-rate operational evidence only. Never use this rotating log for health samples. */
 public final class Journal {
     public static final int MAX_LOG_BYTES = 262144;
+    public static final int MAX_OBSERVATION_BYTES = 65536;
     private final File directory;
     private final Gson gson = new Gson();
     private final String runId = UUID.randomUUID().toString();
@@ -39,15 +40,7 @@ public final class Journal {
     }
 
     public synchronized void event(String kind, Map<String, ?> details) throws IOException {
-        Map<String, Object> event = new LinkedHashMap<>();
-        event.put("schemaVersion", 1);
-        event.put("processRunId", runId);
-        event.put("deviceRole", role);
-        event.put("eventSeq", ++sequence);
-        event.put("utc", Instant.now().toString());
-        event.put("monotonicNanos", System.nanoTime());
-        event.put("event", kind);
-        event.put("details", details);
+        Map<String, Object> event = baseEvent(kind, details);
         byte[] data = (gson.toJson(event) + "\n").getBytes(StandardCharsets.UTF_8);
         if (data.length > MAX_LOG_BYTES / 2) throw new IOException("EVENT_TOO_LARGE");
         File current = new File(directory, "events.jsonl");
@@ -61,6 +54,40 @@ public final class Journal {
             out.write(data);
             out.getFD().sync();
         }
+    }
+
+    /**
+     * User-visible problem reports are kept separately from the rotating operational event log.
+     * They contain IDs, timestamps, fixed symptom codes and bounded metadata, never health samples.
+     */
+    public synchronized void observation(String kind, Map<String, ?> details) throws IOException {
+        Map<String, Object> event = baseEvent(kind, details);
+        byte[] data = (gson.toJson(event) + "\n").getBytes(StandardCharsets.UTF_8);
+        if (data.length > MAX_OBSERVATION_BYTES / 2) throw new IOException("OBSERVATION_TOO_LARGE");
+        File current = new File(directory, "diagnostic-observations.jsonl");
+        if (current.length() + data.length > MAX_OBSERVATION_BYTES) {
+            Files.move(current.toPath(), new File(directory, "diagnostic-observations.previous.jsonl").toPath(),
+                StandardCopyOption.REPLACE_EXISTING);
+            durableReplace(new File(directory, "observation-rotation.json"), gson.toJson(Map.of(
+                "lastRotationUtc", Instant.now().toString(), "historicalEvidenceMayBeMissing", true)));
+        }
+        try (FileOutputStream out = new FileOutputStream(current, true)) {
+            out.write(data);
+            out.getFD().sync();
+        }
+    }
+
+    private Map<String, Object> baseEvent(String kind, Map<String, ?> details) {
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("schemaVersion", 1);
+        event.put("processRunId", runId);
+        event.put("deviceRole", role);
+        event.put("eventSeq", ++sequence);
+        event.put("utc", Instant.now().toString());
+        event.put("monotonicNanos", System.nanoTime());
+        event.put("event", kind);
+        event.put("details", details);
+        return event;
     }
 
     public synchronized void fault(String kind, Throwable error) throws IOException {
@@ -86,7 +113,8 @@ public final class Journal {
     public synchronized Map<String, byte[]> snapshot() throws IOException {
         Map<String, byte[]> files = new TreeMap<>();
         for (String name : List.of("events.jsonl", "events.previous.jsonl", "process.json",
-                "previous-process.json", "rotation.json", "first-fault.json", "last-fault.json", "sensor-sdk-logcat.txt", "sensor-sdk-logcat.previous.txt")) {
+                "previous-process.json", "rotation.json", "first-fault.json", "last-fault.json", "sensor-sdk-logcat.txt", "sensor-sdk-logcat.previous.txt",
+                "diagnostic-observations.jsonl", "diagnostic-observations.previous.jsonl", "observation-rotation.json")) {
             File file = new File(directory, name);
             if (file.isFile()) files.put(role + "/" + name, Files.readAllBytes(file.toPath()));
         }

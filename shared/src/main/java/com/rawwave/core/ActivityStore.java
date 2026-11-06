@@ -16,10 +16,14 @@ public final class ActivityStore {
         this.root = root; this.directorySync = directorySync;
         Files.createDirectories(root.toPath());
     }
-    public record Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia, boolean ppg) {
+    public record Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia, boolean ppg, boolean biaBoth) {
         public Template {
             Objects.requireNonNull(id); Objects.requireNonNull(name);
             coreSources = SensorCatalog.normalizeCoreSources(coreSources);
+        }
+        /** Source-compatible constructor for templates written before the two-BIA-mode option existed. */
+        public Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia, boolean ppg) {
+            this(id, name, ecg, coreSources, spo2, biaProfile, mfBia, ppg, false);
         }
         /** Source-compatible constructor for templates written before the PPG short measurement existed. */
         public Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia) {
@@ -56,12 +60,15 @@ public final class ActivityStore {
         return createTemplate(name, ecg, coreSources, spo2, profile, mfBia, false);
     }
     public Template createTemplate(String name, boolean ecg, Collection<String> coreSources, boolean spo2, BiaProfile profile, boolean mfBia, boolean ppg) throws IOException {
+        return createTemplate(name,ecg,coreSources,spo2,profile,mfBia,ppg,false);
+    }
+    public Template createTemplate(String name, boolean ecg, Collection<String> coreSources, boolean spo2, BiaProfile profile, boolean mfBia, boolean ppg, boolean biaBoth) throws IOException {
         name = name.trim();
         if (name.isEmpty() || name.length() > 40) throw new IOException("活动名称需要1至40个字");
         final List<String> normalized;
         try { normalized = SensorCatalog.normalizeCoreSources(coreSources); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage(),e); }
-        Template t = new Template(UUID.randomUUID().toString(), name, ecg, normalized, spo2, profile, mfBia, ppg);
+        Template t = new Template(UUID.randomUUID().toString(), name, ecg, normalized, spo2, profile, mfBia, ppg, biaBoth);
         File folder = new File(root,"templates"); Files.createDirectories(folder.toPath());
         write(new File(folder,t.id()+".json"),t); return t;
     }
@@ -78,12 +85,15 @@ public final class ActivityStore {
         return updateTemplate(id, name, ecg, sources, spo2, profile, mfBia, false);
     }
     public synchronized Template updateTemplate(String id,String name,boolean ecg,Collection<String> sources,boolean spo2,BiaProfile profile,boolean mfBia,boolean ppg) throws IOException {
+        return updateTemplate(id,name,ecg,sources,spo2,profile,mfBia,ppg,false);
+    }
+    public synchronized Template updateTemplate(String id,String name,boolean ecg,Collection<String> sources,boolean spo2,BiaProfile profile,boolean mfBia,boolean ppg,boolean biaBoth) throws IOException {
         if (id == null || !id.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))
             throw new IOException("INVALID_TEMPLATE_ID");
         name = name.trim();
         if (name.isEmpty() || name.length() > 40) throw new IOException("活动名称需要1至40个字");
         final Template updated;
-        try { updated = new Template(id, name, ecg, SensorCatalog.normalizeCoreSources(sources), spo2, profile, mfBia, ppg); }
+        try { updated = new Template(id, name, ecg, SensorCatalog.normalizeCoreSources(sources), spo2, profile, mfBia, ppg, biaBoth); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage(), e); }
         File folder = new File(root,"templates"), target = new File(folder,id+".json");
         if (!target.isFile()) throw new IOException("活动已不存在，请返回重新选择");
@@ -110,7 +120,7 @@ public final class ActivityStore {
             result.add(new Template(object.get("id").getAsString(), object.get("name").getAsString(),
                 object.get("ecg").getAsBoolean(), coreSources, object.has("spo2") && object.get("spo2").getAsBoolean(),
                 object.has("biaProfile") ? JSON.fromJson(object.get("biaProfile"), BiaProfile.class) : null, object.has("mfBia") && object.get("mfBia").getAsBoolean(),
-                object.has("ppg") && object.get("ppg").getAsBoolean()));
+                object.has("ppg") && object.get("ppg").getAsBoolean(), object.has("biaBoth") && object.get("biaBoth").getAsBoolean()));
         }
         result.sort(Comparator.comparing(Template::name)); return result;
     }
@@ -184,16 +194,36 @@ public final class ActivityStore {
             plan.put("schema",5); plan.put("sessionId",id); plan.put("template",t);
             plan.put("createdUtcMs",utc); plan.put("createdElapsedMs",elapsed);
             plan.put("coreSources",t.coreSources());
-            plan.put("source","Samsung Health Sensor SDK 1.4.1; GYROSCOPE, PRESSURE and MAGNETIC_FIELD use Android SensorManager");
+            plan.put("source","Samsung Health Sensor SDK 1.4.1; GYROSCOPE, GYROSCOPE_UNCALIBRATED, PRESSURE, MAGNETIC_FIELD, MAGNETIC_FIELD_UNCALIBRATED, LIGHT, STEP_COUNT, STEP_DETECTOR and OFFBODY use Android SensorManager; GPS uses Android LocationManager and is platform location, not raw GNSS measurements");
             Map<String,String> kinds = new LinkedHashMap<>();
             if (t.ecg()) kinds.put(SensorCatalog.ECG,SensorCatalog.dataKind(SensorCatalog.ECG));
-            if (t.bia()) { String body=t.mfBia()?"MF_BIA":"BIA"; kinds.put(body,SensorCatalog.dataKind(body)); }
+            if (t.bia()) {
+                if (t.biaBoth()) {
+                    kinds.put(SensorCatalog.BIA,SensorCatalog.dataKind(SensorCatalog.BIA));
+                    kinds.put(SensorCatalog.MF_BIA,SensorCatalog.dataKind(SensorCatalog.MF_BIA));
+                } else {
+                    String body=t.mfBia()?"MF_BIA":"BIA";
+                    kinds.put(body,SensorCatalog.dataKind(body));
+                }
+            }
             if (t.spo2()) kinds.put(SensorCatalog.SPO2,SensorCatalog.dataKind(SensorCatalog.SPO2));
             if (t.ppg()) kinds.put(SensorCatalog.PPG_ON_DEMAND,SensorCatalog.dataKind(SensorCatalog.PPG_ON_DEMAND));
             for (String sensor : t.coreSources()) kinds.put(sensor,SensorCatalog.dataKind(sensor));
             plan.put("dataKinds",kinds);
             plan.put("rawPolicy","SDK values copied without filtering, interpolation, invented samples or unit conversion; quality metadata is separate");
-            plan.put("sampleTime","Samsung SDK timestamp milliseconds retained; Android platform original sensorTimestampNs retained with separately derived sdkTimestamp milliseconds; receipt clocks and captureCallback fields are separate metadata");
+            plan.put("sampleTime","Samsung SDK timestamp milliseconds retained; Android platform original sensorTimestampNs retained with separately derived sdkTimestamp milliseconds; GPS Location.getElapsedRealtimeNanos and Location.getTime UTC retained; receipt clocks and captureCallback fields are separate metadata");
+            if (t.coreSources().contains(SensorCatalog.GPS)) plan.put("gpsPolicy",
+                "LocationManager GPS_PROVIDER platform fixes only; not raw GNSS measurements; no filtering, interpolation, smoothing, invented points or road snapping; provider-disabled, permission and start failures are explicit; no delivered tail is provable after stop because LocationManager has no flush API; Location.extras and GNSS measurements are not captured");
+            if (t.coreSources().contains(SensorCatalog.STEP_COUNT)) plan.put("stepCountPolicy",
+                "TYPE_STEP_COUNTER cumulative platform counter since boot; callbacks occur only when the platform counter changes, so long gaps while stationary are expected and are not missing samples or zero steps; original float value and sensorTimestampNs retained; platform counter, not raw motion and not a per-step event stream; no filtering, interpolation, invented steps or step inference");
+            if (t.coreSources().contains(SensorCatalog.STEP_DETECTOR)) plan.put("stepDetectorPolicy",
+                "TYPE_STEP_DETECTOR per-step event; each callback is one platform-detected step (raw value normally 1.0), with original sensorTimestampNs and accuracy; event stream, not raw motion waveform; sparse callbacks while stationary are expected and are not missing steps; no filtering, interpolation, invented steps, cadence or gait inference");
+            if (t.coreSources().contains(SensorCatalog.OFFBODY)) plan.put("offBodyPolicy",
+                "TYPE_LOW_LATENCY_OFFBODY_DETECT platform on-body/off-body state; raw value normally 1.0 on-body and 0.0 off-body, with original sensorTimestampNs and accuracy; state events, not raw optical or skin data; sparse callbacks while state is unchanged are expected; no filtering or inference");
+            if (t.coreSources().contains(SensorCatalog.GYROSCOPE_UNCALIBRATED)) plan.put("gyroscopeUncalibratedPolicy",
+                "TYPE_GYROSCOPE_UNCALIBRATED uncalibrated angular velocity XYZ rad/s plus platform estimated bias XYZ rad/s; original sensorTimestampNs and accuracy retained; platform uncalibrated values, not app bias estimation; no filtering, calibration or unit conversion");
+            if (t.coreSources().contains(SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED)) plan.put("magneticFieldUncalibratedPolicy",
+                "TYPE_MAGNETIC_FIELD_UNCALIBRATED uncalibrated magnetic field XYZ microtesla plus platform hard-iron bias XYZ microtesla; original sensorTimestampNs and accuracy retained; platform uncalibrated values, not app calibration; no filtering or unit conversion");
             plan.put("durability","Periodic immutable blocks; uncommitted memory and .part tail may be lost on power failure");
             write(new File(folder,"plan.json"),plan);
             directorySync.sync(folder.getParentFile());
