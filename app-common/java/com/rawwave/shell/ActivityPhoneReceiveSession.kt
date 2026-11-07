@@ -20,6 +20,7 @@ class ActivityPhoneReceiveSession(private val app: ProbeApplication,private val 
     private var trigger=ActivitySyncPolicy.UNKNOWN
     private var finished=false
     private var idleHeld=false
+    private var expectedBytes=0L
     fun start() {
         try {
             val hello=JSONObject(String(bytes,Charsets.UTF_8))
@@ -27,6 +28,7 @@ class ActivityPhoneReceiveSession(private val app: ProbeApplication,private val 
             trigger=ActivitySyncPolicy.normalize(hello.optString("trigger",ActivitySyncPolicy.UNKNOWN))
             val window=hello.getString("senderWindow")
             val archiveBytes=hello.getLong("bytes")
+            expectedBytes=archiveBytes
             ActivityTransferFiles.validate(window,hello.getString("hash"),archiveBytes)
             ActivityTransferFiles.validate(hello.getString("id"),hello.getString("hash"),archiveBytes)
             when(SyncAdmission.activityArrival(app.activeSyncOwner != null,app.preemptDiagnosticReceive != null)) {
@@ -98,6 +100,10 @@ class ActivityPhoneReceiveSession(private val app: ProbeApplication,private val 
             try { app.activityIdleRelease?.invoke() } catch (_: Exception) {}
         }
         if(ownsStatus && reason == "SUCCESS" && ActivitySyncPolicy.exitAfterSuccessfulSync(trigger)) app.syncFinished?.invoke(reason)
+        try { app.journal?.event("ACTIVITY_PHONE_RECEIVE_RESULT",mapOf(
+            "success" to (reason == "SUCCESS"),"reason" to reason,"owner" to (token ?: ""),
+            "trigger" to trigger,"bytesExpected" to expectedBytes,"text" to text.take(300),
+            "uiExitRequested" to (ownsStatus && reason == "SUCCESS" && ActivitySyncPolicy.exitAfterSuccessfulSync(trigger)))) } catch (_: Exception) {}
         try { app.journal?.event("ACTIVITY_PHONE_WAKE_FINISHED",mapOf("reason" to reason,"owner" to (token ?: ""),"trigger" to trigger,"uiExitRequested" to (ownsStatus && reason == "SUCCESS" && ActivitySyncPolicy.exitAfterSuccessfulSync(trigger)),"automaticRetry" to false)); if(ownsStatus && app.activeSyncOwner == null) app.journal?.mark("CLEANUP_REQUESTED") } catch (_: Exception) {}
         owner=null
     }

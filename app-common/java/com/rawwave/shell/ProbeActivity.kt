@@ -12,6 +12,14 @@ import com.rawwave.core.ReportExporter
 import com.rawwave.core.RunDeadlines
 import com.rawwave.core.WorkBudget
 import com.rawwave.core.SyncStopScope
+import com.rawwave.designsystem.RwBodyText
+import com.rawwave.designsystem.RwCard
+import com.rawwave.designsystem.RwDialogs
+import com.rawwave.designsystem.RwGradientTitle
+import com.rawwave.designsystem.RwPrimaryButton
+import com.rawwave.designsystem.RwScreen
+import com.rawwave.designsystem.RwSecondaryButton
+import com.rawwave.designsystem.RwTheme
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -22,25 +30,34 @@ class ProbeActivity : ComponentActivity() {
     private val app get() = application as ProbeApplication
     private lateinit var status: TextView
     private lateinit var powerNote: TextView
+    private lateinit var receivedSummary: TextView
+    private lateinit var batteryState: TextView
+    private var summaryOperation = 0L
     private var working = false
     private var exiting = false
     private var operation = 0L
     private var transfer: TransferWindow? = null
     private var guard: SyncGuardService.Lease? = null
     private var background = false
-    private var exportChoiceDialog: android.app.AlertDialog? = null
     private val ownerToken = java.util.UUID.randomUUID().toString()
     private val diagnosticPreempt: () -> Unit = { preemptDiagnosticForActivity() }
     private val syncObserver: (String) -> Unit = { reason ->
         if (!exiting && !working) exitNow("BACKGROUND_SYNC_$reason", force = true)
     }
     private val activitySyncObserver: (ProbeApplication.ActivitySyncStatus) -> Unit = { sync ->
-        if (!exiting && ::status.isInitialized) status.text = sync.text
-        if (sync.running) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (!exiting && ::status.isInitialized) {
+            status.text = when {
+                sync.running -> "正在同步：${sync.text}"
+                sync.text.isNotBlank() -> "上次同步：${sync.text}"
+                else -> currentSyncText()
+            }
+        }
+        // The bounded lease owns a CPU wake lock; receiving must not depend on this page being lit.
+        window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (!exiting && transfer == null) {
             if (sync.running) holdIdleForActivitySync() else releaseIdleForActivitySync()
         }
+        if (!exiting && !sync.running && sync.success) refreshReceivedSummary()
     }
     private val activityIdleHold: () -> Boolean = { holdIdleForActivitySync() }
     private val activityIdleRelease: () -> Boolean = { releaseIdleForActivitySync() }
@@ -58,46 +75,431 @@ class ProbeActivity : ComponentActivity() {
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
         val watch = BuildConfig.DEVICE_ROLE == "watch"
-        val scroll = ScrollView(this).apply { setBackgroundColor(Color.BLACK); isFillViewport = true }
-        val body = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            val inset = if (watch) (resources.displayMetrics.widthPixels * .17f).toInt() else dp(24)
-            setPadding(inset, dp(if (watch) 64 else 32), inset, dp(if (watch) 72 else 32))
-        }
-        fun label(text: String, size: Float): TextView = TextView(this).apply {
-            this.text = text; textSize = size; setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER; setPadding(0, dp(8), 0, dp(8))
-        }.also { body.addView(it) }
-        label("原波 · RawWave", if (watch) 20f else 28f)
-        label((if (watch) "问题报告工具" else "手机数据中心") + "\n${BuildConfig.VERSION_NAME}\n${BuildConfig.BUILD_RUN}", 13f)
-        label(if (watch) "问题报告与活动数据分开传输。此页面不传活动原始数据。" else "手表会自动唤醒手机接收活动数据。\n同步完成立即停止；失败后手表会自动重试一次。\n活动原始数据与问题报告分开保存。", 15f)
-        status = label(initialStatus(), 15f)
-        powerNote = label("", 13f)
-        fun button(title: String, action: () -> Unit) {
-            body.addView(Button(this).apply {
-                text = title; isAllCaps = false; textSize = 15f; minHeight = dp(52)
-                setOnClickListener { if (!exiting && runtime.check("BUTTON")) action() }
-            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        }
-        if (!watch) button("导出活动原始数据") { exportActivityData() }
-        if (!watch) button("导出最近3次活动（一个压缩包）") { exportActivityData(recent = true) }
-        button("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
-        button("记录问题现场") { recordDiagnosticCapture() }
-        button("导出问题报告") { exportReport() }
-        button(if (watch) "发送报告到手机" else "仅接收问题报告（不接收活动数据）") { startTransfer() }
-        button("后台同步设置") {
-            if (!working && app.activeSyncOwner == null) {
-                try { startActivity(android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
-                catch (error: Exception) { status.text = "请在系统应用设置中查看原波的电池/后台限制。当前设备没有提供此设置入口。" }
-            }
-        }
-        button("退出（停止所有工作）") { exitNow("USER_EXIT") }
-        scroll.addView(body)
-        setContentView(scroll)
+        if (watch) buildWatchConsole() else buildPhoneHome()
         record("ACTIVITY_CREATED", mapOf("screenRound" to resources.configuration.isScreenRound))
         try { app.journal?.mark("RUNNING") } catch (error: Exception) { showError(error) }
         scheduleIdle()
+    }
+
+    /** Watch-side problem-report console; same green language, still separate from activity capture. */
+    private fun buildWatchConsole() {
+        val colors = RwTheme.colors(this)
+        window.statusBarColor = colors.background
+        window.navigationBarColor = colors.background
+        val inset = (resources.displayMetrics.widthPixels * .15f).toInt()
+        val scroll = ScrollView(this).apply { setBackgroundColor(colors.background); isFillViewport = true }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(inset, dp(36), inset, dp(56))
+        }
+        body.addView(RwGradientTitle(this).apply {
+            text = "RawWave"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 24f)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(4), 0, dp(2))
+        })
+        body.addView(RwBodyText(this).apply {
+            text = "问题报告工具\n${BuildConfig.VERSION_NAME}\n${BuildConfig.BUILD_RUN}"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER
+            setTextColor(colors.onSurfaceVariant)
+            setPadding(0, 0, 0, dp(6))
+        })
+        body.addView(RwBodyText(this).apply {
+            text = "问题报告与活动数据分开传输。此页面不传活动原始数据。"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
+            setTextColor(colors.onSurface)
+            setPadding(0, dp(2), 0, dp(4))
+        })
+        status = RwBodyText(this).apply {
+            text = initialStatus()
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
+            setTextColor(colors.onSurface)
+            setPadding(0, dp(6), 0, dp(4))
+        }
+        body.addView(status)
+        powerNote = RwBodyText(this).apply {
+            text = ""
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER
+            setTextColor(colors.onSurfaceVariant)
+            setPadding(0, 0, 0, dp(4))
+        }
+        body.addView(powerNote)
+        fun action(title: String, primary: Boolean = false, run: () -> Unit) {
+            val view = if (primary) RwPrimaryButton(this) else RwSecondaryButton(this)
+            view.text = title
+            view.setOnClickListener { if (!exiting && runtime.check("BUTTON")) run() }
+            body.addView(view, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(6) })
+        }
+        action("发送报告到手机", primary = true) { startTransfer() }
+        action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
+        action("记录问题现场") { recordDiagnosticCapture() }
+        action("导出问题报告") { exportReport() }
+        action("后台运行设置") { openBackgroundSettings() }
+        action("退出（停止所有工作）") { exitNow("USER_EXIT") }
+        scroll.addView(body)
+        setContentView(scroll)
+    }
+
+    /** Consumer phone home: four jobs, no developer menu on the first screen. */
+    private fun buildPhoneHome() {
+        val colors = RwTheme.colors(this)
+        window.statusBarColor = colors.background
+        window.navigationBarColor = colors.background
+        val lightFlags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.decorView.systemUiVisibility = if (RwTheme.isDark(this)) {
+            window.decorView.systemUiVisibility and lightFlags.inv()
+        } else {
+            window.decorView.systemUiVisibility or lightFlags
+        }
+        val screen = RwScreen(this)
+        val content = screen.content
+
+        content.addView(
+            RwGradientTitle(this).apply {
+                text = "RawWave"
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 36f)
+            },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        content.addView(
+            phoneText("手表数据 · 手机端", 14f, colors.onSurfaceVariant),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(2)
+            },
+        )
+
+        val dataCard = RwCard(this)
+        dataCard.addView(
+            phoneText("活动原始数据", 18f, colors.onSurface, medium = true),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        status = RwBodyText(this).apply {
+            text = currentSyncText()
+            setPadding(0, dp(6), 0, 0)
+        }
+        dataCard.addView(
+            status,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        powerNote = RwBodyText(this).apply {
+            text = ""
+            setPadding(0, dp(4), 0, 0)
+        }
+        dataCard.addView(
+            powerNote,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        receivedSummary = RwBodyText(this).apply {
+            text = "正在读取已接收活动…"
+            setPadding(0, dp(6), 0, 0)
+        }
+        dataCard.addView(
+            receivedSummary,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        dataCard.addView(
+            phoneText("同步由手表发起；手表首页可手动同步/重试。", 12f, colors.onSurfaceVariant).apply {
+                setPadding(0, dp(6), 0, 0)
+            },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        dataCard.addView(
+            RwPrimaryButton(this).apply {
+                text = "导出原始活动数据"
+                setOnClickListener { openActivityExport() }
+            },
+            phoneButtonParams(12),
+        )
+        dataCard.addView(
+            RwSecondaryButton(this).apply {
+                text = "刷新接收状态"
+                setOnClickListener { refreshReceivedSummary() }
+            },
+            phoneButtonParams(8, compact = true),
+        )
+        content.addView(dataCard, cardParams(16))
+
+        val officialCard = RwCard(this)
+        officialCard.addView(
+            phoneText("Samsung Health 官方数据", 18f, colors.onSurface, medium = true),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        officialCard.addView(
+            phoneText("仅读取官方允许的健康记录，按你的逻辑日界线导出。", 14f, colors.onSurfaceVariant).apply {
+                setPadding(0, dp(6), 0, 0)
+            },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        officialCard.addView(
+            RwSecondaryButton(this).apply {
+                text = "导出官方健康数据"
+                setOnClickListener { openOfficialExport() }
+            },
+            phoneButtonParams(12, compact = true),
+        )
+        content.addView(officialCard, cardParams(12))
+
+        val reportCard = RwCard(this)
+        reportCard.addView(
+            phoneText("问题报告", 18f, colors.onSurface, medium = true),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        reportCard.addView(
+            phoneText("问题报告与活动原始数据分开保存、分开传输。", 14f, colors.onSurfaceVariant).apply {
+                setPadding(0, dp(6), 0, 0)
+            },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        reportCard.addView(
+            RwPrimaryButton(this).apply {
+                text = "导出问题报告"
+                setOnClickListener { exportReport() }
+            },
+            phoneButtonParams(12),
+        )
+        reportCard.addView(
+            RwSecondaryButton(this).apply {
+                text = "诊断 / 记录问题现场"
+                setOnClickListener { showReportTools() }
+            },
+            phoneButtonParams(8, compact = true),
+        )
+        content.addView(reportCard, cardParams(12))
+
+        val backgroundCard = RwCard(this)
+        backgroundCard.addView(
+            phoneText("后台运行", 18f, colors.onSurface, medium = true),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        batteryState = RwBodyText(this).apply {
+            text = batteryStateText()
+            setPadding(0, dp(6), 0, 0)
+        }
+        backgroundCard.addView(
+            batteryState,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        backgroundCard.addView(
+            RwSecondaryButton(this).apply {
+                text = "允许后台一直运行"
+                setOnClickListener { requestBatteryExemption() }
+            },
+            phoneButtonParams(10, compact = true),
+        )
+        content.addView(backgroundCard, cardParams(12))
+
+        content.addView(
+            RwSecondaryButton(this).apply {
+                text = "退出软件"
+                setOnClickListener { exitNow("USER_EXIT") }
+            },
+            phoneButtonParams(20, compact = true),
+        )
+        content.addView(
+            phoneText(
+                "RawWave 仍会在本轮工作结束后自行退出；后台权限只用于熄屏时完成数据接收。",
+                12f,
+                colors.onSurfaceVariant,
+            ),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(12)
+            },
+        )
+        setContentView(screen)
+        refreshReceivedSummary()
+        updateBatteryState()
+    }
+
+    private fun cardParams(top: Int) = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+    ).apply { topMargin = dp(top) }
+
+    private fun currentSyncText(): String {
+        val sync = app.activitySyncStatus
+        return when {
+            sync.running -> "正在同步：${sync.text}"
+            sync.text.isNotBlank() -> "上次同步：${sync.text}"
+            else -> "等待手表发送活动数据。"
+        }
+    }
+
+    private fun phoneText(text: String, size: Float, color: Int, medium: Boolean = false): TextView =
+        TextView(this).apply {
+            this.text = text
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, size)
+            setTextColor(color)
+            typeface = if (medium && size >= 18f) RwTheme.displayTypeface() else RwTheme.boldTypeface()
+            setLineSpacing(dp(2).toFloat(), 1f)
+        }
+
+    private fun phoneButtonParams(top: Int, compact: Boolean = false): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(top) }
+
+    private fun openActivityExport() {
+        if (working || app.activeSyncOwner != null) {
+            status.text = "正在处理其他任务，完成后打开原始活动导出。"
+            return
+        }
+        try {
+            startActivity(android.content.Intent().setClassName(
+                this,
+                "com.rawwave.mobile.activity.ActivityExportActivity",
+            ))
+        } catch (error: Exception) {
+            status.text = "无法打开原始活动导出：${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private fun openOfficialExport() {
+        if (working || app.activeSyncOwner != null) {
+            status.text = "正在处理其他任务，完成后打开官方健康数据导出。"
+            return
+        }
+        try {
+            startActivity(android.content.Intent().setClassName(
+                this,
+                "com.rawwave.mobile.samsunghealth.SamsungHealthExportActivity",
+            ))
+        } catch (error: Exception) {
+            status.text = "无法打开官方健康数据导出：${error.javaClass.simpleName}: ${error.message}"
+        }
+    }
+
+    private fun refreshReceivedSummary() {
+        if (!::receivedSummary.isInitialized || working || exiting) return
+        val op = ++summaryOperation
+        receivedSummary.text = "正在读取已接收活动…"
+        if (worker.isShutdown) worker = Executors.newSingleThreadExecutor()
+        worker.execute {
+            val text = try {
+                val exporter = ActivityDataExporter(
+                    File(filesDir, "activity-inbox"),
+                    DownloadsExportDestination(contentResolver),
+                ) { folder ->
+                    val fd = android.system.Os.open(folder.absolutePath, android.system.OsConstants.O_RDONLY, 0)
+                    try { android.system.Os.fsync(fd) } finally { android.system.Os.close(fd) }
+                }
+                val sessions = exporter.sessionChoices()
+                if (sessions.isEmpty()) {
+                    "还没有收到活动数据。\n在手表结束活动后，保持两台设备靠近即可自动同步。"
+                } else {
+                    val latest = sessions.maxByOrNull { it.createdUtcMs() }
+                    val bytes = sessions.map { it.fileBytes() }.distinct().sum()
+                    val time = latest?.let {
+                        java.time.Instant.ofEpochMilli(it.createdUtcMs())
+                            .atZone(java.time.ZoneId.systemDefault())
+                            .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+                    } ?: "时间未知"
+                    "已接收 ${sessions.size} 次活动\n最近：$time\n原始包约 ${"%.1f".format(bytes / 1024.0 / 1024.0)} MB"
+                }
+            } catch (_: ActivityDataExporter.NoDataException) {
+                "还没有收到活动数据。\n在手表结束活动后，保持两台设备靠近即可自动同步。"
+            } catch (failure: Exception) {
+                "读取活动失败：${failure.javaClass.simpleName}: ${failure.message}"
+            }
+            main.post {
+                if (!exiting && op == summaryOperation && ::receivedSummary.isInitialized) {
+                    receivedSummary.text = text
+                }
+            }
+        }
+    }
+
+    private fun openBackgroundSettings() {
+        try {
+            startActivity(android.content.Intent(
+                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.parse("package:$packageName"),
+            ))
+        } catch (_: Exception) {
+            status.text = "当前设备没有提供应用设置入口，请在系统设置中查看原波的后台限制。"
+        }
+    }
+
+    private fun batteryStateText(): String {
+        val exempt = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        return if (exempt) {
+            "已允许不受限制。熄屏后仍可完成本轮数据接收。"
+        } else {
+            "未允许。手机熄屏后系统可能暂停接收；大包同步需要更长时间。"
+        }
+    }
+
+    private fun updateBatteryState() {
+        if (::batteryState.isInitialized) batteryState.text = batteryStateText()
+        if (::powerNote.isInitialized) {
+            val exempt = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+            powerNote.text = if (exempt) "后台运行：已允许" else "后台运行：未允许（只影响熄屏接收）"
+        }
+    }
+
+    private fun requestBatteryExemption() {
+        val exempt = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        if (exempt) {
+            RwDialogs.message(this, "后台运行", "原波已经允许不受电池优化限制。\n本轮工作结束后仍会自行退出。")
+            return
+        }
+        RwDialogs.confirm(
+            this,
+            "允许后台运行",
+            "为保证手机熄屏时仍能接收手表的大活动包，请允许原波不受电池优化限制。\n\n原波只在同步期间保活，完成后会自行退出。",
+            confirmLabel = "去设置",
+            cancelLabel = "稍后",
+        ) {
+            try {
+                startActivity(android.content.Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:$packageName"),
+                ))
+            } catch (_: Exception) {
+                try {
+                    startActivity(android.content.Intent(
+                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        android.net.Uri.parse("package:$packageName"),
+                    ))
+                } catch (_: Exception) {
+                    status.text = "当前设备没有提供后台运行设置入口，请在系统应用设置中查看原波。"
+                }
+            }
+        }
+    }
+
+    private fun showAbout() {
+        RwDialogs.message(
+            this,
+            "关于 RawWave",
+            "版本 ${BuildConfig.VERSION_NAME}\n\n" +
+                "RawWave 只读取、保存和导出数据，不会写回 Samsung Health，也不会修改手表原始记录。",
+            confirmLabel = "知道了",
+        )
+    }
+
+    private fun showReportTools() {
+        RwDialogs.actions(
+            this,
+            "问题报告",
+            "问题报告与活动原始数据分开保存、分开传输",
+            listOf(
+                RwDialogs.Action("导出问题报告", primary = true) { exportReport() },
+                RwDialogs.Action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) },
+                RwDialogs.Action("记录问题现场") { recordDiagnosticCapture() },
+                RwDialogs.Action("仅接收问题报告（不接收活动数据）") { startTransfer() },
+                RwDialogs.Action("关于与版本") { showAbout() },
+            ),
+            cancelLabel = "关闭",
+        )
     }
 
     private fun recordDiagnosticCapture() {
@@ -111,16 +513,17 @@ class ProbeActivity : ComponentActivity() {
         )
         val keys = symptoms.keys.toList()
         val labels = symptoms.values.toTypedArray()
-        val checked = BooleanArray(labels.size)
-        android.app.AlertDialog.Builder(this)
-            .setTitle("记录问题现场（可多选）")
-            .setMultiChoiceItems(labels, checked) { _, index, value -> checked[index] = value }
-            .setPositiveButton("保存") { _, _ ->
-                val selected = keys.filterIndexed { index, _ -> checked[index] }
-                saveDiagnosticCapture(selected)
-            }
-            .setNegativeButton("取消", null)
-            .show()
+        RwDialogs.checklist(
+            this,
+            "记录问题现场",
+            "可多选；保存后会写进问题报告",
+            labels,
+            BooleanArray(labels.size),
+            confirmLabel = "保存",
+        ) { checked ->
+            val selected = keys.filterIndexed { index, _ -> checked[index] }
+            saveDiagnosticCapture(selected)
+        }
     }
 
     private fun saveDiagnosticCapture(selected: List<String>) {
@@ -301,69 +704,6 @@ class ProbeActivity : ComponentActivity() {
         return true
     }
 
-    private fun exportActivityData(selected: List<String>? = null, recent: Boolean = false) {
-        if (working || exiting) return
-        if (app.activeSyncOwner != null) { status.text = "正在接收手表数据；完成后再导出。"; return }
-        app.activeSyncOwner = ownerToken; working = true; val owner = ++operation
-        status.text = if(recent) "正在按开始时间导出最近3次活动…" else if (selected == null) "正在读取活动列表，请稍候…" else "正在校验并导出所选 ${selected.size} 个数据包…"
-        if (worker.isShutdown) worker = Executors.newSingleThreadExecutor()
-        worker.execute {
-            try {
-                val exporter = ActivityDataExporter(File(filesDir, "activity-inbox"), DownloadsExportDestination(contentResolver)) { folder ->
-                    val fd=android.system.Os.open(folder.absolutePath,android.system.OsConstants.O_RDONLY,0)
-                    try { android.system.Os.fsync(fd) } finally { android.system.Os.close(fd) }
-                }
-                if (selected == null && !recent) {
-                    val choices = exporter.choices()
-                    val rejected = exporter.rejectedFiles()
-                    if (rejected.isNotEmpty()) app.journal?.event("ACTIVITY_EXPORT_REJECTED", mapOf("files" to rejected))
-                    main.post { if (owner == operation && !exiting) {
-                        status.text = if (rejected.isEmpty()) "请选择要导出的活动。" else "${rejected.size} 个异常包已隔离保留；可选择其余活动。"
-                        if (choices.isNotEmpty()) {
-                            val checked = BooleanArray(choices.size) { it == 0 }
-                            val labels = choices.map { choice ->
-                                choice.displayName().removePrefix("RawWave-activities-").removeSuffix("-${choice.file()}")
-                                    .replace('_', ' ') + "\n${choice.sessions()} 次活动 · ${choice.file().take(8)}"
-                            }.toTypedArray()
-                            val dialog = android.app.AlertDialog.Builder(this)
-                                .setTitle("选择导出（最新在前）")
-                                .setMultiChoiceItems(labels, checked) { _, index, value -> checked[index] = value; scheduleIdle() }
-                                .setPositiveButton("导出所选") { _, _ ->
-                                    val files = choices.filterIndexed { index, _ -> checked[index] }.map { it.file() }
-                                    if (files.isEmpty()) status.text = "未选择活动，没有导出。" else exportActivityData(files)
-                                }
-                                .setNegativeButton("取消", null).create()
-                            exportChoiceDialog = dialog
-                            dialog.setOnDismissListener { exportChoiceDialog = null; scheduleIdle() }
-                            dialog.show()
-                        } else status.text = "没有可导出的有效数据包。"
-                    } }
-                    return@execute
-                }
-                val results = if(recent) exporter.exportRecent(3) else exporter.exportSelected(selected)
-                val rejected = exporter.rejectedFiles()
-                if (rejected.isNotEmpty()) app.journal?.event("ACTIVITY_EXPORT_REJECTED", mapOf("files" to rejected,"count" to rejected.size))
-                app.journal?.event("ACTIVITY_EXPORT_VERIFIED", mapOf("packages" to results.size,
-                    "sessions" to results.sumOf { it.sessions().size }, "bytes" to results.sumOf { it.bytes() }))
-                main.post { if (owner == operation && !exiting) {
-                    status.text = (if (results.isEmpty()) "没有可导出的有效数据包。" else "导出完成并已回读校验：\nDownloads/RawWave\n共 ${results.sumOf { it.sessions().size }} 次活动，${results.size} 个原始数据包。") +
-                        if (rejected.isNotEmpty()) "\n${rejected.size} 个异常包已隔离保留，请导出问题报告；它们未算作成功导出。" else ""
-                } }
-            } catch (empty: ActivityDataExporter.NoDataException) {
-                try { app.journal?.event("ACTIVITY_EXPORT_EMPTY", mapOf("message" to empty.message.orEmpty())) } catch (_: Exception) {}
-                main.post { if (owner == operation && !exiting) status.text = "手机还没有收到活动原始数据。\n请先完成一次活动；活动结束后手表会自动发送，不需要在手机点接收。" }
-            } catch (failure: Exception) {
-                try { app.journal?.fault("ACTIVITY_EXPORT_FAILED", failure) } catch (_: Exception) {}
-                main.post { if (owner == operation && !exiting) showError(failure) }
-            } finally {
-                main.post { if (owner == operation && !exiting) {
-                    working = false; if (app.activeSyncOwner == ownerToken) app.activeSyncOwner = null
-                    scheduleIdle(); if (background) parkIdle()
-                } }
-            }
-        }
-    }
-
     private fun exportReport() {
         if (working || exiting) return
         if (app.activeSyncOwner != null) { status.text = "正在同步；完成后再导出报告。"; return }
@@ -388,13 +728,30 @@ class ProbeActivity : ComponentActivity() {
             try {
                 val report = exporter.export(owner)
                 main.post {
-                    if (owner == operation && !exiting && runtime.check("EXPORT_RESULT")) status.text = "已保存并回读校验：\nDownloads/RawWave/${report.file().name}\n含本机日志及已收到且校验通过的最近 ${report.includedWatchReports()} 份手表包。旧附件不代表本轮成功。前台空闲80秒收尾；空闲后台不保活。"
+                    if (owner == operation && !exiting && runtime.check("EXPORT_RESULT")) {
+                        status.text = "已保存并回读校验：\nDownload/RawWave/${report.file().name}"
+                        RwDialogs.message(
+                            this,
+                            "问题报告已保存",
+                            "已保存到：\nDownload/RawWave/${report.file().name}\n\n" +
+                                "含本机日志及已收到且校验通过的最近 ${report.includedWatchReports()} 份手表包。\n" +
+                                "已回读校验；旧附件不代表本轮成功。",
+                            confirmLabel = "知道了",
+                        )
+                    }
                 }
             } catch (failure: Exception) {
                 main.post { if (owner == operation && !exiting && runtime.check("EXPORT_FAILURE")) {
                     showError(failure)
-                    if (failure is ReportExporter.Failure && failure.published)
-                        status.append("\n注意：已校验的导出文件已发布并保留；失败发生在后续诊断记录。")
+                    RwDialogs.message(
+                        this,
+                        "问题报告导出失败",
+                        "没有报告成功。\n${failure.javaClass.simpleName}: ${failure.message}\n\n" +
+                            if (failure is ReportExporter.Failure && failure.published)
+                                "注意：已校验的导出文件已发布并保留；失败发生在后续诊断记录。"
+                            else "本机日志仍保留，可稍后重试。",
+                        confirmLabel = "知道了",
+                    )
                 } }
             } finally {
                 main.post { if (owner == operation && !exiting) {
@@ -441,8 +798,6 @@ class ProbeActivity : ComponentActivity() {
         finishAndRemoveTask()
     }
     override fun onDestroy() {
-        exportChoiceDialog?.setOnDismissListener(null)
-        exportChoiceDialog?.dismiss(); exportChoiceDialog = null
         if (isFinishing && !exiting) exitNow("ACTIVITY_FINISHED", force = true)
         ++operation
         runtime.close()
@@ -468,11 +823,11 @@ class ProbeActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         background = false
-        if (::powerNote.isInitialized) {
-            val exempt = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
-            powerNote.text = if (exempt) "系统电池优化例外：已允许。仍只在本轮同步期间保活。"
-                else "系统仍有限制：后台接收或息屏计时可能受影响。可在“后台同步设置”中允许原波；空闲不会保活。"
-        }
+        // Re-register after a preview/other screen temporarily owned the observer. Without this,
+        // returning to the data console would leave its status frozen.
+        if (!exiting) app.activitySyncObserver = activitySyncObserver
+        updateBatteryState()
+        if (!exiting && !working) refreshReceivedSummary()
         // Background time counts toward the same absolute 80-second idle deadline.
         // Returning is not itself a user interaction and cannot renew that deadline.
         if (!exiting && transfer == null && !working) {

@@ -13,7 +13,8 @@ public final class DiagnosticSummary {
     private DiagnosticSummary() {}
     public static byte[] create(Map<String, byte[]> snapshot, String build) {
         List<String> pages = DiagnosticFeedback.pages(snapshot, "watch");
-        String text = "有限摘要；不证明健康数据已同步；完整日志留在手表。\n";
+        String text = "有限摘要；不证明健康数据已同步；完整日志留在手表。\n" +
+            "同步结论：" + DiagnosticFeedback.syncConclusion(snapshot, "watch") + "\n";
         // Latest entered events before old process/fault files; do not imply old fault is current.
         for (int i=1; i<pages.size(); i++) text += pages.get(i) + "\n---\n";
         JsonObject o = new JsonObject();

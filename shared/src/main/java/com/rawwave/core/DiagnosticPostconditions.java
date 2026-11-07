@@ -21,6 +21,8 @@ public final class DiagnosticPostconditions {
         String sessionEnd = "", sessionEndUtc = "", persistence = "", persistenceUtc = "";
         Boolean syncSuccess = null;
         String syncText = "", syncUtc = "";
+        Boolean phoneSyncSuccess = null;
+        String phoneSyncText = "";
         for (JsonObject event : read.events) {
             String name = DiagnosticEvents.eventName(event);
             JsonObject details = DiagnosticEvents.details(event);
@@ -52,6 +54,14 @@ public final class DiagnosticPostconditions {
                 if (details.has("success")) syncSuccess = details.get("success").getAsBoolean();
                 syncText = DiagnosticEvents.text(details, "text");
                 syncUtc = DiagnosticEvents.text(event, "utc");
+            }
+            if ("ACTIVITY_PHONE_RECEIVE_RESULT".equals(name)) {
+                if (details.has("success")) phoneSyncSuccess = details.get("success").getAsBoolean();
+                String reason = DiagnosticEvents.text(details, "reason");
+                String text = DiagnosticEvents.text(details, "text");
+                String bytes = details.has("bytesExpected") ? details.get("bytesExpected").getAsString() : "";
+                phoneSyncText = "reason=" + reason + "; bytesExpected=" + bytes
+                    + (text.isEmpty() ? "" : "; " + text);
             }
         }
         CleanupLedger selected = ledgers.values().stream()
@@ -125,6 +135,10 @@ public final class DiagnosticPostconditions {
             checks.add(check("diagnostic_journal", persistence.isEmpty() ? "UNKNOWN" : "PASS", "CAPTURE_PERSISTENCE_SUMMARY",
                 persistence.isEmpty() ? "No persistence summary in the retained journal." : bounded(persistence, 320)));
         }
+        if (phoneSyncSuccess == null) checks.add(check("phone_sync_result", "NOT_APPLICABLE",
+            "ACTIVITY_PHONE_RECEIVE_RESULT", "No phone-side receive result in the retained journal."));
+        else checks.add(check("phone_sync_result", phoneSyncSuccess ? "PASS" : "FAIL",
+            "ACTIVITY_PHONE_RECEIVE_RESULT", bounded(phoneSyncText, 320)));
         boolean syncNear = selected == null || near(selected.lastUtc, syncUtc);
         if (syncSuccess == null) checks.add(check("sync_result", "NOT_APPLICABLE", "ACTIVITY_WATCH_SYNC_FINISHED", "No activity sync result in the retained journal."));
         else if (!syncNear) checks.add(check("sync_result", "UNKNOWN", "ACTIVITY_WATCH_SYNC_FINISHED",

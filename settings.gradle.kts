@@ -4,4 +4,4 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "RawWave"
-include(":shared", ":wear", ":mobile")
+include(":shared", ":wear", ":mobile", ":designsystem")

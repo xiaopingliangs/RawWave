@@ -36,9 +36,10 @@ class ActivityRecordingService : Service() {
             val skipAllowed: Boolean = false, val failedAttempts: Int = 0, val shortSensor: String = "ECG",
             val biaMode: String = "", val biaHasNext: Boolean = false, val biaContact: Boolean = false,
             val biaRetrying: Boolean = false, val biaAttempt: Int = 0, val biaProgress: Int = -1,
-            val biaHint: String = "")
+            val biaHint: String = "", val coreElapsedSeconds: Long = 0L)
         @Volatile var state = State(); private set
         var observer: ((State) -> Unit)? = null // main thread; removed on Activity stop
+        var successObserver: ((String, String) -> Unit)? = null // main thread; short measurement success
         var idleExitObserver: (() -> Unit)? = null // main thread; retained only until Activity destroy
         fun store(context: Context) = ActivityStore(File(context.filesDir, "activities")) { dir ->
             val fd = Os.open(dir.path, OsConstants.O_RDONLY, 0)
@@ -99,6 +100,8 @@ class ActivityRecordingService : Service() {
     private var coreSources = SensorCatalog.defaultCoreSources()
     private var deadline = 0L
     private var sessionStartedMs = 0L
+    private var coreStartedMs = 0L
+    private var coreEndedMs = 0L
     @Volatile private var coreDataObserved = false
     internal var terminalReason = ""; private set
     private var stopping = false
@@ -290,6 +293,8 @@ class ActivityRecordingService : Service() {
         biaModeIndex = 0
         bodySource = biaModes.firstOrNull() ?: "BIA"
         sessionStartedMs = clock()
+        coreStartedMs = 0L
+        coreEndedMs = 0L
         event("CAPTURE_START", "build=${BuildConfig.BUILD_RUN}; template=${template.id()}")
         phase = "CONNECTING"; deadline = clock() + 20_000
         adapter = SensorPort.requireCompatible(sensors)
@@ -317,6 +322,7 @@ class ActivityRecordingService : Service() {
                 }
                 when (action) {
                     "END" -> if (phase == "CORE-1") {
+                        if (coreEndedMs == 0L) coreEndedMs = clock()
                         event("USER_ENDED_CORE", "Post measurements follow the template, not a new choice")
                         // Keep the continuous PPG tracker alive through post ECG. Samsung's
                         // post-ECG HRM start re-enables the shared 25 Hz stream; stopping PPG
@@ -407,6 +413,8 @@ class ActivityRecordingService : Service() {
     }
     private fun beginCore() {
         shortSensor = ""; shortBudgetStartMs = 0L
+        if (coreStartedMs == 0L) coreStartedMs = clock()
+        coreEndedMs = 0L
         phase = "CORE-1"; notice = ""; coreDataObserved = false
         // If the user starts an activity and is then interrupted before any raw row arrives,
         // end the session and exit instead of holding the watch awake indefinitely.
@@ -474,7 +482,7 @@ class ActivityRecordingService : Service() {
         drainSources {
             biaResults[biaPhase]=if(success) "成功：$biaSummary" else "未成功，未取得完整有效结果"
             event("BIA_MEASUREMENT_SAVED","success=$success; reason=$reason; pre=$biaPre; mode=$bodySource; attempt=$biaAttempt; progress=$biaProgress")
-            if(success) { biaRetrying=false; biaHint=""; afterBia() } else if(isBiaRetryable(reason) && clock() < biaContactStartMs + SHORT_BUDGET_MS) {
+            if(success) { biaRetrying=false; biaHint=""; publishSuccess("体成分", biaSummary); afterBia() } else if(isBiaRetryable(reason) && clock() < biaContactStartMs + SHORT_BUDGET_MS) {
                 biaContactDetected=false
                 biaRetrying=true
                 biaHint=biaRetryHint(reason)
@@ -552,7 +560,7 @@ class ActivityRecordingService : Service() {
         drainSources {
             spo2Results[spo2Phase] = if(success) "成功 ${spo2Value}%" else "未成功，未取得有效结果"
             event("SPO2_MEASUREMENT_SAVED", "success=$success; reason=$reason; pre=$spo2Pre; value=$spo2Value")
-            if(success) afterSpo2() else {
+            if(success) { publishSuccess("血氧", spo2Value?.let { "$it%" } ?: "已成功"); afterSpo2() } else {
                 phase = if(spo2Pre) "REVIEW_SPO2_PRE" else "REVIEW_SPO2_POST"
                 val explanation = when(reason) {
                     "SDK_STATUS_-4" -> "检测到移动，请重新调整并保持静止"
@@ -594,7 +602,7 @@ class ActivityRecordingService : Service() {
         drainSources {
             ppgResults[ppgPhase] = if(success) "已采集 $ppgRows 条原始记录" else "未采集到原始记录"
             event("PPG_MEASUREMENT_SAVED", "success=$success; reason=$reason; pre=$ppgPre; rawRows=$ppgRows")
-            if(success) afterPpg() else {
+            if(success) { publishSuccess("PPG", "已采集 $ppgRows 条原始记录"); afterPpg() } else {
                 phase = if(ppgPre) "REVIEW_PPG_PRE" else "REVIEW_PPG_POST"
                 notice = "PPG 未取得原始记录（$reason）。已有数据已保存，可重测或跳过；80秒不操作则退出。"
                 deadline = clock() + 80_000; holdDecisionWindow(); restartTick()
@@ -798,9 +806,13 @@ class ActivityRecordingService : Service() {
         } else {
             if (update != null && ecgTotalRows > update.continuousSamples())
                 event("ECG_RAW_INCLUDES_INVALID_SEGMENTS", "rawRows=$ecgTotalRows; acceptedContinuousSamples=${update.continuousSamples()}; all rows retained")
+            publishSuccess("ECG", "已取得连续 30 秒记录")
             if (!wasPre) continueAfterPostEcg { beginPostShorts() }
             else if (next == CapturePhasePolicy.Next.CORE) beginCore() else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
         }
+    }
+    private fun publishSuccess(kind: String, text: String) {
+        main.post { successObserver?.invoke(kind, text.ifBlank { "已成功" }) }
     }
     private fun retryPolicy(pre: Boolean) = if (pre) preRetryPolicy else postRetryPolicy
     private fun skipEcg() {
@@ -1015,6 +1027,11 @@ class ActivityRecordingService : Service() {
         val postLedHint = if (phase.contains("POST"))
             "\n活动后短测仍在进行，传感器灯亮着是正常的。短测结束后会停止采集；若灯仍长时间亮着，请发送问题报告。"
             else ""
+        val coreElapsedSeconds = when {
+            coreStartedMs <= 0L -> 0L
+            coreEndedMs > 0L -> ((coreEndedMs - coreStartedMs).coerceAtLeast(0L)) / 1000L
+            else -> ((clock() - coreStartedMs).coerceAtLeast(0L)) / 1000L
+        }
         val next = State(true, if (draining != null) "DRAINING" else phase,
             if (draining != null) "正在收尾并保存各传感器数据，请稍候（最多5秒收尾等待）\n$count"
             else "$title\n$notice$idleHint$postLedHint" + (if(shortSensor == "BIA" || shortSensor == "SPO2" || shortSensor == "PPG_ON_DEMAND" || placementWaiting()) "\n${when { shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") && biaRetrying -> "测量中断，正在重试"; shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") -> "等待双指接触"; shortSensor == "BIA" && !phase.startsWith("REVIEW_") -> "测量中，请保持接触"; placementWaiting() || phase.startsWith("REVIEW_") -> "等待操作 $remaining 秒"; else -> "最多等待 $remaining 秒" }}" else "") +
@@ -1023,7 +1040,7 @@ class ActivityRecordingService : Service() {
             policy.skipAllowed(), policy.failures(), shortSensor,
             if(shortSensor == "BIA") biaModeLabel() else "", biaModeIndex + 1 < biaModes.size, biaContactDetected,
             biaRetrying && shortSensor == "BIA" && phase.startsWith("WAIT_BIA_"), biaAttempt, biaProgress,
-            if(shortSensor == "BIA") biaHint else "")
+            if(shortSensor == "BIA") biaHint else "", coreElapsedSeconds)
         state = next; main.post { observer?.invoke(next) }
     }
     private fun countText(): String {

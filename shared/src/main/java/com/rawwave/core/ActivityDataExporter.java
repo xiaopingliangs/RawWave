@@ -16,43 +16,80 @@ public final class ActivityDataExporter {
     }
     public record Result(String name, long bytes, String sha256, List<String> sessions) {}
     public record Choice(String file, String displayName, int sessions) {}
+    /** One activity session with its real start time; transport packages may contain several. */
+    public record SessionChoice(String id, long createdUtcMs, String file, boolean sealed, long fileBytes) {}
     /** Select individual sessions, not transport packages: old multi-session packages are supported. */
     public List<Result> exportRecent(int limit) throws IOException {
         if(limit < 1 || limit > 3) throw new IllegalArgumentException("RECENT_LIMIT");
+        var chosen=sessionChoices().stream().limit(limit).toList();
+        if(chosen.isEmpty()) throw new IOException("没有开始时间可确认的活动，请使用选择导出");
+        return exportSessionChoices(chosen);
+    }
+
+    /**
+     * Lists every sealed or unsealed session with a real start time. The list never publishes
+     * an export; it is safe for date selection and for showing "received N activities".
+     */
+    public List<SessionChoice> sessionChoices() throws IOException {
         rejected.clear();
-        Map<String,Recent> sessions = new HashMap<>();
+        Map<String,SessionChoice> sessions = new LinkedHashMap<>();
         for(File file:sources()) {
             var verified=verifyOrIsolate(file); if(verified==null) continue;
             try(var zip=new java.util.zip.ZipFile(file)) {
                 for(String id:verified.sessionIds()) {
                     var entry=zip.getEntry("sessions/"+id+"/plan.json");
-                    if(entry.getSize()>65536) throw new IOException("RECENT_PLAN_TOO_LARGE");
+                    if(entry==null || entry.getSize()>65536) continue;
                     long time;
                     try(var in=zip.getInputStream(entry); var reader=new InputStreamReader(in,java.nio.charset.StandardCharsets.UTF_8)) {
-                        time=com.google.gson.JsonParser.parseReader(reader).getAsJsonObject().get("createdUtcMs").getAsLong();
-                    }
+                        var value=com.google.gson.JsonParser.parseReader(reader).getAsJsonObject().get("createdUtcMs");
+                        if(value==null || value.isJsonNull()) continue;
+                        time=value.getAsLong();
+                    } catch(RuntimeException malformed) { continue; }
                     if(time<=0) continue; // Unknown start times cannot claim to be the latest.
                     boolean sealed=zip.getEntry("sessions/"+id+"/seal.json")!=null;
                     var prior=sessions.get(id);
-                    if(prior==null || (!prior.sealed() && sealed)) sessions.put(id,new Recent(id,time,file,sealed));
+                    if(prior==null || (!prior.sealed() && sealed)) sessions.put(id,
+                        new SessionChoice(id,time,file.getName(),sealed,file.length()));
                 }
             }
         }
-        var chosen=sessions.values().stream().sorted(Comparator.comparingLong(Recent::time).reversed()
-            .thenComparing(Recent::id)).limit(limit).toList();
-        if(chosen.isEmpty()) throw new IOException("没有开始时间可确认的活动，请使用选择导出");
-        java.nio.file.Path scratch=java.nio.file.Files.createTempDirectory(inbox.toPath(),"recent-export-");
+        var list=new ArrayList<>(sessions.values());
+        list.sort(Comparator.comparingLong(SessionChoice::createdUtcMs).reversed()
+            .thenComparing(SessionChoice::id));
+        return List.copyOf(list);
+    }
+
+    /** Export exactly the chosen session ids into one new verified archive. */
+    public List<Result> exportSessions(Collection<String> ids) throws IOException {
+        if(ids==null || ids.isEmpty()) return List.of();
+        Set<String> selected=new LinkedHashSet<>();
+        for(String id:ids) {
+            if(id==null || !id.matches("[0-9a-f-]{36}")) throw new IOException("INVALID_SESSION_SELECTION");
+            selected.add(id);
+        }
+        var chosen=sessionChoices().stream().filter(item -> selected.contains(item.id())).toList();
+        if(chosen.size()!=selected.size()) throw new IOException("EXPORT_SESSION_MISSING");
+        return exportSessionChoices(chosen);
+    }
+
+    private List<Result> exportSessionChoices(List<SessionChoice> chosen) throws IOException {
+        java.nio.file.Path scratch=java.nio.file.Files.createTempDirectory(inbox.toPath(),"session-export-");
         try {
             List<File> folders=new ArrayList<>();
             for(var item:chosen) {
-                File folder=new File(scratch.toFile(),item.id());java.nio.file.Files.createDirectories(folder.toPath());folders.add(folder);
-                try(var zip=new java.util.zip.ZipFile(item.file())) {
+                File folder=new File(scratch.toFile(),item.id());
+                java.nio.file.Files.createDirectories(folder.toPath());folders.add(folder);
+                try(var zip=new java.util.zip.ZipFile(new File(inbox,item.file()))) {
                     String prefix="sessions/"+item.id()+"/";
+                    boolean found=false;
                     for(var entry:Collections.list(zip.entries())) if(entry.getName().startsWith(prefix)) {
                         String name=entry.getName().substring(prefix.length());
+                        if(name.isEmpty()) continue;
                         if(name.contains("/") || name.contains("\\") || name.equals("..")) throw new IOException("UNSAFE_RECENT_ENTRY");
+                        found=true;
                         try(var in=zip.getInputStream(entry)) {java.nio.file.Files.copy(in,new File(folder,name).toPath());}
                     }
+                    if(!found) throw new IOException("EXPORT_SESSION_MISSING:"+item.id());
                 }
             }
             String id=UUID.randomUUID().toString();File output=new File(scratch.toFile(),id+".zip");
@@ -64,7 +101,6 @@ public final class ActivityDataExporter {
             }
         }
     }
-    private record Recent(String id,long time,File file,boolean sealed) {}
     /** Listing never publishes a Downloads copy. Old multi-session packages remain intact. */
     public List<Choice> choices() throws IOException {
         rejected.clear();

@@ -66,6 +66,59 @@ public final class DiagnosticFeedback {
         out.append("RUNNING只表示最后记录仍在运行，不等于已证明崩溃。\nCRASH_OBSERVED仅表示应用捕获到崩溃；无标记不能排除系统终止。");
         return bounded(out.toString(), 2300);
     }
+    /**
+     * One-line sync truth for the first screen and the 4 KB watch summary. This scans all
+     * retained events, not just the last 40, so an omitted old success/failure is still visible.
+     */
+    public static String syncConclusion(Map<String, byte[]> snapshot, String role) {
+        String latest = "";
+        String latestUtc = "";
+        int latestPriority = 0;
+        for (String name : List.of("events.previous.jsonl", "events.jsonl")) {
+            byte[] bytes = snapshot.get(role + "/" + name);
+            if (bytes == null) continue;
+            for (String line : new String(bytes, StandardCharsets.UTF_8).split("\n")) {
+                if (line.isBlank()) continue;
+                try {
+                    JsonElement parsed = STRICT.fromJson(line, JsonElement.class);
+                    if (parsed == null || !parsed.isJsonObject()) continue;
+                    JsonObject e = parsed.getAsJsonObject();
+                    String kind = value(e.get("event"));
+                    if (!("ACTIVITY_WATCH_SYNC_FINISHED".equals(kind)
+                        || "ACTIVITY_PHONE_RECEIVE_RESULT".equals(kind)
+                        || "ACTIVITY_PHONE_WAKE_FINISHED".equals(kind))) continue;
+                    JsonObject d = e.has("details") && e.get("details").isJsonObject()
+                        ? e.getAsJsonObject("details") : new JsonObject();
+                    String utc = value(e.get("utc"));
+                    int priority = "ACTIVITY_PHONE_WAKE_FINISHED".equals(kind) ? 1 : 2;
+                    if (utc.compareTo(latestUtc) < 0) continue;
+                    if (utc.equals(latestUtc) && priority < latestPriority) continue;
+                    latestUtc = utc;
+                    latestPriority = priority;
+                    boolean ok = d.has("success") && d.get("success").getAsBoolean();
+                    String reason = shortValue(d, "reason", 80);
+                    String text = shortValue(d, "text", 220);
+                    String bytesExpected = d.has("bytesExpected") && !d.get("bytesExpected").isJsonNull()
+                        ? d.get("bytesExpected").getAsString() : "";
+                    StringBuilder lineOut = new StringBuilder();
+                    if ("ACTIVITY_PHONE_RECEIVE_RESULT".equals(kind))
+                        lineOut.append("手机接收").append(ok ? "成功" : "失败");
+                    else if ("ACTIVITY_WATCH_SYNC_FINISHED".equals(kind))
+                        lineOut.append("手表同步").append(ok ? "成功" : "失败");
+                    else
+                        lineOut.append("手机接收结束：").append(reason);
+                    if (!bytesExpected.isEmpty()) lineOut.append("；").append(bytesExpected).append(" 字节");
+                    if (!reason.isEmpty() && !"ACTIVITY_PHONE_WAKE_FINISHED".equals(kind))
+                        lineOut.append("；").append(reason);
+                    if (!text.isEmpty()) lineOut.append("；").append(text);
+                    lineOut.append("；UTC ").append(utc);
+                    latest = bounded(lineOut.toString(), 420);
+                } catch (RuntimeException ignored) {}
+            }
+        }
+        return latest.isEmpty() ? "未观察到同步结果" : latest;
+    }
+
     /** Five-photo default: the viewer prepends its version page to these four evidence pages. */
     public static List<String> quickPages(Map<String, byte[]> snapshot, String role) {
         List<String> latestWindow = new ArrayList<>(), latestCapture = new ArrayList<>(), latestDiagnostic = new ArrayList<>(), latestObservation = new ArrayList<>();
@@ -109,7 +162,7 @@ public final class DiagnosticFeedback {
                 JsonElement raw = e.get("details");
                 JsonObject d = raw != null && raw.isJsonObject() ? raw.getAsJsonObject() : new JsonObject();
                 String compact = kind + "\nUTC " + value(e.get("utc"));
-                for (String key : List.of("transferId","success","trigger","lastStage","error","text","detail","reason","remainingMs")) {
+                for (String key : List.of("transferId","success","trigger","lastStage","error","text","detail","reason","remainingMs","bytesExpected","bytesCommitted")) {
                     String v = shortValue(d,key,key.equals("text") || key.equals("detail") ? 180 : 72);
                     if (!v.isEmpty()) compact += "\n" + key + ": " + v;
                 }
@@ -129,7 +182,8 @@ public final class DiagnosticFeedback {
                     String session = shortValue(d,"session",13);
                     if (!session.isEmpty()) latestCaptureSession = session;
                 }
-                if (kind.equals("ACTIVITY_WATCH_SYNC_FINISHED")) latestActivityResult = compact;
+                if (kind.equals("ACTIVITY_WATCH_SYNC_FINISHED") || kind.equals("ACTIVITY_PHONE_RECEIVE_RESULT"))
+                    latestActivityResult = compact;
                 if (kind.startsWith("DIAGNOSTIC_SUMMARY_")) {
                     latestDiagnostic.add(compact);
                     if (latestDiagnostic.size() > 5) latestDiagnostic.remove(0);

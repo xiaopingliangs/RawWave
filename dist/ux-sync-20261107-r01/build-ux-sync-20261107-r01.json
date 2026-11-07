@@ -1,0 +1,14 @@
+{
+  "buildRun": "ux-sync-20261107-r01",
+  "versionCode": 86,
+  "versionName": "0.12.12-step",
+  "mobileApk": "Phone_RawWave_0.12.12-step_ux-sync-20261107-r01.apk",
+  "mobileBytes": 8065832,
+  "mobileSha256": "D6698EF912D45808A66F9843C8C7087450DD7F60BF832472DF0B3872EC8DFC5B",
+  "wearApk": "Watch_RawWave_0.12.12-step_ux-sync-20261107-r01.apk",
+  "wearBytes": 7018912,
+  "wearSha256": "C1EA12424CF84FAC23229AF68B4426E2C5E70BAACA200FE16B7EA4D311513840",
+  "builtUtc": "2026-11-07T11:13:12.701Z",
+  "note": "Sync truth + manual sync + date export + background permission + auto-height + radial green buttons + measurement success UI",
+  "deliveryFolder": "D:\\RawWave-APK"
+}

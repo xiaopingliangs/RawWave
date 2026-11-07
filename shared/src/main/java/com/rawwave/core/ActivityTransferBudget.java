@@ -11,7 +11,8 @@ package com.rawwave.core;
  *
  * <p>Handshake, send and commit have separate sub-budgets so a stuck handshake cannot consume
  * the whole transfer time. A stalled file write is aborted after {@link #STALL_MS}. This is a
- * safety ceiling, not a promise of throughput.</p>
+ * safety ceiling, not a promise of throughput. The transfer is driven by a foreground service
+ * and CPU wake lock, not by the screen being on.</p>
  */
 public final class ActivityTransferBudget {
     private ActivityTransferBudget() {}
@@ -28,11 +29,12 @@ public final class ActivityTransferBudget {
     public static final long MIN_RATE_BYTES_PER_SECOND = 32L * 1024L;
     /** Minimum estimated send time; the initial window supplies the rest for tiny archives. */
     public static final long BASE_TRANSFER_MS = 10_000L;
-    public static final long MAX_TRANSFER_MS = 15L * 60_000L;
+    /** Large 30-minute activities get a real chance on a slow link; the foreground lease is longer. */
+    public static final long MAX_TRANSFER_MS = 25L * 60_000L;
     /** Cleanup margin after the work deadline; the lease is a last-resort, not a second attempt. */
     public static final long LEASE_MARGIN_MS = 5_000L;
     /** Last-resort foreground-service ceiling for the watch, including packaging and cleanup. */
-    public static final long WATCH_LEASE_MS = 20L * 60_000L;
+    public static final long WATCH_LEASE_MS = 35L * 60_000L;
 
     public static long transferMs(long bytes) {
         if (bytes <= 0L || bytes > ActivityTransferFiles.MAX_BYTES)

@@ -1,4 +1,6 @@
-plugins { id("com.android.application") }
+plugins {
+    id("com.android.application")
+}
 android {
     namespace = "com.rawwave.shell"
     compileSdk = 36
@@ -6,14 +8,16 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 79
-        versionName = "0.12.5-step"
+        versionCode = 86
+        versionName = "0.12.12-step"
         buildConfigField("String", "DEVICE_ROLE", "\"watch\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))
         buildConfigField("String", "BUILD_RUN", "\"" + runId + "\"")
     }
-    buildFeatures { buildConfig = true }
+    buildFeatures {
+        buildConfig = true
+    }
     testOptions { unitTests.isReturnDefaultValues = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     sourceSets.getByName("main") {
@@ -34,6 +38,7 @@ dependencies {
     testImplementation("org.json:json:20240303")
     implementation(files("libs/samsung-health-sensor-api-1.4.1.aar"))
     implementation(project(":shared"))
+    implementation(project(":designsystem"))
     implementation("androidx.activity:activity:1.9.3")
     implementation("com.google.android.gms:play-services-wearable:19.0.0")
 }

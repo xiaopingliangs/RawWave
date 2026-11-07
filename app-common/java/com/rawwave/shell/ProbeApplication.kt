@@ -61,6 +61,7 @@ class ProbeApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        com.rawwave.designsystem.RwTheme.forceDark = BuildConfig.DEVICE_ROLE == "watch"
         try {
             journal = Journal(File(filesDir, "diagnostics"), BuildConfig.DEVICE_ROLE)
             journal?.event("BUILD", mapOf("version" to BuildConfig.VERSION_NAME,

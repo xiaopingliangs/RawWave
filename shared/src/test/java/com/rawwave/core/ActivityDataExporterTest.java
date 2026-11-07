@@ -137,6 +137,30 @@ public class ActivityDataExporterTest {
             }
         }
     }
+    @Test public void sessionChoicesExposeDatesAndDateSelectionExportsOnlyChosenSessions() throws Exception {
+        File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
+        var store=new ActivityStore(root,dir->{});List<ActivityStore.Session> sessions=new ArrayList<>();
+        for(int i=0;i<2;i++) {
+            var session=store.start(store.createTemplate("session "+i,false,List.of("GYROSCOPE"),true),
+                1000L+i*86_400_000L,1);
+            session.append("CORE-1","GYROSCOPE",List.of(Map.of("GYROSCOPE_X",0.1*i,"sensorTimestampNs",1234567L)));
+            session.seal("DONE",2000L+i*86_400_000L);sessions.add(session);
+        }
+        var batch=ActivityArchive.preparePending(root,out);
+        Files.copy(batch.file().toPath(),new File(inbox,batch.file().getName()).toPath());
+        var exporter=new ActivityDataExporter(inbox,new FolderDestination(visible),dir->{});
+        var choices=exporter.sessionChoices();
+        assertEquals(2,choices.size());
+        assertEquals(sessions.get(1).id,choices.get(0).id());
+        assertTrue(choices.get(0).createdUtcMs()>choices.get(1).createdUtcMs());
+        assertTrue(choices.get(0).fileBytes()>0);
+        var results=exporter.exportSessions(List.of(sessions.get(0).id));
+        assertEquals(1,results.size());
+        assertEquals(List.of(sessions.get(0).id),results.get(0).sessions());
+        assertThrows(IOException.class,()->exporter.exportSessions(List.of(UUID.randomUUID().toString())));
+        assertEquals(batch.sha256(),ActivityTransferFiles.hashFile(new File(inbox,batch.file().getName())));
+    }
+
     @Test public void recentWithFewerThanThreeExportsAvailableAndDuplicateSessionsOnlyOnce() throws Exception {
         File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
         var store=new ActivityStore(root,dir->{});var session=store.start(store.createTemplate("one",false),1000,1);session.seal("DONE",2000);

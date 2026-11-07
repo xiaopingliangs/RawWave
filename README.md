@@ -20,30 +20,29 @@ RawWave 是一个开源的手表数据采集软件，主要面向三星 Galaxy W
 
 目前项目仍在开发中，具体支持哪些数据，取决于手表硬件和系统开放的功能。
 
-## 最新测试版（2026-11-06）
+## 最新测试版（2026-11-07）
 
-- `gravity-geomag-20261106-r01` / `0.12.5-step` / versionCode 79
+- `ux-sync-20261107-r01` / `0.12.12-step` / versionCode 86
 - 这是测试版，不是稳定发布。
-- 安装包、SHA256 和更新说明见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，也可以到 [Releases](https://github.com/xiaopingliangs/RawWave/releases) 下载。
+- 安装包、SHA256 和完整更新说明见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，也可以到 [Releases](https://github.com/xiaopingliangs/RawWave/releases) 下载。
 
-0.12.5 新增：
+0.12.12 重点：
 
-- `GRAVITY` 重力矢量（平台融合，25 Hz）
-- `GEOMAGNETIC_ROTATION_VECTOR` 地磁姿态四元数（磁力计 + 加速度，25 Hz）
+- 手机首页收敛为：活动原始数据、Samsung Health 官方数据、问题报告、后台运行、退出。
+- 新增按“最近一次 / 今天 / 日期范围”导出原始活动，按 session 导出，成功弹窗显示 `Download/RawWave` 和 SHA-256。
+- 手表首页始终有同步状态和手动同步/刷新入口；同步不再强制亮屏，大包时限提高到 25 分钟。
+- 手机/手表增加后台运行权限引导；报告增加手机接收结果和同步结论。
+- 按钮改为随文字自动增高；绿色按钮改为中心偏亮径向材质。
+- 活动计时只在活动记录期间显示；短测增加示意图、接触状态、成功提示和失败重测/跳过。
 
-0.12.4 已完成：
+**已知限制（仍然存在）：**
 
-- BIA / MF-BIA 改为只在活动前测量，活动后不再测体成分
-- `ROTATION_VECTOR` 绝对姿态旋转矢量
-- `WRIST_TILT_GESTURE` 抬腕手势事件
-
-0.12.3 已完成：
-
-- BIA / MF-BIA 中断后显示进度、原因和第几次尝试
-- 2 秒后自动重试
-- 移除手表不支持的“未校准加速度”
-
-0.12.5 已在 Galaxy Watch 上验证：重力/地磁姿态均为 25 Hz；BIA/MF-BIA 仅活动前且成功；ECG 前后连续；后置 PPG 成功；自动同步第一次唤醒成功。SpO2 本轮的两次尝试均超时，属于接触/血流质量问题，不是数据管线错误。
+- 真机 `NOT_RUN`；没有本轮设备截图。
+- 0.12.12 的 18 分钟测试中，step counter 与 step detector 数值不一致（156 vs 103）；两者都保留，不做补步或合并。
+- 室内工位测试没有 GPS fix；GPS 0 点属于环境结果，不是应用崩溃。
+- 官方 Samsung Health 导出是 **Samsung Health 存储/处理后的数据**，不是原始 PPG/ECG 波形；官方 SDK 不开放原始波形。
+- 部分 Samsung Health 类型为 NO_DATA（本次：血糖、血压、体温、心律不齐通知、营养、睡眠呼吸暂停、饮水），不是导出失败。
+- 问题报告的手机端应用层证据完整；系统功耗、传感器硬件停止和完整系统 dump 仍需另抓。
 
 ---
 
@@ -69,11 +68,13 @@ You can use other apps, AI tools, or your own methods to explore the exported da
 
 RawWave is still in development. Available features depend on the watch hardware and system support.
 
-### Latest test build (2026-11-06)
+### Latest test build (2026-11-07)
 
-`gravity-geomag-20261106-r01` / `0.12.5-step` / versionCode 79. Test build, not a stable release. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
+`ux-sync-20261107-r01` / `0.12.12-step` / versionCode 86. Test build, not a stable release. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
 
-0.12.5 adds `GRAVITY` and `GEOMAGNETIC_ROTATION_VECTOR`. 0.12.4 made BIA/MF-BIA pre-activity only and added `ROTATION_VECTOR` and `WRIST_TILT_GESTURE`. 0.12.3 improved BIA retry feedback and removed the unsupported uncalibrated accelerometer.
+0.12.12 adds a simplified phone home, date/session-based raw activity export with success dialogs, always-visible watch sync status/manual retry, background-permission guidance, screen-off-friendly sync with a 25-minute large-package ceiling, auto-height buttons, radial green button styling, and clearer short-measurement guidance/success/failure states.
+
+**Known limitations:** device verification is `NOT_RUN`; the 18-minute test shows step counter 156 vs step detector 103 (both raw values retained, no reconciliation); no GPS fix indoors; Samsung Health export is processed store data, not raw PPG/ECG; seven official Samsung types had no data in this window; system-level power/sensor dumps are still not included in the app report.
 
 ## License
 
