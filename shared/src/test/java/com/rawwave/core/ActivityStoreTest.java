@@ -588,7 +588,13 @@ public class ActivityStoreTest {
                 catch(java.util.concurrent.ExecutionException error){assertTrue(error.getCause() instanceof IOException);remoteSucceeded=false;}
                 assertEquals(fault,fault.equals("NONE"),localFailure==null);
                 assertEquals(fault,fault.equals("NONE")||fault.equals("FINISHED"),remoteSucceeded);
-                assertArrayEquals(original,Files.readAllBytes(payload.file().toPath()));
+                boolean acknowledged = fault.equals("NONE") || fault.equals("CONFIRM") || fault.equals("FINISHED");
+                if (kind == ReceiveStore.Kind.RAW_ACTIVITY && acknowledged) {
+                    // The derived activity ZIP is deleted after the ack is durable; raw session bytes stay.
+                    assertFalse(payload.file().isFile());
+                } else {
+                    assertArrayEquals(original,Files.readAllBytes(payload.file().toPath()));
+                }
                 if(!fault.equals("CORRUPT")) {
                     File saved=new File(phone,(kind==ReceiveStore.Kind.RAW_ACTIVITY?"activity-inbox/":"received/")+payload.id()+".zip");
                     assertArrayEquals(original,Files.readAllBytes(saved.toPath()));

@@ -2,9 +2,11 @@ package com.rawwave.shell
 
 import android.os.Handler
 import android.os.Looper
+import com.rawwave.core.ActivityArchive
 import com.rawwave.core.ActivityRetryPolicy
 import com.rawwave.core.ActivitySyncPolicy
 import com.rawwave.core.ActivityTransferBudget
+import java.io.File
 import java.util.UUID
 
 internal data class ActivityTransferCallbacks(
@@ -22,14 +24,23 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
     private var finished=false
     @Volatile private var attempts=0
     @Volatile private var leaseExtended=false
+    private var prepareBudgetMs=ActivityTransferBudget.INITIAL_MS
+    private var pendingRawBytesValue=0L
     internal var post: (() -> Unit) -> Unit = { action -> main.post(action) }
     internal var postDelayed: (Long, () -> Unit) -> Unit = { delay, action -> main.postDelayed(action, delay) }
+    /** Raw bytes for the packaging budget; injectable so unit tests do not need Android filesDir. */
+    internal var pendingRawBytes: () -> Long = {
+        try {
+            val root = app.filesDir
+            if (root == null) 0L else ActivityArchive.pendingRawBytes(File(root, "activities"))
+        } catch (_: Exception) { 0L }
+    }
     internal var leaseFactory: (Long, () -> Unit, () -> Unit, (String) -> Unit) -> SyncGuardService.Lease? = { leaseMs, cancel, ready, ended ->
         SyncGuardService.open(app,leaseMs=leaseMs,cancel=cancel,ready=ready,ended=ended)
     }
-    internal var transferFactory: (ActivityTransferCallbacks) -> ActivityTransferHandle = { callbacks ->
+    internal var transferFactory: (ActivityTransferCallbacks, Long) -> ActivityTransferHandle = { callbacks, prepareBudget ->
         ActivityTransferWindow(app,app,callbacks.update,callbacks.finished,trigger=trigger,
-            onArchiveSizeKnown=callbacks.sizeKnown)
+            prepareBudgetMs=prepareBudget,onArchiveSizeKnown=callbacks.sizeKnown)
     }
     fun start() {
         if(BuildConfig.DEVICE_ROLE != "watch" || app.activeSyncOwner != null) { finish(false,"已有工作正在进行，活动数据稍后再同步。"); return }
@@ -39,21 +50,30 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
                 "trigger" to trigger,"owner" to owner)) } catch (_: Exception) {}
             finish(false,"同步已停止（$source）；数据仍保留在手表。")
         }
-        publish(true,false,"正在准备活动原始数据…")
+        pendingRawBytesValue=try { pendingRawBytes() } catch (_: Exception) { 0L }
+        prepareBudgetMs=ActivityTransferBudget.prepareBudgetMs(pendingRawBytesValue)
+        try { app.journal?.event("ACTIVITY_WATCH_SYNC_PREPARE_BUDGET",mapOf(
+            "trigger" to trigger,"rawBytes" to pendingRawBytesValue,
+            "prepareBudgetMs" to prepareBudgetMs,
+            "leaseMs" to ActivityTransferBudget.prepareLeaseMs(pendingRawBytesValue))) } catch (_: Exception) {}
+        publish(true,false,"正在打包并准备活动原始数据…")
         try {
             attempts=1
-            transfer=transferFactory(callbacks(attempts))
-            // Start with the same short window as the transfer. The window extends this lease
-            // only after packaging proves the archive is large enough; a small or failed package
-            // therefore closes near the initial 80-second window instead of holding for 20 minutes.
-            lease=leaseFactory(ActivityTransferBudget.initialLeaseMs(),
-                { transfer?.cancel() },
-                { if(!finished) { lease?.extendBy(ActivityTransferBudget.initialLeaseMs()); transfer?.start() } },
-                { reason -> finish(false,"同步在限定时间内没有完成（$reason）；数据仍保留在手表。") })
+            transfer=transferFactory(callbacks(attempts),prepareBudgetMs)
+            // Packaging is a separate phase. A long activity must not be aborted by the
+            // 80-second transfer window; the lease covers the raw-byte packaging estimate and
+            // is extended only after the exact ZIP size is known.
+            openLease()
         } catch(error: Exception) {
             try { app.journal?.fault("ACTIVITY_WATCH_SYNC_START_FAILED",error) } catch (_: Exception) {}
             finish(false,"无法开始同步：${error.message}。数据仍保留在手表。")
         }
+    }
+    private fun openLease() {
+        lease=leaseFactory(ActivityTransferBudget.prepareLeaseMs(pendingRawBytesValue),
+            { transfer?.cancel() },
+            { if(!finished) { lease?.extendBy(ActivityTransferBudget.initialLeaseMs()); transfer?.start() } },
+            { reason -> finish(false,"同步在限定时间内没有完成（$reason）；数据仍保留在手表。") })
     }
     private fun callbacks(attemptId: Int): ActivityTransferCallbacks = ActivityTransferCallbacks(
         update = { text -> post { if(!finished && app.activeSyncOwner == owner && attemptId == attempts) publish(true,false,text) } },
@@ -81,11 +101,15 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
         attempts++
         try {
             transfer?.cancel()
-            transfer=transferFactory(callbacks(attempts))
+            // The previous attempt's lease is closed. A retry must open a new lease; reusing
+            // the old one reports SYNC_DEADLINE within seconds even though the data is intact.
+            SyncGuardService.close(lease); lease=null
+            leaseExtended=false
+            transfer=transferFactory(callbacks(attempts),prepareBudgetMs)
             try { app.journal?.event("ACTIVITY_WATCH_SYNC_RETRY_STARTED",mapOf("attempt" to attempts,
                 "maxAttempts" to ActivityRetryPolicy.MAX_ATTEMPTS,"trigger" to trigger,"owner" to owner)) } catch (_: Exception) {}
             publish(true,false,"正在自动重试同步（第 $attempts 次，共 ${ActivityRetryPolicy.MAX_ATTEMPTS} 次）…")
-            transfer?.start()
+            openLease()
         } catch(error: Exception) {
             try { app.journal?.fault("ACTIVITY_WATCH_SYNC_RETRY_START_FAILED",error) } catch (_: Exception) {}
             finish(false,"无法开始重试：${error.message}。数据仍保留在手表。")

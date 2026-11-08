@@ -51,6 +51,21 @@ public class ActivityTransferBudgetTest {
         assertTrue(lease > ActivityTransferBudget.MAX_TRANSFER_MS);
     }
 
+    @Test public void longPackagingGetsItsOwnBudgetBeforeTheTransferWindow() {
+        long raw = 432_055_330L;
+        long packaging = ActivityTransferBudget.packagingMs(raw);
+        assertTrue(packaging > ActivityTransferBudget.INITIAL_MS);
+        assertTrue(packaging <= ActivityTransferBudget.PACKAGING_MAX_MS);
+        assertEquals(packaging, ActivityTransferBudget.prepareBudgetMs(raw));
+        assertEquals(packaging + ActivityTransferBudget.PACKAGING_MARGIN_MS,
+            ActivityTransferBudget.prepareLeaseMs(raw));
+        assertTrue(ActivityTransferBudget.prepareLeaseMs(raw) < ActivityTransferBudget.WATCH_LEASE_MS);
+        // A small activity keeps the short 80-second initial window.
+        assertEquals(ActivityTransferBudget.INITIAL_MS, ActivityTransferBudget.prepareBudgetMs(1L));
+        assertEquals(ActivityTransferBudget.INITIAL_MS + ActivityTransferBudget.PACKAGING_MARGIN_MS,
+            ActivityTransferBudget.prepareLeaseMs(1L));
+    }
+
     @Test public void invalidSizesAreRejected() {
         assertThrows(IllegalArgumentException.class, () -> ActivityTransferBudget.transferMs(0));
         assertThrows(IllegalArgumentException.class,

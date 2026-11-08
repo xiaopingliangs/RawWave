@@ -8,8 +8,8 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 86
-        versionName = "0.12.12-step"
+        versionCode = 88
+        versionName = "0.12.14-step"
         buildConfigField("String", "DEVICE_ROLE", "\"watch\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))

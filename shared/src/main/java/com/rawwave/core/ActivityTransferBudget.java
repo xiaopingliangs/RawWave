@@ -19,6 +19,14 @@ public final class ActivityTransferBudget {
 
     /** One short attempt window before the archive size is known. */
     public static final long INITIAL_MS = 80_000L;
+    /** Conservative packaging throughput: raw bytes per second on the watch (17 min observed). */
+    public static final long PACKAGING_MIN_RATE_BYTES_PER_SECOND = 256L * 1024L;
+    /** A packaging attempt may legitimately take minutes on a long activity. */
+    public static final long PACKAGING_BASE_MS = 60_000L;
+    /** Packaging ceiling; the longer watch lease is 35 minutes. */
+    public static final long PACKAGING_MAX_MS = 25L * 60_000L;
+    /** Extra protection beyond the packaging estimate for slow storage and final verification. */
+    public static final long PACKAGING_MARGIN_MS = 120_000L;
     /** Discovery, HELLO retries and opening the file channel after the size is known. */
     public static final long HANDSHAKE_MS = 30_000L;
     /** Phone commit, deep verification, COMMITTED/CONFIRM/FINISHED exchange. */
@@ -35,6 +43,28 @@ public final class ActivityTransferBudget {
     public static final long LEASE_MARGIN_MS = 5_000L;
     /** Last-resort foreground-service ceiling for the watch, including packaging and cleanup. */
     public static final long WATCH_LEASE_MS = 35L * 60_000L;
+
+    /**
+     * Estimated packaging time before the archive size is known. This is a separate phase:
+     * the short {@link #INITIAL_MS} window must not abort a multi-minute compression of raw
+     * session files. The estimate is deliberately conservative and bounded.
+     */
+    public static long packagingMs(long rawBytes) {
+        long bytes = Math.max(1L, rawBytes);
+        long estimated = (bytes * 1000L + PACKAGING_MIN_RATE_BYTES_PER_SECOND - 1L)
+            / PACKAGING_MIN_RATE_BYTES_PER_SECOND;
+        return Math.min(PACKAGING_MAX_MS, Math.max(PACKAGING_BASE_MS, estimated));
+    }
+
+    /** Initial attempt window: small activities keep the short window, long ones get packaging time. */
+    public static long prepareBudgetMs(long rawBytes) {
+        return Math.max(INITIAL_MS, packagingMs(rawBytes));
+    }
+
+    /** Watch foreground-service lease for packaging + handshake cleanup. */
+    public static long prepareLeaseMs(long rawBytes) {
+        return prepareBudgetMs(rawBytes) + PACKAGING_MARGIN_MS;
+    }
 
     public static long transferMs(long bytes) {
         if (bytes <= 0L || bytes > ActivityTransferFiles.MAX_BYTES)

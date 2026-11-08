@@ -21,7 +21,11 @@ public class ActivityArchiveTest {
         assertThrows(IOException.class,() -> replacement.acknowledge(payload,new SendStore.Confirmation(payload.id(),payload.sha256(),payload.bytes()+1,"phone",1)));
         assertEquals(1,ActivityArchive.pendingCount(activities));
         replacement.acknowledge(payload,new SendStore.Confirmation(payload.id(),payload.sha256(),payload.bytes(),"phone",1));
-        assertNull(replacement.prepare(null)); assertTrue(source.folder.isDirectory()); assertTrue(payload.file().isFile());
+        assertNull(replacement.prepare(null)); assertTrue(source.folder.isDirectory());
+        // The acknowledged transport ZIP is deleted; the raw session and ack receipts remain.
+        assertFalse(payload.file().isFile());
+        assertTrue(new File(root,"activity-outgoing/"+payload.id()+".ack.json").isFile());
+        assertTrue(new File(activities,"sync/"+source.id+".phone-ack.json").isFile());
     }
     @Test public void verificationCallbackCancellationDoesNotQuarantineSavedBytes() throws Exception {
         File root=temp.newFolder(),out=temp.newFolder(),phone=temp.newFolder();session(root,true);

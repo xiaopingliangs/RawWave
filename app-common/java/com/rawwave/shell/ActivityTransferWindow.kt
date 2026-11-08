@@ -31,6 +31,8 @@ class ActivityTransferWindow(
     private val initialNode: String? = null,
     private val initialHello: ByteArray? = null,
     private val trigger: String = "",
+    /** Packaging gets its own window; it is not the 80-second transfer window. */
+    private val prepareBudgetMs: Long = ActivityTransferBudget.INITIAL_MS,
     private val receiveStore: ReceiveStore = FileReceiveStore(context.filesDir) { directory ->
         val fd = Os.open(directory.absolutePath, OsConstants.O_RDONLY, 0)
         try { Os.fsync(fd) } finally { Os.close(fd) }
@@ -48,7 +50,7 @@ class ActivityTransferWindow(
 ) : ActivityTransferHandle {
     private val transport = transportPort ?: GoogleTransport(context) { event, detail -> log(event, mapOf("detail" to detail)) }
     private val executor = Executors.newSingleThreadExecutor()
-    private val prepareDeadline = monotonicMs() + ActivityTransferBudget.INITIAL_MS
+    private val prepareDeadline = monotonicMs() + prepareBudgetMs
     @Volatile private var deadline = prepareDeadline
     /** Bounds discovery/channel-open separately from the size-aware send budget. */
     @Volatile private var handshakeDeadline = 0L
@@ -163,6 +165,8 @@ class ActivityTransferWindow(
             reason == "ACTIVITY_TRANSFER_STALLED" ->
                 "传输连续 ${ActivityTransferBudget.STALL_MS / 1000} 秒没有进展（手机或连接可能已断开）"
             reason == "ACTIVITY_HANDSHAKE_TIMEOUT" -> "等待手机连接或建立数据通道的时间已用完"
+            reason == "ACTIVITY_WINDOW_EXPIRED" && lastStage == "ACTIVITY_ARCHIVE_PREPARING" ->
+                "手表数据打包超过本次上限（${prepareBudgetMs / 60_000} 分钟）"
             reason == "ACTIVITY_TRANSFER_RATE_UNSTABLE" ->
                 "文件传输速率持续大幅波动，无法确认本轮能稳定完成"
             else -> "本轮同步时间已用完"
@@ -300,7 +304,8 @@ class ActivityTransferWindow(
     }
 
     private fun send() {
-        stage("ACTIVITY_ARCHIVE_PREPARING","正在打包并核验手表已保存的数据…")
+        stage("ACTIVITY_ARCHIVE_PREPARING","正在打包并核验手表已保存的数据…",
+            mapOf("prepareBudgetMs" to prepareBudgetMs))
         val prepared=sendStore.prepare(null)
         if(prepared == null) { complete(true,"没有待同步的活动数据。"); return }
         id=prepared.id(); hash=prepared.sha256(); expected=prepared.bytes()
@@ -342,6 +347,10 @@ class ActivityTransferWindow(
         }, {
             stage("ACTIVITY_REMOTE_RECEIPT_RECEIVED","手机已保存，正在保存本地确认记录…")
             sendStore.acknowledge(prepared,SendStore.Confirmation(id,hash,expected,peer,System.currentTimeMillis()))
+            // The derived transport ZIP is deleted only after the ack is durable. Raw session
+            // files and the ack receipts remain; a delete failure never turns success into failure.
+            try { log("ACTIVITY_ZIP_DELETE_RESULT",mapOf("deleted" to !prepared.file().exists(),
+                "bytes" to prepared.bytes(),"batchId" to prepared.id())) } catch (_: Exception) {}
             stage("ACTIVITY_LOCAL_ACK_SAVED","本地确认已保存，正在通知手机…")
         }, {
             await(message("CONFIRM"))

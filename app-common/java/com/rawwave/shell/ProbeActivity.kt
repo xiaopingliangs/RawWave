@@ -79,6 +79,17 @@ class ProbeActivity : ComponentActivity() {
         record("ACTIVITY_CREATED", mapOf("screenRound" to resources.configuration.isScreenRound))
         try { app.journal?.mark("RUNNING") } catch (error: Exception) { showError(error) }
         scheduleIdle()
+        if (watch) {
+            val autoAction = intent.getStringExtra("autoAction")
+            if (!autoAction.isNullOrBlank()) main.post {
+                if (exiting) return@post
+                when (autoAction) {
+                    "send" -> startTransfer()
+                    "export" -> exportReport()
+                    "record" -> recordDiagnosticCapture()
+                }
+            }
+        }
     }
 
     /** Watch-side problem-report console; same green language, still separate from activity capture. */
@@ -647,7 +658,9 @@ class ProbeActivity : ComponentActivity() {
     private fun scheduleIdle() {
         if (!working && !exiting) runtime.touchIdle()
     }
-    private fun newIdleRuntime() = DeadlineRuntime { reason, evidence -> onIdleDeadline(reason, evidence) }
+    private fun newIdleRuntime() = DeadlineRuntime(
+        idleBudgetMs = if (BuildConfig.DEVICE_ROLE == "phone") WorkBudget.PHONE_UI_IDLE_MS else WorkBudget.IDLE_MS,
+    ) { reason, evidence -> onIdleDeadline(reason, evidence) }
     private fun onIdleDeadline(reason: String, evidence: Map<String, Any>) {
         // A watch-initiated activity transfer owns its own lease; the page idle countdown must
         // never cancel that receive just because the screen was untouched.
@@ -828,8 +841,8 @@ class ProbeActivity : ComponentActivity() {
         if (!exiting) app.activitySyncObserver = activitySyncObserver
         updateBatteryState()
         if (!exiting && !working) refreshReceivedSummary()
-        // Background time counts toward the same absolute 80-second idle deadline.
-        // Returning is not itself a user interaction and cannot renew that deadline.
+        // Background time counts toward the same absolute idle deadline (phone: 3 minutes;
+        // watch: 80 seconds). Returning is not itself a user interaction and cannot renew it.
         if (!exiting && transfer == null && !working) {
             if (app.activitySyncStatus.running) holdIdleForActivitySync()
             else if (runtime.isClosed()) releaseIdleForActivitySync()

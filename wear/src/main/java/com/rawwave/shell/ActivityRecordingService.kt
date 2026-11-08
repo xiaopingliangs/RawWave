@@ -36,7 +36,8 @@ class ActivityRecordingService : Service() {
             val skipAllowed: Boolean = false, val failedAttempts: Int = 0, val shortSensor: String = "ECG",
             val biaMode: String = "", val biaHasNext: Boolean = false, val biaContact: Boolean = false,
             val biaRetrying: Boolean = false, val biaAttempt: Int = 0, val biaProgress: Int = -1,
-            val biaHint: String = "", val coreElapsedSeconds: Long = 0L)
+            val biaHint: String = "", val coreElapsedSeconds: Long = 0L,
+            val phaseRemainingSeconds: Int = 0, val biaModeNumber: Int = 0, val biaModeCount: Int = 0)
         @Volatile var state = State(); private set
         var observer: ((State) -> Unit)? = null // main thread; removed on Activity stop
         var successObserver: ((String, String) -> Unit)? = null // main thread; short measurement success
@@ -482,7 +483,11 @@ class ActivityRecordingService : Service() {
         drainSources {
             biaResults[biaPhase]=if(success) "成功：$biaSummary" else "未成功，未取得完整有效结果"
             event("BIA_MEASUREMENT_SAVED","success=$success; reason=$reason; pre=$biaPre; mode=$bodySource; attempt=$biaAttempt; progress=$biaProgress")
-            if(success) { biaRetrying=false; biaHint=""; publishSuccess("体成分", biaSummary); afterBia() } else if(isBiaRetryable(reason) && clock() < biaContactStartMs + SHORT_BUDGET_MS) {
+            if(success) {
+                biaRetrying=false; biaHint=""
+                publishSuccess("${biaModeLabel()} ${biaModeIndex + 1}/${biaModes.size.coerceAtLeast(1)}", biaSummary)
+                afterBia()
+            } else if(isBiaRetryable(reason) && clock() < biaContactStartMs + SHORT_BUDGET_MS) {
                 biaContactDetected=false
                 biaRetrying=true
                 biaHint=biaRetryHint(reason)
@@ -1032,6 +1037,7 @@ class ActivityRecordingService : Service() {
             coreEndedMs > 0L -> ((coreEndedMs - coreStartedMs).coerceAtLeast(0L)) / 1000L
             else -> ((clock() - coreStartedMs).coerceAtLeast(0L)) / 1000L
         }
+        val phaseRemainingSeconds = ((deadline - clock()).coerceAtLeast(0L) / 1000L).toInt()
         val next = State(true, if (draining != null) "DRAINING" else phase,
             if (draining != null) "正在收尾并保存各传感器数据，请稍候（最多5秒收尾等待）\n$count"
             else "$title\n$notice$idleHint$postLedHint" + (if(shortSensor == "BIA" || shortSensor == "SPO2" || shortSensor == "PPG_ON_DEMAND" || placementWaiting()) "\n${when { shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") && biaRetrying -> "测量中断，正在重试"; shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") -> "等待双指接触"; shortSensor == "BIA" && !phase.startsWith("REVIEW_") -> "测量中，请保持接触"; placementWaiting() || phase.startsWith("REVIEW_") -> "等待操作 $remaining 秒"; else -> "最多等待 $remaining 秒" }}" else "") +
@@ -1040,7 +1046,8 @@ class ActivityRecordingService : Service() {
             policy.skipAllowed(), policy.failures(), shortSensor,
             if(shortSensor == "BIA") biaModeLabel() else "", biaModeIndex + 1 < biaModes.size, biaContactDetected,
             biaRetrying && shortSensor == "BIA" && phase.startsWith("WAIT_BIA_"), biaAttempt, biaProgress,
-            if(shortSensor == "BIA") biaHint else "", coreElapsedSeconds)
+            if(shortSensor == "BIA") biaHint else "", coreElapsedSeconds,
+            phaseRemainingSeconds, if (biaModes.isEmpty()) 0 else biaModeIndex + 1, biaModes.size)
         state = next; main.post { observer?.invoke(next) }
     }
     private fun countText(): String {

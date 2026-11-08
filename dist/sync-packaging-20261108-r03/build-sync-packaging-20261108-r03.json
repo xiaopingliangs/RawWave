@@ -1,0 +1,14 @@
+﻿{
+    "buildRun":  "sync-packaging-20261108-r03",
+    "versionCode":  88,
+    "versionName":  "0.12.14-step",
+    "mobileApk":  "Phone_RawWave_0.12.14-step_sync-packaging-20261108-r03.apk",
+    "mobileBytes":  8069576,
+    "mobileSha256":  "0184662D7F2C616990076F28ED36505007A6C94CE5A237A524B8BAE02F5018C4",
+    "wearApk":  "Watch_RawWave_0.12.14-step_sync-packaging-20261108-r03.apk",
+    "wearBytes":  7026980,
+    "wearSha256":  "2B44DBA559C3110054B8B8D96DD8B0B5ABFF84A41708224214C5AE29D2625E42",
+    "builtUtc":  "2026-11-08T12:47:04.6435171+08:00",
+    "note":  "Activity packaging lease + retry lease + delete acknowledged ZIP + phone 180s idle",
+    "deliveryFolder":  "D:\\RawWave-APK"
+}

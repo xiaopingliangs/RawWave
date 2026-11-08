@@ -7,7 +7,10 @@ import com.rawwave.core.RunDeadlines
 import com.rawwave.core.WorkBudget
 
 /** Main-thread adapter; does not wake a sleeping device or hold it awake. */
-class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
+class DeadlineRuntime(
+    private val idleBudgetMs: Long = WorkBudget.IDLE_MS,
+    private val expired: (String, Map<String, Any>) -> Unit,
+) {
     private val handler = Handler(Looper.getMainLooper())
     private val deadlines = RunDeadlines { SystemClock.elapsedRealtime() }
     private var closed = false
@@ -41,7 +44,7 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
     }
     fun touchIdle() {
         if (held) return
-        if (check("INTERACTION")) { deadlines.touchIdle(WorkBudget.IDLE_MS); schedule() }
+        if (check("INTERACTION")) { deadlines.touchIdle(idleBudgetMs); schedule() }
     }
     /** Suspend the UI idle countdown while a bounded activity transfer is genuinely active. */
     fun holdIdle(): Boolean {
@@ -56,7 +59,7 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
     fun releaseIdle(): Boolean {
         if (closed || !held) return false
         held = false
-        val renewed = deadlines.releaseIdle(WorkBudget.IDLE_MS)
+        val renewed = deadlines.releaseIdle(idleBudgetMs)
         if (renewed) schedule()
         return renewed
     }
@@ -72,7 +75,7 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
         parked = false
         if (held) return true
         if (!check("RESUME_IDLE")) return false
-        val renewed = deadlines.resumeIdle(WorkBudget.IDLE_MS)
+        val renewed = deadlines.resumeIdle(idleBudgetMs)
         if (renewed) schedule()
         return renewed
     }
@@ -84,10 +87,10 @@ class DeadlineRuntime(private val expired: (String, Map<String, Any>) -> Unit) {
         return accepted
     }
     fun finishExport() {
-        if (check("EXPORT_FINISHED")) { deadlines.finishExport(WorkBudget.IDLE_MS); schedule() }
+        if (check("EXPORT_FINISHED")) { deadlines.finishExport(idleBudgetMs); schedule() }
     }
     fun finishTransfer() {
-        if (check("TRANSFER_FINISHED")) { deadlines.finishTransfer(WorkBudget.IDLE_MS); schedule() }
+        if (check("TRANSFER_FINISHED")) { deadlines.finishTransfer(idleBudgetMs); schedule() }
     }
     private fun schedule() {
         handler.removeCallbacks(timer)

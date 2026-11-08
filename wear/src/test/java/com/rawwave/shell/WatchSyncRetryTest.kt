@@ -20,7 +20,7 @@ class WatchSyncRetryTest {
         owner.post={ it() }
         owner.postDelayed={ _, action -> action() }
         owner.leaseFactory={ _, _, ready, _ -> ready(); null }
-        owner.transferFactory={ callbacks ->
+        owner.transferFactory={ callbacks, _ ->
             val attempt=starts.incrementAndGet()
             FakeHandle {
                 if(attempt == 1) callbacks.finished(false,"injected first failure")
@@ -48,7 +48,7 @@ class WatchSyncRetryTest {
         owner.post={ it() }
         owner.postDelayed={ _, action -> action() }
         owner.leaseFactory={ _, _, ready, _ -> ready(); null }
-        owner.transferFactory={ callbacks ->
+        owner.transferFactory={ callbacks, _ ->
             starts.incrementAndGet()
             FakeHandle { callbacks.finished(false,"injected failure") }
         }
@@ -69,7 +69,7 @@ class WatchSyncRetryTest {
         var delayed:(() -> Unit)?=null
         owner.postDelayed={ _, action -> delayed=action }
         owner.leaseFactory={ _, _, ready, _ -> ready(); null }
-        owner.transferFactory={ callbacks ->
+        owner.transferFactory={ callbacks, _ ->
             starts.incrementAndGet()
             FakeHandle { callbacks.finished(false,"injected failure") }
         }

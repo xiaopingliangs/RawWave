@@ -51,6 +51,17 @@ public final class ActivityArchive {
         return batch(target, verified);
     }
 
+    /** Raw bytes that a pending archive would read; used only to size the packaging budget. */
+    public static long pendingRawBytes(File activitiesRoot) throws IOException {
+        File sessionsRoot = new File(activitiesRoot, "sessions");
+        File[] folders = sessionsRoot.listFiles(file -> file.isDirectory()
+            && UUID.matcher(file.getName()).matches() && !isAcknowledged(activitiesRoot, file.getName()));
+        if (folders == null) return 0L;
+        long total = 0L;
+        for (File folder : folders) for (File file : sessionFiles(folder)) total += file.length();
+        return total;
+    }
+
     public static int pendingCount(File activitiesRoot) {
         File[] folders = new File(activitiesRoot, "sessions").listFiles(file -> file.isDirectory()
             && UUID.matcher(file.getName()).matches() && !isAcknowledged(activitiesRoot, file.getName()));

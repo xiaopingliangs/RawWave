@@ -60,6 +60,12 @@ public final class FileSendStore implements SendStore {
             File activities=new File(root,"activities");
             ActivityArchive.acknowledge(activities,outgoing,new ActivityArchive.Batch(payload.file(),payload.id(),payload.sha256(),payload.bytes(),payload.sessions()),confirmation.utcMs());
             durability.sync(new File(activities,"sync"));durability.sync(outgoing);
+            // The ZIP is a derived transport artifact. The raw session bytes and the ack
+            // receipts above are the durable record; delete only this acknowledged batch.
+            // A delete failure is not a sync failure: the phone already committed the bytes.
+            File zip=payload.file();
+            if(zip.isFile() && zip.getName().equals(payload.id()+".zip")) zip.delete();
+            durability.sync(outgoing);
         } else {
             byte[] receipt=new Gson().toJson(Map.of("id",payload.id(),"sha256",payload.sha256(),"bytes",payload.bytes(),"peer",confirmation.peer())).getBytes(StandardCharsets.UTF_8);
             File temporary=new File(outgoing,payload.id()+".ack.part");

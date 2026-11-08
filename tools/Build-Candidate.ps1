@@ -204,9 +204,14 @@ try {
         if (($badging -join "`n") -notmatch "package: name='com.rawwave.rebuild'" -or ($badging -join "`n") -match 'application-debuggable') { throw 'Unexpected package or debuggable release' }
         if ($manifestText -match 'E: (receiver|provider)\b') { throw 'Unexpected automatic component' }
         $permissions = @([regex]::Matches(($badging -join "`n"), "uses-permission: name='([^']+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-        $allowedPermissions = @('android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_DATA_SYNC','android.permission.WAKE_LOCK') | Sort-Object
+        $allowedPermissions = @('android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_DATA_SYNC','android.permission.WAKE_LOCK','android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS') | Sort-Object
         if ($module -eq 'wear') {
             $allowedPermissions = @($allowedPermissions) + @('android.permission.FOREGROUND_SERVICE_HEALTH','android.permission.FOREGROUND_SERVICE_LOCATION','android.permission.ACCESS_FINE_LOCATION','android.permission.ACCESS_COARSE_LOCATION','android.permission.BODY_SENSORS','android.permission.health.READ_HEART_RATE','android.permission.health.READ_SKIN_TEMPERATURE','android.permission.health.READ_OXYGEN_SATURATION','android.permission.ACTIVITY_RECOGNITION','com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA') | Sort-Object
+        }
+        if ($module -eq 'mobile') {
+            # Samsung Health Data SDK 1.1.0 AAR declares INTERNET. RawWave itself has no network
+            # code path or upload; the permission is vendor-declared, not used for health upload.
+            $allowedPermissions = @($allowedPermissions) + @('android.permission.INTERNET') | Sort-Object
         }
         if (($permissions -join ',') -ne ($allowedPermissions -join ',')) { throw 'Unexpected final APK permissions' }
         $services = @([regex]::Matches($manifestText, '(?ms)^(\s*)E: service\b.*?(?=^\1E:|\z)'))

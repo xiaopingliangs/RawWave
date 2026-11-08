@@ -13,6 +13,12 @@ public class RunDeadlinesTest {
         now = 77000; assertEquals(TRANSFER, deadlines.expired().kind());
         assertFalse(deadlines.begin(TRANSFER, WorkBudget.SYNC_LEASE_MS));
     }
+    @Test public void phoneUiIdleIsThreeMinutesWhileCaptureDecisionStaysEightySeconds() {
+        assertEquals(80_000L, WorkBudget.IDLE_MS);
+        assertEquals(180_000L, WorkBudget.PHONE_UI_IDLE_MS);
+        assertEquals(80_000L, CoreDataBudget.NO_DATA_MS);
+    }
+
     @Test public void productionIdleBudgetAndSuccessNeedNoWait() {
         deadlines.touchIdle(WorkBudget.IDLE_MS);
         now = 79999; assertNull(deadlines.expired());

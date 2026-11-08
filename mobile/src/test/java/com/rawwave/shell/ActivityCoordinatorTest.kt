@@ -172,7 +172,9 @@ class ActivityCoordinatorTest {
             }
             assertTrue(w.second,w.first);assertTrue(p.second,p.first)
             assertArrayEquals(original,File(phoneRoot,"activity-inbox/${payload.id()}.zip").readBytes())
-            assertArrayEquals(original,payload.file().readBytes())
+            // Success deletes only the derived transport ZIP; the raw session stays on the watch.
+            assertFalse(payload.file().isFile())
+            assertTrue(File(watchRoot,"activities/sessions/${session.id}").isDirectory)
             assertTrue(File(payload.file().parentFile,"${payload.id()}.ack.json").isFile)
             assertEquals(1,wire.opens.get());assertEquals(1,wire.watch.closes.get());assertEquals(1,wire.phone.closes.get())
             if(dropReady)assertTrue(wire.readyCount.get()>=2)
@@ -215,7 +217,9 @@ class ActivityCoordinatorTest {
             assertTrue(w.second,w.first);assertTrue(p.second,p.first)
             assertTrue("simulated transfer time must exceed the old 75s budget",now.get() > WorkBudget.TRANSFER_MS)
             assertArrayEquals(original,File(phoneRoot,"activity-inbox/${payload.id()}.zip").readBytes())
-            assertArrayEquals(original,payload.file().readBytes())
+            // Success deletes only the derived transport ZIP; the raw session stays on the watch.
+            assertFalse(payload.file().isFile())
+            assertTrue(File(watchRoot,"activities/sessions/${session.id}").isDirectory)
             assertTrue(File(payload.file().parentFile,"${payload.id()}.ack.json").isFile)
         } finally {watch.cancel();phone.cancel();wire.dispose()}
     }

@@ -37,6 +37,8 @@ class RecordingActivity : ComponentActivity() {
     private lateinit var timerLabel: TextView
     private lateinit var activityTimer: TextView
     private lateinit var successBanner: RwStatusPill
+    private lateinit var stepCountdown: TextView
+    private lateinit var stepInstruction: TextView
     private lateinit var topPane: ScrollView
     
     private lateinit var controls: LinearLayout
@@ -182,13 +184,37 @@ class RecordingActivity : ComponentActivity() {
             visibility = View.GONE
         }
         body.addView(activityTimer)
+        stepCountdown = RwBodyText(this).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 19f)
+            typeface = RwTheme.displayTypeface()
+            gravity = Gravity.CENTER
+            setTextColor(colors.primary)
+            setPadding(0, dp(2), 0, dp(2))
+            visibility = View.GONE
+        }
+        body.addView(stepCountdown, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
+        guide = HomeKeyGuide(this)
+        body.addView(guide, LinearLayout.LayoutParams(-1, dp(120)))
+        stepInstruction = RwBodyText(this).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+            gravity = Gravity.CENTER
+            setTextColor(colors.onSurface)
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(2), 0, dp(4))
+            visibility = View.GONE
+        }
+        body.addView(stepInstruction, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
         measurementHeader = label("")
         measurementHeader.setTextColor(colors.onSurface)
         measurementHeader.typeface = RwTheme.displayTypeface()
         controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         body.addView(controls)
-        guide = HomeKeyGuide(this)
-        body.addView(guide, LinearLayout.LayoutParams(-1, dp(120)))
         val details = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(inset, dp(4), inset, dp(32))
@@ -287,6 +313,11 @@ class RecordingActivity : ComponentActivity() {
         guide.biaMode = guideMode == "BIA"
         guide.contactDetected = contactDetected
         guide.animateContact = shortPhase && !contactDetected && resumed && waitingContact
+        val countdown = if (shortPhase) countdownText(s, guideMode, contactDetected) else ""
+        stepCountdown.visibility = if (countdown.isNotEmpty()) View.VISIBLE else View.GONE
+        if (countdown.isNotEmpty()) stepCountdown.text = countdown
+        stepInstruction.visibility = if (shortPhase) View.VISIBLE else View.GONE
+        if (shortPhase) stepInstruction.text = instructionsFor(s, guideMode, contactDetected)
         if (measuringEcg || (s.active && (s.shortSensor == "SPO2" || s.shortSensor == "BIA" || s.shortSensor == "PPG_ON_DEMAND"))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val showTimer = s.active && s.phase == "CORE-1"
@@ -299,14 +330,17 @@ class RecordingActivity : ComponentActivity() {
         measurementHeader.text = if (s.active) {
             if (shortPhase) {
                 val title = when (guideMode) {
-                    "ECG" -> if (contactDetected) "ECG · 已检测到接触" else if (measuringEcg) "ECG · 等待接触" else "ECG · 准备"
-                    "BIA" -> if (contactDetected) "体成分 · 接触已确认" else "体成分 · 等待双指"
+                    "ECG" -> if (contactDetected) "ECG · 接触已确认" else if (measuringEcg) "ECG · 等待接触" else "ECG · 准备"
+                    "BIA" -> {
+                        val name = s.biaMode.ifBlank { "体成分" }
+                        if (s.biaModeCount > 0) "$name ${s.biaModeNumber}/${s.biaModeCount}" else name
+                    }
                     "SPO2" -> if (s.phase.startsWith("READY_")) "血氧 · 准备" else "血氧 · 测量中"
                     "PPG" -> if (s.phase.startsWith("READY_")) "PPG · 准备" else "PPG · 测量中"
                     "RESTORE" -> "恢复平时佩戴位置"
                     else -> "测量"
                 }
-                "$title\n${if (contactDetected) "保持不动，完成后自动进入下一步" else "按第一屏示意图操作"}"
+                "$title\n${if (contactDetected) "接触已确认，保持不动" else "按下方说明操作"}"
             } else {
                 val timer = when {
                     s.phase == "DRAINING" -> "正在保存…"
@@ -388,30 +422,17 @@ class RecordingActivity : ComponentActivity() {
             val store = ActivityRecordingService.store(this)
             val pendingSync = ActivityArchive.pendingCount(File(filesDir, "activities"))
             val sync = app.activitySyncStatus
-            when {
-                sync.running -> {
-                    label("正在同步到手机。\n${sync.text}", controls)
-                    button("停止同步（数据仍保留）") { app.requestStopBackgroundSync("WATCH_SYNC_STOP_BUTTON") }
-                }
-                pendingSync > 0 -> {
-                    label("有 $pendingSync 次活动等待同步。\n同步不依赖亮屏；完成前请保持两台设备靠近。", controls)
-                    button("立即同步活动数据到手机", primary = true) { startPendingSync(ActivitySyncPolicy.USER_MANUAL) }
-                }
-                sync.text.isNotBlank() && !sync.success -> {
-                    label("上次同步没有完成：${sync.text}\n数据仍保留在手表。", controls)
-                    button("重新同步活动数据到手机", primary = true) { startPendingSync(ActivitySyncPolicy.USER_MANUAL) }
-                }
-                else -> {
-                    label("活动数据已全部同步到手机。", controls)
-                    button("手动同步 / 刷新") { startPendingSync(ActivitySyncPolicy.USER_MANUAL) }
-                }
+            val statusNeedsAction = !sync.running && (pendingSync > 0 || (sync.text.isNotBlank() && !sync.success))
+            val statusText = when {
+                sync.running -> "同步中：${sync.text.ifBlank { "正在准备" }}\n点击停止（数据仍保留）"
+                pendingSync > 0 -> "同步状态：待同步 $pendingSync 次\n点击立即同步"
+                sync.text.isNotBlank() && !sync.success -> "同步状态：上次未完成\n点击重试；数据仍保留"
+                else -> "同步状态：已全部同步\n点击手动刷新"
             }
-            if (!isBatteryExempt()) {
-                label("为保证手表熄屏后仍能完成大包同步，请允许后台运行。", controls)
-                button("允许后台运行") { showBackgroundPermission() }
+            button(statusText, primary = statusNeedsAction) {
+                if (sync.running) app.requestStopBackgroundSync("WATCH_SYNC_STOP_BUTTON")
+                else startPendingSync(ActivitySyncPolicy.USER_MANUAL)
             }
-            if (store.history().any { it.contains("未封存/") }) label("发现之前中断的活动。已写入的数据保留，未写入尾部情况未知；不会自动恢复采集。", controls)
-            if (filesDir.usableSpace < 1_000_000_000L) label("存储不足 1GB，请清理不需要的软件。原始数据尚未同步，请勿卸载原波。", controls)
             val templates = store.templates()
             if (templates.isEmpty()) {
                 button("新建活动", primary = true) { createForm() }
@@ -420,7 +441,9 @@ class RecordingActivity : ComponentActivity() {
                     button(template.name(), primary = index == 0) { prepare(template) }
                 }
             }
-            button("更多（活动管理 / 问题报告）") { showMoreMenu() }
+            if (store.history().any { it.contains("未封存/") }) label("发现之前中断的活动。已写入的数据保留，未写入尾部情况未知；不会自动恢复采集。", controls)
+            if (filesDir.usableSpace < 1_000_000_000L) label("存储不足 1GB，请清理不需要的软件。原始数据尚未同步，请勿卸载原波。", controls)
+            button("更多（问题报告 / 活动管理 / 后台设置）") { showMoreMenu() }
         } catch (e: Exception) { status.text = "读取活动失败：${e.message}。请保留数据并导出问题报告。" }
         scheduleAutoSync("HOME_RENDERED")
     }
@@ -431,14 +454,11 @@ class RecordingActivity : ComponentActivity() {
             "更多",
             "问题报告、活动管理与后台设置",
             listOf(
-                RwDialogs.Action("问题报告（发送到手机）", primary = true) {
-                    idle?.close(); idle = null
-                    startActivity(Intent(this, ProbeActivity::class.java)); finish()
-                },
+                RwDialogs.Action("发送问题报告到手机", primary = true) { openReportAction("send") },
+                RwDialogs.Action("问题报告工具（记录 / 诊断 / 导出）") { showReportTools() },
                 RwDialogs.Action("活动管理") { showActivityManagement() },
                 RwDialogs.Action("查看本地记录") { showLocalHistory() },
                 RwDialogs.Action("后台运行设置") { openBackgroundSettings() },
-                RwDialogs.Action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) },
                 RwDialogs.Action("退出") {
                     app.requestStopBackgroundSync("WATCH_EXPLICIT_EXIT_BUTTON")
                     finishAndRemoveTask()
@@ -446,6 +466,30 @@ class RecordingActivity : ComponentActivity() {
             ),
             cancelLabel = "关闭",
         )
+    }
+
+    private fun showReportTools() {
+        RwDialogs.actions(
+            this,
+            "问题报告工具",
+            "一键发送在上一级；这里只放现场记录和诊断",
+            listOf(
+                RwDialogs.Action("记录问题现场") { openReportAction("record") },
+                RwDialogs.Action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) },
+                RwDialogs.Action("导出问题报告") { openReportAction("export") },
+                RwDialogs.Action("仅接收问题报告") {
+                    idle?.close(); idle = null
+                    startActivity(Intent(this, ProbeActivity::class.java)); finish()
+                },
+            ),
+            cancelLabel = "返回",
+        )
+    }
+
+    private fun openReportAction(action: String) {
+        idle?.close(); idle = null
+        startActivity(Intent(this, ProbeActivity::class.java).putExtra("autoAction", action))
+        finish()
     }
 
     private fun showLocalHistory() {
@@ -954,8 +998,42 @@ class RecordingActivity : ComponentActivity() {
     private fun hideTimer() {
         if (::timerLabel.isInitialized) timerLabel.visibility = View.GONE
         if (::activityTimer.isInitialized) activityTimer.visibility = View.GONE
+        if (::stepCountdown.isInitialized) stepCountdown.visibility = View.GONE
+        if (::stepInstruction.isInitialized) stepInstruction.visibility = View.GONE
         if (::successBanner.isInitialized) successBanner.visibility = View.GONE
     }
+    private fun countdownText(s: ActivityRecordingService.Companion.State, mode: String, contact: Boolean): String {
+        val seconds = if (mode == "ECG" && contact && s.remaining > 0) s.remaining else s.phaseRemainingSeconds
+        if (seconds <= 0) return ""
+        return when {
+            s.phase.startsWith("READY_SPO2") -> "准备血氧 · ${seconds} 秒后自动开始"
+            s.phase.startsWith("READY_PPG") -> "准备 PPG · ${seconds} 秒后自动开始"
+            s.phase.startsWith("WAIT_BIA") -> "接触中断 · ${seconds} 秒后自动重试"
+            s.phase == "RESTORE_PRE" -> "恢复佩戴 · ${seconds} 秒后自动继续"
+            mode == "ECG" && !contact -> "等待接触 · ${seconds} 秒后停止"
+            else -> "剩余 ${seconds} 秒"
+        }
+    }
+
+    private fun instructionsFor(s: ActivityRecordingService.Companion.State, mode: String, contact: Boolean): String =
+        when (mode) {
+            "ECG" -> if (contact)
+                "已检测到接触\n手臂放稳，保持接触\n不要滑动，直到倒计时结束"
+            else
+                "食指轻触 Home 键，不要按下\n手臂放稳，另一只手不要碰表框\n保持接触，不要滑动"
+            "BIA" -> {
+                val item = if (s.biaModeCount > 1) "第 ${s.biaModeNumber}/${s.biaModeCount} 项：${s.biaMode.ifBlank { "体成分" }}\n" else ""
+                item + if (contact)
+                    "双指接触已确认\n两指不要相触，双手不要相碰\n保持不动，直到测量完成"
+                else
+                    "手表上移贴紧，手臂抬起\n中指上键、无名指下键\n两指不相触，双手不相碰"
+            }
+            "SPO2" -> "手表上移贴紧，手肘放桌上\n手腕靠近心脏，保持静止\n不要说话或移动"
+            "PPG" -> "正常佩戴并贴紧\n手臂放稳，保持静止\n采集 30 秒后自动继续"
+            "RESTORE" -> "移回平时佩戴位置\n表带贴紧，保持不动\n倒计时结束后自动继续"
+            else -> ""
+        }
+
     private fun formatElapsed(seconds: Long): String {
         val safe = seconds.coerceAtLeast(0L)
         val hours = safe / 3600

@@ -7,7 +7,7 @@ class WatchSyncOwnerTest {
         val app=ProbeApplication()
         val owner=WatchActivitySyncSession(app,"MANUAL")
         app.activeWatchActivitySync=owner
-        owner.transferFactory={throw IllegalStateException("injected constructor failure")}
+        owner.transferFactory={ _, _ -> throw IllegalStateException("injected constructor failure")}
         owner.start()
         assertNull(app.activeSyncOwner)
         assertNull(app.activeWatchActivitySync)
@@ -21,7 +21,7 @@ class WatchSyncOwnerTest {
         val status=ProbeApplication.ActivitySyncStatus(true,false,"existing")
         app.activitySyncStatus=status
         val owner=WatchActivitySyncSession(app,"MANUAL")
-        owner.transferFactory={error("must not construct while busy")}
+        owner.transferFactory={ _, _ -> error("must not construct while busy")}
         owner.start()
         assertEquals("existing",app.activeSyncOwner)
         assertSame(status,app.activitySyncStatus)
