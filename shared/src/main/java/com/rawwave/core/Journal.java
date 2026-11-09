@@ -122,6 +122,19 @@ public final class Journal {
         if (sdkLogs != null) for (File file : sdkLogs) {
             if (file.isFile()) files.put(role + "/" + file.getName(), Files.readAllBytes(file.toPath()));
         }
+        // Short, explicit sensor-registration probes are diagnostic evidence, never activity payload.
+        // Keep the four newest bounded files so a probe cannot crowd out the report itself.
+        File[] probes = new File(directory, "sensor-probes")
+            .listFiles((dir, name) -> name.matches("[A-Za-z0-9._-]+\\.json"));
+        if (probes != null) {
+            Arrays.sort(probes, Comparator.comparingLong(File::lastModified).reversed());
+            int included = 0;
+            for (File file : probes) {
+                if (!file.isFile() || file.length() > 512 * 1024) continue;
+                files.put(role + "/sensor-probes/" + file.getName(), Files.readAllBytes(file.toPath()));
+                if (++included >= 4) break;
+            }
+        }
         return files;
     }
 

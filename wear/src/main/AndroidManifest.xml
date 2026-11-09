@@ -1,4 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+﻿<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
     <queries>
         <package android:name="com.google.android.gms" />
         <package android:name="com.google.android.wearable.app.cn" />
@@ -31,8 +31,13 @@
         <provider android:name="androidx.startup.InitializationProvider" tools:node="remove" tools:ignore="MissingClass" />
         <receiver android:name="androidx.profileinstaller.ProfileInstallReceiver" tools:node="remove" tools:ignore="MissingClass" />
         <meta-data android:name="com.google.android.wearable.standalone" android:value="true" />
-        <activity android:name="com.rawwave.shell.ProbeActivity" android:exported="false" android:enableOnBackInvokedCallback="true" />
-        <activity android:name="com.rawwave.shell.RecordingActivity" android:exported="true" android:enableOnBackInvokedCallback="true"
+        <activity android:name="com.rawwave.shell.ProbeActivity" android:exported="false"
+            android:screenOrientation="nosensor" android:enableOnBackInvokedCallback="true" />
+        <activity android:name="com.rawwave.shell.SensorProbeActivity" android:exported="false"
+            android:screenOrientation="nosensor" android:label="传感器注册测试" android:enableOnBackInvokedCallback="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
+        <activity android:name="com.rawwave.shell.RecordingActivity" android:exported="true"
+            android:screenOrientation="nosensor" android:enableOnBackInvokedCallback="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

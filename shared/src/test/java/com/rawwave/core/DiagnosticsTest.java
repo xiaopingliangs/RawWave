@@ -36,6 +36,20 @@ public class DiagnosticsTest {
         assertTrue(new File(dir, "events.previous.jsonl").length() <= Journal.MAX_LOG_BYTES);
         assertTrue(journal.snapshot().containsKey("watch/rotation.json"));
     }
+    @Test public void sensorProbeFilesAreBoundedAndIncludedInTheReportSnapshot() throws Exception {
+        File dir = temp.newFolder();
+        Journal journal = new Journal(dir, "watch");
+        File probes = new File(dir, "sensor-probes");
+        assertTrue(probes.mkdirs());
+        Files.writeString(new File(probes, "hr_ab-1.json").toPath(), "{\"probe\":\"hr\"}");
+        Files.writeString(new File(probes, "light_cct-1.json").toPath(), "{\"probe\":\"light\"}");
+        var snapshot = journal.snapshot();
+        assertArrayEquals("{\"probe\":\"hr\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+            snapshot.get("watch/sensor-probes/hr_ab-1.json"));
+        assertArrayEquals("{\"probe\":\"light\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+            snapshot.get("watch/sensor-probes/light_cct-1.json"));
+    }
+
     @Test public void archiveIsVerifiedAndCannotOverwrite() throws Exception {
         File output = new File(temp.newFolder(), "report.zip");
         DiagnosticArchive.create(output, Map.of("summary.md", "真实报告".getBytes(java.nio.charset.StandardCharsets.UTF_8)));

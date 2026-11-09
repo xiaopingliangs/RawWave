@@ -24,6 +24,16 @@ public final class SensorRows {
             for (Object item : list) copy.add(copyValue(item));
             return Collections.unmodifiableList(copy);
         }
+        if (value instanceof Map<?,?> map) {
+            Map<String,Object> copy = new LinkedHashMap<>();
+            for (Map.Entry<?,?> item : map.entrySet()) {
+                if (!(item.getKey() instanceof String key))
+                    throw new IllegalArgumentException("UNSUPPORTED_SENSOR_MAP_KEY:" +
+                        (item.getKey() == null ? "null" : item.getKey().getClass().getName()));
+                copy.put(key, copyValue(item.getValue()));
+            }
+            return Collections.unmodifiableMap(copy);
+        }
         // Do not silently serialize an SDK object or stringify unknown scientific values.
         throw new IllegalArgumentException("UNSUPPORTED_SENSOR_VALUE:" + value.getClass().getName());
     }

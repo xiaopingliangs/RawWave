@@ -27,12 +27,15 @@ import java.util.concurrent.Executors
 class ProbeActivity : ComponentActivity() {
     private val main = Handler(Looper.getMainLooper())
     private var worker = Executors.newSingleThreadExecutor()
+    private var reportWorker = Executors.newSingleThreadExecutor()
     private val app get() = application as ProbeApplication
     private lateinit var status: TextView
     private lateinit var powerNote: TextView
     private lateinit var receivedSummary: TextView
+    private lateinit var reportStatus: TextView
     private lateinit var batteryState: TextView
     private var summaryOperation = 0L
+    private var summaryLoading = false
     private var working = false
     private var exiting = false
     private var operation = 0L
@@ -42,7 +45,9 @@ class ProbeActivity : ComponentActivity() {
     private val ownerToken = java.util.UUID.randomUUID().toString()
     private val diagnosticPreempt: () -> Unit = { preemptDiagnosticForActivity() }
     private val syncObserver: (String) -> Unit = { reason ->
-        if (!exiting && !working) exitNow("BACKGROUND_SYNC_$reason", force = true)
+        // The phone home is deliberately persistent: a watch-initiated diagnostic receive must
+        // update the page, not close it. The watch console still exits after its bounded task.
+        if (BuildConfig.DEVICE_ROLE == "watch" && !exiting && !working) exitNow("BACKGROUND_SYNC_$reason", force = true)
     }
     private val activitySyncObserver: (ProbeApplication.ActivitySyncStatus) -> Unit = { sync ->
         if (!exiting && ::status.isInitialized) {
@@ -57,6 +62,7 @@ class ProbeActivity : ComponentActivity() {
         if (!exiting && transfer == null) {
             if (sync.running) holdIdleForActivitySync() else releaseIdleForActivitySync()
         }
+        if (!exiting) keepPhoneHomeVisible()
         if (!exiting && !sync.running && sync.success) refreshReceivedSummary()
     }
     private val activityIdleHold: () -> Boolean = { holdIdleForActivitySync() }
@@ -65,6 +71,12 @@ class ProbeActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (BuildConfig.DEVICE_ROLE == "phone") {
+            // Keep the consumer page visible when the user presses power again. The keyguard
+            // is not used to hide RawWave; the page has no sensitive history beyond the data
+            // the user explicitly asked to export.
+            setShowWhenLocked(true)
+        }
         app.syncFinished = syncObserver
         app.activitySyncObserver = activitySyncObserver
         app.activityIdleHold = activityIdleHold
@@ -78,7 +90,7 @@ class ProbeActivity : ComponentActivity() {
         if (watch) buildWatchConsole() else buildPhoneHome()
         record("ACTIVITY_CREATED", mapOf("screenRound" to resources.configuration.isScreenRound))
         try { app.journal?.mark("RUNNING") } catch (error: Exception) { showError(error) }
-        scheduleIdle()
+        if (watch) scheduleIdle() else keepPhoneHomeVisible()
         if (watch) {
             val autoAction = intent.getStringExtra("autoAction")
             if (!autoAction.isNullOrBlank()) main.post {
@@ -124,6 +136,15 @@ class ProbeActivity : ComponentActivity() {
             setTextColor(colors.onSurface)
             setPadding(0, dp(2), 0, dp(4))
         })
+        if (captureServiceRunning()) {
+            body.addView(RwBodyText(this).apply {
+                text = "当前仍有活动在采集：背面红/绿/蓝灯是传感器工作指示。\n请先回到首页结束活动；结束后灯会熄灭。"
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+                gravity = Gravity.CENTER
+                setTextColor(colors.onSurfaceVariant)
+                setPadding(0, 0, 0, dp(4))
+            })
+        }
         status = RwBodyText(this).apply {
             text = initialStatus()
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
@@ -276,6 +297,16 @@ class ProbeActivity : ComponentActivity() {
             },
             phoneButtonParams(12),
         )
+        reportStatus = RwBodyText(this).apply {
+            text = "导出时会在这里显示进度。"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(colors.onSurfaceVariant)
+            setPadding(0, dp(8), 0, 0)
+        }
+        reportCard.addView(
+            reportStatus,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
         reportCard.addView(
             RwSecondaryButton(this).apply {
                 text = "诊断 / 记录问题现场"
@@ -389,8 +420,9 @@ class ProbeActivity : ComponentActivity() {
     }
 
     private fun refreshReceivedSummary() {
-        if (!::receivedSummary.isInitialized || working || exiting) return
+        if (!::receivedSummary.isInitialized || working || exiting || summaryLoading) return
         val op = ++summaryOperation
+        summaryLoading = true
         receivedSummary.text = "正在读取已接收活动…"
         if (worker.isShutdown) worker = Executors.newSingleThreadExecutor()
         worker.execute {
@@ -413,7 +445,8 @@ class ProbeActivity : ComponentActivity() {
                             .atZone(java.time.ZoneId.systemDefault())
                             .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
                     } ?: "时间未知"
-                    "已接收 ${sessions.size} 次活动\n最近：$time\n原始包约 ${"%.1f".format(bytes / 1024.0 / 1024.0)} MB"
+                    val name = latest?.activityName()?.takeIf { it.isNotBlank() } ?: "未命名活动"
+                    "已接收 ${sessions.size} 次活动\n最近：$name · $time\n原始包约 ${"%.1f".format(bytes / 1024.0 / 1024.0)} MB"
                 }
             } catch (_: ActivityDataExporter.NoDataException) {
                 "还没有收到活动数据。\n在手表结束活动后，保持两台设备靠近即可自动同步。"
@@ -421,6 +454,7 @@ class ProbeActivity : ComponentActivity() {
                 "读取活动失败：${failure.javaClass.simpleName}: ${failure.message}"
             }
             main.post {
+                if (op == summaryOperation) summaryLoading = false
                 if (!exiting && op == summaryOperation && ::receivedSummary.isInitialized) {
                     receivedSummary.text = text
                 }
@@ -537,8 +571,15 @@ class ProbeActivity : ComponentActivity() {
         }
     }
 
-    private fun saveDiagnosticCapture(selected: List<String>) {
-        val journal = app.journal
+    private fun captureServiceRunning(): Boolean = try {
+        getSystemService(android.app.ActivityManager::class.java)
+            .getRunningServices(64)
+            .any { it.service.className == "com.rawwave.shell.ActivityRecordingService" }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun saveDiagnosticCapture(selected: List<String>) {        val journal = app.journal
         if (journal == null) { status.text = app.journalFailure ?: "诊断存储未初始化，无法记录问题现场。"; return }
         val captureId = java.util.UUID.randomUUID().toString()
         val led = if ("LED_PERSISTENT" in selected) "ON" else "NOT_OBSERVED"
@@ -563,6 +604,7 @@ class ProbeActivity : ComponentActivity() {
             "activeSyncOwner" to app.activeSyncOwner.orEmpty(),
             "activitySyncRunning" to app.activitySyncStatus.running,
             "activitySyncTrigger" to app.activitySyncStatus.trigger,
+            "captureServiceRunning" to captureServiceRunning(),
             "lastStopReason" to app.lastStopReason.orEmpty(),
             "processState" to (try { journal.previousState() } catch (_: Exception) { "UNKNOWN" })
         )
@@ -658,10 +700,27 @@ class ProbeActivity : ComponentActivity() {
     private fun scheduleIdle() {
         if (!working && !exiting) runtime.touchIdle()
     }
+    /** Phone home stays alive until the explicit exit button; no idle timeout kills it. */
+    private fun keepPhoneHomeVisible() {
+        if (BuildConfig.DEVICE_ROLE != "phone" || exiting || working || transfer != null) return
+        if (runtime.isIdleHeld()) return
+        if (!runtime.holdIdle()) {
+            runtime.close()
+            runtime = newIdleRuntime()
+            runtime.holdIdle()
+        }
+    }
     private fun newIdleRuntime() = DeadlineRuntime(
         idleBudgetMs = if (BuildConfig.DEVICE_ROLE == "phone") WorkBudget.PHONE_UI_IDLE_MS else WorkBudget.IDLE_MS,
     ) { reason, evidence -> onIdleDeadline(reason, evidence) }
     private fun onIdleDeadline(reason: String, evidence: Map<String, Any>) {
+        if (BuildConfig.DEVICE_ROLE == "phone" && reason == "DEADLINE_IDLE") {
+            // The consumer home page is not a bounded diagnostic task. Keep it visible for the
+            // next screen-on instead of closing the task in the user's pocket.
+            record("PHONE_HOME_IDLE_SUPPRESSED", evidence)
+            keepPhoneHomeVisible()
+            return
+        }
         // A watch-initiated activity transfer owns its own lease; the page idle countdown must
         // never cancel that receive just because the screen was untouched.
         if (app.activitySyncStatus.running && transfer == null) {
@@ -719,30 +778,41 @@ class ProbeActivity : ComponentActivity() {
 
     private fun exportReport() {
         if (working || exiting) return
-        if (app.activeSyncOwner != null) { status.text = "正在同步；完成后再导出报告。"; return }
+        if (app.activeSyncOwner != null) {
+            showReportProgress("正在同步；完成后再导出报告。")
+            return
+        }
         val journal = app.journal ?: run { status.text = initialStatus(); return }
         if (!runtime.begin(RunDeadlines.Kind.EXPORT, 58_000)) return
         app.activeSyncOwner = ownerToken
         working = true
         val owner = ++operation
         record("DEADLINE_ARMED", runtime.evidence())
-        status.text = "正在保存问题报告…本次诊断导出最多 60 秒；不是健康历史导出的时长限制。"
+        showReportProgress("正在保存问题报告…本次诊断导出最多 60 秒。")
+        val progress: (String) -> Unit = { text ->
+            main.post { if (owner == operation && !exiting) showReportProgress(text) }
+        }
+        val builder = DiagnosticReportBuilder(
+            journal, File(filesDir, "received"), File(cacheDir, "reports"),
+            BuildConfig.DEVICE_ROLE, mapOf(
+                "appId" to packageName, "versionCode" to BuildConfig.VERSION_CODE,
+                "versionName" to BuildConfig.VERSION_NAME, "buildRun" to BuildConfig.BUILD_RUN,
+                "debuggable" to BuildConfig.DEBUG, "manufacturer" to Build.MANUFACTURER,
+                "model" to Build.MODEL, "sdkInt" to Build.VERSION.SDK_INT, "fingerprint" to Build.FINGERPRINT,
+                "release" to Build.VERSION.RELEASE, "display" to Build.DISPLAY),
+            File(filesDir, "diagnostic-summary/latest.json"), progress,
+        )
         val exporter = ReportExporter(
-            DiagnosticReportBuilder(journal, File(filesDir, "received"), File(cacheDir, "reports"),
-                BuildConfig.DEVICE_ROLE, mapOf(
-                    "appId" to packageName, "versionCode" to BuildConfig.VERSION_CODE,
-                    "versionName" to BuildConfig.VERSION_NAME, "buildRun" to BuildConfig.BUILD_RUN,
-                    "debuggable" to BuildConfig.DEBUG, "manufacturer" to Build.MANUFACTURER,
-                    "model" to Build.MODEL, "sdkInt" to Build.VERSION.SDK_INT, "fingerprint" to Build.FINGERPRINT,
-                    "release" to Build.VERSION.RELEASE, "display" to Build.DISPLAY), File(filesDir, "diagnostic-summary/latest.json")),
-            DownloadsExportDestination(contentResolver), journal)
-        if (worker.isShutdown) worker = Executors.newSingleThreadExecutor()
-        worker.execute {
+            builder, DownloadsExportDestination(contentResolver), journal, progress,
+        )
+        if (reportWorker.isShutdown) reportWorker = Executors.newSingleThreadExecutor()
+        reportWorker.execute {
             try {
                 val report = exporter.export(owner)
                 main.post {
                     if (owner == operation && !exiting && runtime.check("EXPORT_RESULT")) {
-                        status.text = "已保存并回读校验：\nDownload/RawWave/${report.file().name}"
+                        val saved = "已保存并回读校验：\nDownload/RawWave/${report.file().name}"
+                        showReportProgress(saved)
                         RwDialogs.message(
                             this,
                             "问题报告已保存",
@@ -754,26 +824,37 @@ class ProbeActivity : ComponentActivity() {
                     }
                 }
             } catch (failure: Exception) {
-                main.post { if (owner == operation && !exiting && runtime.check("EXPORT_FAILURE")) {
-                    showError(failure)
-                    RwDialogs.message(
-                        this,
-                        "问题报告导出失败",
-                        "没有报告成功。\n${failure.javaClass.simpleName}: ${failure.message}\n\n" +
-                            if (failure is ReportExporter.Failure && failure.published)
-                                "注意：已校验的导出文件已发布并保留；失败发生在后续诊断记录。"
-                            else "本机日志仍保留，可稍后重试。",
-                        confirmLabel = "知道了",
-                    )
-                } }
+                main.post {
+                    if (owner == operation && !exiting && runtime.check("EXPORT_FAILURE")) {
+                        val detail = "${failure.javaClass.simpleName}: ${failure.message}"
+                        showReportProgress("导出失败：$detail\n本机日志仍保留，可稍后重试。")
+                        RwDialogs.message(
+                            this,
+                            "问题报告导出失败",
+                            "没有报告成功。\n$detail\n\n" +
+                                if (failure is ReportExporter.Failure && failure.published)
+                                    "注意：已校验的导出文件已发布并保留；失败发生在后续诊断记录。"
+                                else "本机日志仍保留，可稍后重试。",
+                            confirmLabel = "知道了",
+                        )
+                    }
+                }
             } finally {
-                main.post { if (owner == operation && !exiting) {
-                    working = false; runtime.finishExport()
-                    if (app.activeSyncOwner == ownerToken) app.activeSyncOwner = null
-                    if (background) parkIdle()
-                } }
+                main.post {
+                    if (owner == operation && !exiting) {
+                        working = false; runtime.finishExport()
+                        if (app.activeSyncOwner == ownerToken) app.activeSyncOwner = null
+                        keepPhoneHomeVisible()
+                        if (background) parkIdle()
+                    }
+                }
             }
         }
+    }
+
+    private fun showReportProgress(text: String) {
+        if (::reportStatus.isInitialized) reportStatus.text = text
+        else if (::status.isInitialized) status.text = text
     }
 
     private fun showError(failure: Exception) {
@@ -804,6 +885,8 @@ class ProbeActivity : ComponentActivity() {
         transfer?.cancel()
         record("EXIT_REQUESTED", mapOf("reason" to reason))
         worker.shutdownNow()
+        reportWorker.shutdownNow()
+        summaryLoading = false
         main.removeCallbacksAndMessages(null)
         record("CLEANUP_RESULT", mapOf("workerStopRequested" to true, "workerTerminatedAtCheck" to worker.isTerminated,
             "systemResourcesVerified" to false, "forcedProcessKill" to false, "cachedProcessAllowed" to true))
@@ -823,6 +906,7 @@ class ProbeActivity : ComponentActivity() {
         if (app.activityIdleRelease === activityIdleRelease) app.activityIdleRelease = null
         transfer?.cancel()
         worker.shutdownNow()
+        reportWorker.shutdownNow()
         main.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -847,12 +931,14 @@ class ProbeActivity : ComponentActivity() {
             if (app.activitySyncStatus.running) holdIdleForActivitySync()
             else if (runtime.isClosed()) releaseIdleForActivitySync()
         }
+        if (!exiting) keepPhoneHomeVisible()
         if (!exiting && runtime.resumeIdle()) record("IDLE_PAGE_RETURNED_WITHIN_EXISTING_DEADLINE", runtime.evidence())
         if (!exiting && runtime.check("RESUME")) record("ACTIVITY_RESUMED", runtime.evidence())
     }
     private fun parkIdle() {
         if (runtime.parkIdle()) {
             worker.shutdownNow()
+            summaryLoading = false
             record("IDLE_BACKGROUND_QUIESCENT", runtime.evidence() + mapOf(
                 "workerStopRequested" to true, "scheduledCallbacks" to 0,
                 "syncLease" to false, "cachedPageMayRemain" to true))

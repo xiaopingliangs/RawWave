@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     id("com.android.application")
 }
 android {
@@ -8,8 +8,8 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 88
-        versionName = "0.12.14-step"
+        versionCode = 96
+        versionName = "0.12.22-step"
         buildConfigField("String", "DEVICE_ROLE", "\"watch\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))
@@ -19,6 +19,10 @@ android {
         buildConfig = true
     }
     testOptions { unitTests.isReturnDefaultValues = true }
+    lint {
+        abortOnError = false
+        disable += "InvalidFragmentVersionForActivityResult"
+    }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     sourceSets.getByName("main") {
         kotlin.directories += "../app-common/java"

@@ -1,3 +1,49 @@
+## 2026-11-09 测试版：0.12.22 活动缓存 / 常驻前台 / 报告进度 / 手表旋转
+
+- 运行编号：`cache-visible-20261109-r04`
+- 版本：`0.12.22-step` / versionCode 96
+- 类型：测试版，不是稳定发布
+- 真机：手表 r04 已安装并确认版本；手机待安装验收
+
+### 本版重点
+
+- 手机首页、原始活动导出页、Samsung Health 导出页启用锁屏可见；手机首页不再按 3 分钟空闲或后台诊断同步完成自行退出，只有“退出软件”/返回键结束。
+- 活动列表优先读取接收时写入的 `<包ID>.verified.json`：文件长度和回执一致时不再深度解压/逐文件 SHA-256；缺回执的旧包只校验一次并补写；文件变化后回执失效并重新校验/隔离。
+- 单活动导出直接复制原始 ZIP，不再把几千个原始文件解包再重新压缩；边复制边算 SHA-256，发布前仍回读校验；导出页显示百分比和 MB 进度。
+- 问题报告改用独立工作线程，不再排在活动包深度校验后面；进度显示在“问题报告”卡片导出按钮下方（收集日志 → 校验手表附件 → 写 ZIP → 回读 SHA-256 → 完成/失败）。
+- 手表同时勾选“连续 PPG”和“前后短测 PPG”时，只跳过活动前 100Hz 短测，避免厂商 25 Hz client 残留导致背面灯常亮；活动中连续 PPG 和活动后 100Hz 保留。
+- 手表三个 Activity 使用 `android:screenOrientation="nosensor"`，RawWave 页面在充电时也不跟随传感器旋转；表盘/系统桌面仍受三星充电态旋转策略影响。
+- “记录现场问题”新增 `captureServiceRunning`；问题报告页在采集服务仍运行时提示背面红/绿/蓝灯是传感器工作指示。
+
+### 附件报告确认的根因
+
+- 用户手机报告显示已接收 86 个活动包；12:07:11 点击导出问题报告后 58 秒截止到点仍未开始，第二次排队 44 秒，报告实际生成/回读仅 182 ms（230,141 B）。慢在活动深度校验占用同一单线程，不在报告本身。
+- 手表 20:04:35 现场记录 `LED_PERSISTENT`；上次采集 19:30:46 结束时 10 个厂商 tracker 都执行了 final unset + 重试、`disconnectService()` 返回、连接结束回调到达，`trackersRetained=0`；但 SDK 不提供硬件停止回执。
+- 手表旋转问题现场定位为无线充电态：`Wireless powered=true` 时三星 `WristOrientationObserver` 会解除旋转锁；离开充电器后系统锁回 `USER_ROTATION_LOCKED / ROTATION_0`。
+
+### 验证
+
+- shared 384 + wear 82 + mobile 23 = 489 tests，失败 0、错误 0、跳过 1（私有语料未配置）。
+- 新增回归：已校验回执写入、文件变化后缓存失效、单活动直接复制并回读、导出进度到达总字节；手表回归验证连续 PPG 开启时跳过活动前 100Hz、活动后 100Hz 仍运行。
+- 双端 release 编译通过；lint 0 errors（mobile 60 / wear 64 既有警告）。
+- release v2 签名同证书：`3078614c42158d1608e1ba7f97e4e0a4e4a6ad8f9e89daa91e073cdf34844b61`。
+- 手表 r04 已通过 `adb push` + `pm install -r` 安装成功；最终 APK manifest 中三个手表 Activity 均为 `screenOrientation=5 (nosensor)`。
+
+### 安装
+
+手机：`Phone_RawWave_0.12.22-step_cache-visible-20261109-r04.apk`
+SHA256：`09043DC83AE42E3731DA0D9718C727A309496939A72C0079AE066FC87EC5C3C6`
+
+手表：`Watch_RawWave_0.12.22-step_cache-visible-20261109-r04.apk`
+SHA256：`C9501DF9FAB2A32673FE874F39F889B6A997CD8301F160D5E1A4C92AFBDA3A3F`
+
+双端 ZIP：`Both_RawWave_0.12.22-step_cache-visible-20261109-r04.zip`
+SHA256：`CFDE3619C4CAD181133474A63351F59AD540A251B74B30B3AF598D977EFF4177`
+
+两端成对覆盖安装，保留原有数据，不需要先卸载。使用本地测试证书，不是公开发行包。
+
+---
+
 ## 2026-11-08 测试版：0.12.14 同步打包租约 + 手机 3 分钟空闲
 
 - 运行编号：`sync-packaging-20261108-r03`

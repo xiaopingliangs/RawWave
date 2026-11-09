@@ -1,0 +1,28 @@
+﻿{
+    "runId":  "cache-visible-20261109-r04",
+    "versionCode":  96,
+    "versionName":  "0.12.22-step",
+    "builtAt":  "2026-11-09T21:20:15.1541591+08:00",
+    "developerResult":  "PASS_WITH_PRIVATE_CORPUS_NOT_RUN",
+    "deviceResult":  "NOT_RUN",
+    "tests":  489,
+    "skippedTests":  1,
+    "lintErrors":  0,
+    "artifacts":  [
+                      {
+                          "file":  "Phone_RawWave_0.12.22-step_cache-visible-20261109-r04.apk",
+                          "bytes":  8094584,
+                          "sha256":  "09043DC83AE42E3731DA0D9718C727A309496939A72C0079AE066FC87EC5C3C6"
+                      },
+                      {
+                          "file":  "Watch_RawWave_0.12.22-step_cache-visible-20261109-r04.apk",
+                          "bytes":  7085524,
+                          "sha256":  "C9501DF9FAB2A32673FE874F39F889B6A997CD8301F160D5E1A4C92AFBDA3A3F"
+                      },
+                      {
+                          "file":  "Both_RawWave_0.12.22-step_cache-visible-20261109-r04.zip",
+                          "bytes":  5446346,
+                          "sha256":  "CFDE3619C4CAD181133474A63351F59AD540A251B74B30B3AF598D977EFF4177"
+                      }
+                  ]
+}

@@ -186,16 +186,20 @@ public final class ActivityStore {
         public final File folder;
         private final Map<String,Object> files = new TreeMap<>();
         private final Map<String,Long> rows = new TreeMap<>();
+        private final String activityName;
+        private final String activityTemplateId;
         private int sequence;
         private boolean sealed;
         private Session(Template t,long utc,long elapsed) throws IOException {
+            activityName = t.name(); activityTemplateId = t.id();
             folder = new File(new File(root,"sessions"),id); Files.createDirectories(folder.toPath());
             Map<String,Object> plan=new LinkedHashMap<>();
             plan.put("schema",5); plan.put("sessionId",id); plan.put("template",t);
             plan.put("createdUtcMs",utc); plan.put("createdElapsedMs",elapsed);
             plan.put("coreSources",t.coreSources());
-            plan.put("source","Samsung Health Sensor SDK 1.4.1; GYROSCOPE, GYROSCOPE_UNCALIBRATED, PRESSURE, MAGNETIC_FIELD, MAGNETIC_FIELD_UNCALIBRATED, LIGHT, STEP_COUNT, STEP_DETECTOR and OFFBODY use Android SensorManager; GPS uses Android LocationManager and is platform location, not raw GNSS measurements");
+            plan.put("source","Samsung Health Sensor SDK 1.4.1; GYROSCOPE, GYROSCOPE_UNCALIBRATED, PLATFORM_ACCELEROMETER, PRESSURE, MAGNETIC_FIELD, MAGNETIC_FIELD_UNCALIBRATED, LIGHT, STEP_COUNT, STEP_DETECTOR and OFFBODY use Android SensorManager; GPS uses Android LocationManager with a GnssStatus snapshot and is platform location, not raw GNSS measurements");
             Map<String,String> kinds = new LinkedHashMap<>();
+            kinds.put(SensorCatalog.DEVICE_STATE,SensorCatalog.dataKind(SensorCatalog.DEVICE_STATE));
             if (t.ecg()) kinds.put(SensorCatalog.ECG,SensorCatalog.dataKind(SensorCatalog.ECG));
             if (t.bia()) {
                 if (t.biaBoth()) {
@@ -213,7 +217,9 @@ public final class ActivityStore {
             plan.put("rawPolicy","SDK values copied without filtering, interpolation, invented samples or unit conversion; quality metadata is separate");
             plan.put("sampleTime","Samsung SDK timestamp milliseconds retained; Android platform original sensorTimestampNs retained with separately derived sdkTimestamp milliseconds; GPS Location.getElapsedRealtimeNanos and Location.getTime UTC retained; receipt clocks and captureCallback fields are separate metadata");
             if (t.coreSources().contains(SensorCatalog.GPS)) plan.put("gpsPolicy",
-                "LocationManager GPS_PROVIDER platform fixes only; not raw GNSS measurements; no filtering, interpolation, smoothing, invented points or road snapping; provider-disabled, permission and start failures are explicit; no delivered tail is provable after stop because LocationManager has no flush API; Location.extras and GNSS measurements are not captured");
+                "LocationManager GPS_PROVIDER platform fixes only; not raw GNSS measurements; no filtering, interpolation, smoothing, invented points or road snapping; provider-disabled, permission and start failures are explicit; no delivered tail is provable after stop because LocationManager has no flush API; Location.extras are not captured; a GnssStatus snapshot (satellite/used/C/N0/constellation counts) is attached to each delivered fix when the platform provides it");
+            plan.put("deviceStatePolicy",
+                "Battery, charging, screen, keyguard and display state are sampled about once per minute and at session start/end; context metadata only, not a health measurement; unknown values stay null; screen state is recorded directly, never inferred from sensor callback batch sizes");
             if (t.coreSources().contains(SensorCatalog.STEP_COUNT)) plan.put("stepCountPolicy",
                 "TYPE_STEP_COUNTER cumulative platform counter since boot; callbacks occur only when the platform counter changes, so long gaps while stationary are expected and are not missing samples or zero steps; original float value and sensorTimestampNs retained; platform counter, not raw motion and not a per-step event stream; no filtering, interpolation, invented steps or step inference");
             if (t.coreSources().contains(SensorCatalog.STEP_DETECTOR)) plan.put("stepDetectorPolicy",
@@ -234,7 +240,12 @@ public final class ActivityStore {
             if(samples.isEmpty()) return;
             String name=String.format(Locale.ROOT,"%08d-%s-%s.json",++sequence,phase,sensor);
             File file=new File(folder,name);
-            write(file,Map.of("phase",phase,"sensor",sensor,"samples",samples));
+            // The activity name is header metadata, stored once per block. Samples stay byte-for-byte
+            // the sensor values and never repeat or rewrite the activity label.
+            Map<String,Object> block=new LinkedHashMap<>();
+            block.put("activityName",activityName); block.put("activityTemplateId",activityTemplateId);
+            block.put("phase",phase); block.put("sensor",sensor); block.put("samples",samples);
+            write(file,block);
             byte[] bytes=Files.readAllBytes(file.toPath());
             files.put(name,Map.of("bytes",bytes.length,"sha256",DiagnosticArchive.hash(bytes),"rows",samples.size()));
             rows.merge(phase+"/"+sensor,(long)samples.size(),Long::sum);

@@ -114,6 +114,24 @@ public class SensorCatalogTest {
         tracker.observe(List.of(AccelerometerUncalibrated.row(0.1f,0.2f,9.8f,0.01f,0.02f,0.03f,1L,3,1L,2L,1,0,1)));
         assertEquals(1L, tracker.summary().get("valueRows"));
     }
+    @Test public void platformAccelerometerIsASeparateStandardCoreSource() {
+        assertTrue(SensorCatalog.availableCoreSources().contains(SensorCatalog.PLATFORM_ACCELEROMETER));
+        assertTrue(SensorCatalog.isAndroidPlatformSource(SensorCatalog.PLATFORM_ACCELEROMETER));
+        assertEquals(List.of(SensorCatalog.PLATFORM_ACCELEROMETER),
+            SensorCatalog.normalizeCoreSources(List.of(SensorCatalog.PLATFORM_ACCELEROMETER)));
+        assertTrue(SensorCatalog.dataKind(SensorCatalog.PLATFORM_ACCELEROMETER).contains("m/s²"));
+        assertTrue(SensorCatalog.dataKind(SensorCatalog.PLATFORM_ACCELEROMETER).contains("not Samsung SDK raw integer"));
+        var tracker = new StreamQualityTracker(SensorCatalog.PLATFORM_ACCELEROMETER);
+        tracker.observe(List.of(PlatformAccelerometer.row(0.1f,0.2f,9.8f,1L,3,1L,2L,1,0,1)));
+        assertEquals(1L, tracker.summary().get("valueRows"));
+    }
+    @Test public void deviceStateIsMetadataStreamNotASelectableCoreSource() {
+        assertTrue(SensorCatalog.acceptsStream(SensorCatalog.DEVICE_STATE));
+        assertFalse(SensorCatalog.availableCoreSources().contains(SensorCatalog.DEVICE_STATE));
+        assertTrue(SensorCatalog.dataKind(SensorCatalog.DEVICE_STATE).contains("context metadata"));
+        assertThrows(IllegalArgumentException.class,
+            () -> SensorCatalog.normalizeCoreSources(List.of(SensorCatalog.DEVICE_STATE)));
+    }
     @Test public void fusedAccelerationAndOrientationAreCorePlatformSources() {
         assertTrue(SensorCatalog.availableCoreSources().contains(SensorCatalog.LINEAR_ACCELERATION));
         assertTrue(SensorCatalog.availableCoreSources().contains(SensorCatalog.GAME_ROTATION_VECTOR));

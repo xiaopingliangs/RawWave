@@ -11,7 +11,8 @@ import java.util.zip.*;
 
 /** Builds and verifies byte-preserving raw activity archives. It never interprets sensor values. */
 public final class ActivityArchive {
-    public static final long MAX_UNCOMPRESSED_BYTES = 512L * 1024 * 1024;
+    /** Raw session payload cap. bundle.json is derived metadata and has its own 16 MiB limit. */
+    public static final long MAX_UNCOMPRESSED_BYTES = 2L * 1024 * 1024 * 1024;
     private static final Gson JSON = new GsonBuilder().serializeNulls().create();
     private static final Pattern UUID = Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
     private static final Pattern BLOCK = Pattern.compile("[0-9]{8}-(?:PRE|CORE|POST)-[0-9]+-([A-Z0-9_]+)\\.json");
@@ -92,13 +93,18 @@ public final class ActivityArchive {
     }
 
     public static Verified verify(File archive) throws IOException {
+        return verify(archive, MAX_UNCOMPRESSED_BYTES);
+    }
+
+    /** Package-private seam so a regression test can prove the bundle manifest is not raw payload. */
+    static Verified verify(File archive, long maxRawBytes) throws IOException {
         if (!archive.isFile() || archive.length() <= 0 || archive.length() > ActivityTransferFiles.MAX_BYTES)
             throw new IOException("INVALID_ACTIVITY_ARCHIVE_SIZE");
         Map<String, Map<String,Object>> actual = new TreeMap<>();
         byte[] bundleBytes = null;
         Map<String,byte[]> seals = new HashMap<>();
         Map<String,byte[]> plans = new HashMap<>();
-        long total = 0;
+        long rawTotal = 0;
         try (ZipInputStream zip = new ZipInputStream(new FileInputStream(archive), StandardCharsets.UTF_8)) {
             ZipEntry entry;
             byte[] buffer = new byte[64 * 1024];
@@ -111,10 +117,12 @@ public final class ActivityArchive {
                 ByteArrayOutputStream captured = captureMetadata ? new ByteArrayOutputStream() : null;
                 long bytes = 0; int count;
                 while ((count = zip.read(buffer)) != -1) {
-                    bytes += count; total += count;
+                    bytes += count;
+                    if (!name.equals("bundle.json")) {
+                        rawTotal += count;
+                        if (rawTotal > maxRawBytes) throw new IOException("ACTIVITY_ARCHIVE_EXPANSION_LIMIT");
+                    }
                     long metadataLimit = name.equals("bundle.json") ? 16L * 1024 * 1024 : 8L * 1024 * 1024;
-                    if (total > MAX_UNCOMPRESSED_BYTES)
-                        throw new IOException("ACTIVITY_ARCHIVE_EXPANSION_LIMIT");
                     if (captured != null && bytes > metadataLimit)
                         throw new IOException("ACTIVITY_METADATA_LIMIT:" + name + ":" + bytes);
                     digest.update(buffer, 0, count);
@@ -164,7 +172,7 @@ public final class ActivityArchive {
             if (pieces.length != 3 || !pieces[0].equals("sessions") || !sessions.contains(pieces[1]))
                 throw new IOException("ACTIVITY_ENTRY_OUTSIDE_SESSION");
         }
-        return new Verified(id, List.copyOf(sessions), actual.size(), total, allSealed);
+        return new Verified(id, List.copyOf(sessions), actual.size(), rawTotal, allSealed);
     }
 
     private static Batch batch(File file, Verified verified) throws IOException {

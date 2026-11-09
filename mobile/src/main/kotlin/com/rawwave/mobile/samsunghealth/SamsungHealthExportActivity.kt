@@ -133,6 +133,7 @@ class SamsungHealthExportActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setShowWhenLocked(true)
         settings = DailyBoundarySettings(this)
         gateway = AndroidSamsungHealthGateway(applicationContext, zone)
 

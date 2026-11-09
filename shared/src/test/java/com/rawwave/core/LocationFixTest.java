@@ -28,6 +28,30 @@ public class LocationFixTest {
         assertEquals("PLATFORM_LOCATION_FIX_NOT_RAW_GNSS", row.get("locationKind"));
     }
 
+    @Test public void gnssStatusSnapshotIsAttachedWhenAvailable() {
+        var fix = new LocationFix.Fix("gps", 31.2304, 121.4737, null, 3.0, null,
+            null, null, null, null, 123456789L, 987654321L, false);
+        var gnss = new LocationFix.Gnss(12, 8, 32.5, 45.0,
+            Map.of("GPS", 8, "BEIDOU", 4), Map.of("GPS", 6, "BEIDOU", 2));
+        Map<String,Object> row = LocationFix.row(fix, gnss, 111L, 222L, 7, 0, 1);
+        assertEquals(12, row.get("GNSS_SATELLITE_COUNT"));
+        assertEquals(8, row.get("GNSS_USED_IN_FIX_COUNT"));
+        assertEquals(32.5, (Double) row.get("GNSS_MEAN_CN0_DB_HZ"), 0.0);
+        assertEquals(45.0, (Double) row.get("GNSS_MAX_CN0_DB_HZ"), 0.0);
+        assertEquals(Map.of("GPS", 8, "BEIDOU", 4), row.get("GNSS_CONSTELLATION_COUNTS"));
+        assertEquals(Map.of("GPS", 6, "BEIDOU", 2), row.get("GNSS_USED_CONSTELLATION_COUNTS"));
+        assertEquals("SNAPSHOT_AT_FIX_NOT_RAW_GNSS_MEASUREMENTS", row.get("gnssStatusKind"));
+    }
+
+    @Test public void missingGnssStatusKeepsExplicitNullFields() {
+        var fix = new LocationFix.Fix("gps", 1.0, 2.0, null, null, null,
+            null, null, null, null, null, 1L, false);
+        Map<String,Object> row = LocationFix.row(fix, 1L, 2L, 1, 0, 1);
+        assertTrue(row.containsKey("GNSS_SATELLITE_COUNT"));
+        assertNull(row.get("GNSS_SATELLITE_COUNT"));
+        assertNull(row.get("GNSS_CONSTELLATION_COUNTS"));
+    }
+
     @Test public void nonFiniteValuesAreEncodedNotDroppedOrRepaired() {
         var fix = new LocationFix.Fix("gps", Double.NaN, 121.0, null, null,
             Double.POSITIVE_INFINITY, null, null, null, null, null, 1L, false);

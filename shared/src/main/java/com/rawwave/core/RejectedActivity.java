@@ -15,7 +15,7 @@ public final class RejectedActivity {
         if (error instanceof RuntimeException) return error instanceof IllegalStateException || error instanceof IllegalArgumentException
             || error instanceof NullPointerException || error instanceof com.google.gson.JsonParseException;
         String message=String.valueOf(error.getMessage());
-        return List.of("INVALID_ACTIVITY_ARCHIVE_SIZE","DUPLICATE_OR_DIRECTORY_ENTRY","ACTIVITY_ARCHIVE_EXPANSION_LIMIT",
+        return List.of("INVALID_ACTIVITY_ARCHIVE_SIZE","ACTIVITY_ARCHIVE_UNREADABLE","ACTIVITY_PLAN_TOO_LARGE","DUPLICATE_OR_DIRECTORY_ENTRY","ACTIVITY_ARCHIVE_EXPANSION_LIMIT",
             "ACTIVITY_BUNDLE_","INVALID_ACTIVITY_BUNDLE_MANIFEST","INVALID_ACTIVITY_SESSION_ID","ACTIVITY_SESSION_METADATA_MISSING",
             "ACTIVITY_ENTRY_OUTSIDE_SESSION","ACTIVITY_SEAL_BYTES_MISSING","INVALID_ARCHIVED_SEAL","ARCHIVED_SEAL_",
             "ACTIVITY_PLAN_BYTES_MISSING","INVALID_ACTIVITY_PLAN","UNDECLARED_ACTIVITY_SENSOR",

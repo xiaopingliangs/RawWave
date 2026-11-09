@@ -377,6 +377,48 @@ public class ActivityStoreTest {
             try(var paths=Files.walk(folder.toPath())) {for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}
         }
     }
+    @Test public void deviceStateIsStoredAsMetadata() throws Exception {
+        var folder=Files.createTempDirectory("device-state-test").toFile();
+        try {
+            var store=new ActivityStore(folder,dir->{});
+            var template=store.createTemplate("context",false,List.of(SensorCatalog.HEART_RATE),false);
+            var session=store.start(template,1,2);
+            session.append("CORE-1",SensorCatalog.DEVICE_STATE,List.of(
+                DeviceState.row(80,"discharging","none",null,null,true,false,"on",10,20,"CORE-1")));
+            assertEquals(Long.valueOf(1),session.counts().get("CORE-1/DEVICE_STATE"));
+            String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+            assertTrue(plan.contains("deviceStatePolicy"));
+            assertTrue(plan.contains(SensorCatalog.DEVICE_STATE));
+            session.seal("DONE",30);
+        } finally {
+            try(var paths=Files.walk(folder.toPath())) {for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}
+        }
+    }
+
+    @Test public void activityNameIsStoredOncePerBlockHeader() throws Exception {
+        var folder=Files.createTempDirectory("activity-name-test").toFile();
+        try {
+            var store=new ActivityStore(folder,dir->{});
+            var template=store.createTemplate("晨间步行",false,List.of(SensorCatalog.HEART_RATE),false);
+            var session=store.start(template,1,2);
+            session.append("CORE-1",SensorCatalog.HEART_RATE,
+                List.of(Map.of("sdkTimestamp",10L,"HEART_RATE",72)));
+            var block=com.google.gson.JsonParser.parseString(
+                Files.readString(new File(session.folder,"00000001-CORE-1-HEART_RATE.json").toPath()))
+                .getAsJsonObject();
+            assertEquals("晨间步行",block.get("activityName").getAsString());
+            assertEquals(template.id(),block.get("activityTemplateId").getAsString());
+            assertEquals(1,block.getAsJsonArray("samples").size());
+            assertEquals(72,block.getAsJsonArray("samples").get(0).getAsJsonObject()
+                .get("HEART_RATE").getAsInt());
+            String plan=Files.readString(new File(session.folder,"plan.json").toPath());
+            assertTrue(plan.contains("\"name\":\"晨间步行\""));
+            assertFalse(plan.contains("USER_LABEL"));
+        } finally {
+            try(var paths=Files.walk(folder.toPath())) {for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}
+        }
+    }
+
     @Test public void gpsPlanRecordsPlatformLocationAndDeliveredOnlyDrainIsAccepted() throws Exception {
         var folder=Files.createTempDirectory("gps-plan-test").toFile();
         try {
@@ -629,6 +671,17 @@ public class ActivityStoreTest {
         assertThrows(UnsupportedOperationException.class,()->copy.clear());
         assertThrows(UnsupportedOperationException.class,()->copy.get(0).clear());
         assertThrows(UnsupportedOperationException.class,()->((List<?>)copy.get(0).get("IBI_LIST")).clear());
+    }
+    @Test public void sensorSnapshotCopiesNestedStringKeyedMapsForGnss() {
+        var counts=new LinkedHashMap<String,Integer>(); counts.put("GPS",8); counts.put("BEIDOU",4);
+        Map<String,Object> row=new LinkedHashMap<>(); row.put("GNSS_CONSTELLATION_COUNTS",counts);
+        var copy=SensorRows.snapshot(List.of(row));
+        counts.clear(); row.clear();
+        assertEquals(Map.of("GPS",8,"BEIDOU",4),copy.get(0).get("GNSS_CONSTELLATION_COUNTS"));
+        assertThrows(UnsupportedOperationException.class,
+            ()->((Map<?,?>)copy.get(0).get("GNSS_CONSTELLATION_COUNTS")).clear());
+        assertThrows(IllegalArgumentException.class,
+            ()->SensorRows.snapshot(List.of(Map.of("badKeys",Map.of(1,2)))));
     }
     @Test public void sensorSnapshotRejectsOpaqueSdkObjectsInsteadOfInventingValues() {
         assertThrows(IllegalArgumentException.class,()->SensorRows.snapshot(List.of(Map.of("sdkObject",new Object()))));

@@ -343,7 +343,7 @@ class ActivityTransferWindow(
         transferActive=false
         stage("ACTIVITY_FILE_BYTES_WRITTEN","数据已送出，等待手机逐文件校验；现在还不算成功。")
         CommitExchange.sender({
-            waitSignal(committed,"ACTIVITY_PHONE_COMMIT",ActivityTransferBudget.COMMIT_MS)
+            waitSignal(committed,"ACTIVITY_PHONE_COMMIT",ActivityTransferBudget.commitMs(expected))
         }, {
             stage("ACTIVITY_REMOTE_RECEIPT_RECEIVED","手机已保存，正在保存本地确认记录…")
             sendStore.acknowledge(prepared,SendStore.Confirmation(id,hash,expected,peer,System.currentTimeMillis()))

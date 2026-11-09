@@ -2,6 +2,9 @@ package com.rawwave.shell
 
 import android.content.Context
 import android.os.SystemClock
+import com.rawwave.core.EcgTimeline
+import com.rawwave.core.EdaQuality
+import com.rawwave.core.HeartRateQuality
 import com.rawwave.core.SensorPort
 import com.rawwave.core.SensorRows
 import com.rawwave.core.SensorCallbackFence
@@ -207,6 +210,15 @@ class SamsungSensorAdapter internal constructor(
                             row
                         }
                         rows.lastOrNull()?.let { delivery.lastStatus = it["STATUS"] ?: it["HEART_RATE_STATUS"] }
+                        // Derived evidence only; every raw SDK value above stays unchanged.
+                        if (sensor == "ECG") {
+                            EcgTimeline.annotate(rows, points.map { it.timestamp })
+                            EcgTimeline.propagateLeadOff(rows)
+                        } else if (sensor == "EDA") {
+                            rows.forEach { EdaQuality.annotate(it) }
+                        } else if (sensor == "HEART_RATE") {
+                            rows.forEach { HeartRateQuality.annotate(it) }
+                        }
                         val snapshot = SensorRows.snapshot(rows)
                         val deliver = {
                             if (!closed) {

@@ -5,6 +5,7 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.*;
+import java.util.function.Consumer;
 
 /** Diagnostic content policy, separate from UI, platform publication and transfer protocol. */
 public final class DiagnosticReportBuilder implements ReportBuilder {
@@ -13,17 +14,27 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
     private final String role;
     private final File summaryFile;
     private final Map<String, Object> build;
+    private final Consumer<String> progress;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     public DiagnosticReportBuilder(Journal journal, File receivedFolder, File reportFolder,
                                    String role, Map<String, Object> build) {
-        this(journal, receivedFolder, reportFolder, role, build, null);
+        this(journal, receivedFolder, reportFolder, role, build, null, text -> {});
     }
     public DiagnosticReportBuilder(Journal journal, File receivedFolder, File reportFolder,
                                    String role, Map<String, Object> build, File summaryFile) {
+        this(journal, receivedFolder, reportFolder, role, build, summaryFile, text -> {});
+    }
+    public DiagnosticReportBuilder(Journal journal, File receivedFolder, File reportFolder,
+                                   String role, Map<String, Object> build, File summaryFile,
+                                   Consumer<String> progress) {
         this.summaryFile = summaryFile;
         this.journal = journal; this.receivedFolder = receivedFolder; this.reportFolder = reportFolder;
         this.role = role; this.build = Map.copyOf(build);
+        this.progress = progress == null ? text -> {} : progress;
         if (!role.equals("phone") && !role.equals("watch")) throw new IllegalArgumentException("INVALID_REPORT_ROLE");
+    }
+    private void state(String text) {
+        try { progress.accept(text); } catch (RuntimeException ignored) { }
     }
     private void json(Map<String, byte[]> payload, String name, Object value) {
         payload.put(name, gson.toJson(value).getBytes(StandardCharsets.UTF_8));
@@ -38,6 +49,7 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
     }
     @Override public Report build(long operation) throws IOException {
         ReportExporter.checkCancelled();
+        state("正在收集本机日志…");
         Map<String, byte[]> payload = new HashMap<>(journal.snapshot());
         payload.put("diagnostic-feedback.txt", DiagnosticFeedback.report(payload, role));
         String summaryStatus = "NOT_COLLECTED";
@@ -58,6 +70,7 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
             "PASS/UNKNOWN 都只代表应用层证据；L3-L7 需要用户另抓系统 dump，并由 PC 分析器读取。\n").getBytes(StandardCharsets.UTF_8));
         json(payload, "build.json", build);
         json(payload, "module-contracts.json", ModuleVersions.contracts());
+        state("正在校验最近的手表报告…");
         List<File> received = zipFiles(receivedFolder, false);
         List<String> included = new ArrayList<>(), rejected = new ArrayList<>();
         for (File file : received.subList(0, Math.min(3, received.size()))) {
@@ -85,7 +98,11 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         collection.put("rejected", rejected);
         collection.put("omittedOlderCount", Math.max(0, received.size() - 3));
         collection.put("systemPowerEvidence", "NOT_COLLECTED");
-        collection.put("healthData", "NOT_INCLUDED_IN_THIS_REPORT_EXPORT_SEPARATELY");
+        boolean sensorProbes = payload.keySet().stream().anyMatch(name -> name.contains("/sensor-probes/"));
+        collection.put("healthData", sensorProbes
+            ? "ACTIVITY_RAW_DATA_NOT_INCLUDED; SENSOR_REGISTRATION_PROBE_SAMPLES_INCLUDED_AS_DIAGNOSTIC_TEST_DATA"
+            : "NOT_INCLUDED_IN_THIS_REPORT_EXPORT_SEPARATELY");
+        collection.put("sensorProbes", sensorProbes ? "INCLUDED_AS_DIAGNOSTIC_TEST_DATA" : "NONE");
         collection.put("systemDump", "NOT_COLLECTED");
         collection.put("appLevelPostconditions", "INCLUDED_APP_JOURNAL_ONLY");
         collection.put("sensorCapability", "SEE_EVENTS_OR_NOT_COLLECTED");
@@ -107,11 +124,13 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         json(payload, "file-audit.json", Map.of("healthSessions", "NOT_VERIFIED_BY_THIS_REPORT", "reportValidation", "ZIP_REOPEN_AND_TARGET_SHA256"));
         payload.put("resources.jsonl", (new Gson().toJson(Map.of("owner", operation, "resource", "diagnostic_export_worker",
             "state", "ACTIVE_AT_SNAPSHOT", "systemVerification", "NOT_COLLECTED")) + "\n").getBytes(StandardCharsets.UTF_8));
+        state("正在写入报告 ZIP…");
         Files.createDirectories(reportFolder.toPath());
         List<File> cached = zipFiles(reportFolder, true);
         for (File old : cached.subList(Math.min(2, cached.size()), cached.size())) Files.delete(old.toPath());
         ReportExporter.checkCancelled();
         File output = DiagnosticArchive.create(new File(reportFolder, "rawwave-" + role + "-" + UUID.randomUUID() + ".zip"), payload);
+        state("报告已生成，正在回读校验…");
         return new Report(output, included.size());
     }
 }

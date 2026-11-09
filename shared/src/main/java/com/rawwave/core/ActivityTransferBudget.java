@@ -29,8 +29,12 @@ public final class ActivityTransferBudget {
     public static final long PACKAGING_MARGIN_MS = 120_000L;
     /** Discovery, HELLO retries and opening the file channel after the size is known. */
     public static final long HANDSHAKE_MS = 30_000L;
-    /** Phone commit, deep verification, COMMITTED/CONFIRM/FINISHED exchange. */
-    public static final long COMMIT_MS = 30_000L;
+    /** Base phone commit allowance for small archives. */
+    public static final long COMMIT_BASE_MS = 30_000L;
+    /** Conservative deep-verification throughput over the compressed archive bytes. */
+    public static final long COMMIT_MIN_RATE_BYTES_PER_SECOND = 1L * 1024L * 1024L;
+    /** Commit allowance ceiling, bounded so the largest archive still fits the watch lease. */
+    public static final long COMMIT_MAX_MS = 5L * 60_000L;
     /** Abort when no file bytes move for this long, even if the absolute ceiling remains. */
     public static final long STALL_MS = 30_000L;
     /** Conservative floor used to size the ceiling. Observed device rate was about 60-265 KB/s. */
@@ -73,9 +77,20 @@ public final class ActivityTransferBudget {
         return Math.min(MAX_TRANSFER_MS, Math.max(BASE_TRANSFER_MS, estimated));
     }
 
+    /**
+     * Deep verification reads every raw block and hashes it; the watch measured 96 s for a
+     * 69 MB / 531 MB-uncompressed archive. Scale from compressed bytes so a fixed 30 s does
+     * not time out a valid large commit on the phone.
+     */
+    public static long commitMs(long bytes) {
+        long size = Math.max(1L, bytes);
+        long estimated = (size * 1000L + COMMIT_MIN_RATE_BYTES_PER_SECOND - 1L) / COMMIT_MIN_RATE_BYTES_PER_SECOND;
+        return COMMIT_BASE_MS + Math.min(COMMIT_MAX_MS, estimated);
+    }
+
     /** Handshake + estimated send + commit, measured from the moment the size is known. */
     public static long requiredMs(long bytes) {
-        return HANDSHAKE_MS + transferMs(bytes) + COMMIT_MS;
+        return HANDSHAKE_MS + transferMs(bytes) + commitMs(bytes);
     }
 
     /** True only when the archive cannot fit in the initial window even at the conservative rate. */
@@ -94,7 +109,7 @@ public final class ActivityTransferBudget {
 
     /** Sender ceiling from the first file write through the final confirmation exchange. */
     public static long sendMs(long bytes) {
-        return transferMs(bytes) + COMMIT_MS;
+        return transferMs(bytes) + commitMs(bytes);
     }
 
     /** Receiver ceiling from accepting HELLO through saving and acknowledging the archive. */

@@ -196,7 +196,22 @@ public class ActivityArchiveTest {
         assertTrue(failure.getMessage().startsWith("UNDECLARED_ACTIVITY_SENSOR:"));
     }
 
+    @Test public void bundleManifestDoesNotCountAgainstTheRawExpansionLimit() throws Exception {
+        // Raw payload ~1.5 MB, bundle manifest ~8 MB. The old code added both and tripped the
+        // 512 MiB cap; verify must bound raw session bytes and the bundle independently.
+        File archive=archiveWithSource("ACCELEROMETER",true,1_500_000,8_000_000);
+        ActivityArchive.Verified verified=ActivityArchive.verify(archive,2_000_000L);
+        assertTrue(verified.rawBytes()<2_000_000L);
+        assertEquals("ACTIVITY_ARCHIVE_EXPANSION_LIMIT",
+            assertThrows(IOException.class,()->ActivityArchive.verify(archive,1_000_000L)).getMessage());
+    }
+
     private File archiveWithSource(String sensor, boolean declared) throws Exception {
+        return archiveWithSource(sensor, declared, 0, 0);
+    }
+
+    private File archiveWithSource(String sensor, boolean declared,
+                                   int blockPadding, int bundlePadding) throws Exception {
         String sessionId="22222222-2222-4222-8222-222222222222";
         String batchId="11111111-1111-4111-8111-111111111111";
         File folder=temp.newFolder();
@@ -205,8 +220,9 @@ public class ActivityArchiveTest {
         String declaredKind=declared?",\""+sensor+"\":\"future source declared by plan\"":"";
         byte[] plan=("{\"schema\":5,\"sessionId\":\""+sessionId+"\",\"coreSources\":[\"ACCELEROMETER\""+declaredCore+
             "],\"dataKinds\":{\"ACCELEROMETER\":\"test\""+declaredKind+"}}").getBytes(StandardCharsets.UTF_8);
+        String blockPaddingField=blockPadding>0?",\"padding\":\""+"x".repeat(blockPadding)+"\"":"";
         byte[] block=("{\"phase\":\"CORE-1\",\"sensor\":\""+sensor+
-            "\",\"samples\":[{\"sdkTimestamp\":1}]}").getBytes(StandardCharsets.UTF_8);
+            "\",\"samples\":[{\"sdkTimestamp\":1}]"+blockPaddingField+"}").getBytes(StandardCharsets.UTF_8);
         Map<String,byte[]> files=new LinkedHashMap<>();
         files.put("sessions/"+sessionId+"/plan.json",plan);
         files.put("sessions/"+sessionId+"/00000001-CORE-1-"+sensor+".json",block);
@@ -219,10 +235,11 @@ public class ActivityArchiveTest {
                 .append(",\"sha256\":\"").append(DiagnosticArchive.hash(item.getValue())).append("\"}");
         }
         manifest.append('}');
+        String bundlePaddingField=bundlePadding>0?",\"padding\":\""+"x".repeat(bundlePadding)+"\"":"";
         byte[] bundle=("{\"schemaVersion\":1,\"kind\":\"RAWWAVE_ACTIVITY_RAW_EXPORT\",\"batchId\":\""+batchId+
             "\",\"createdUtcMs\":1,\"sessions\":[{\"sessionId\":\""+sessionId+"\",\"sealed\":false,"+
-            "\"integrity\":\"UNSEALED_IMMUTABLE_BLOCK_SNAPSHOT_TAIL_UNKNOWN\"}],\"files\":"+manifest+"}")
-            .getBytes(StandardCharsets.UTF_8);
+            "\"integrity\":\"UNSEALED_IMMUTABLE_BLOCK_SNAPSHOT_TAIL_UNKNOWN\"}],\"files\":"+manifest+
+            bundlePaddingField+"}").getBytes(StandardCharsets.UTF_8);
         try(ZipOutputStream zip=new ZipOutputStream(new FileOutputStream(archive),StandardCharsets.UTF_8)) {
             for(Map.Entry<String,byte[]> item:files.entrySet()) {
                 zip.putNextEntry(new ZipEntry(item.getKey()));zip.write(item.getValue());zip.closeEntry();

@@ -25,7 +25,7 @@ public class ActivityTransferBudgetTest {
         long transfer = ActivityTransferBudget.transferMs(bytes);
         assertEquals(514_540L, transfer);
         assertTrue(transfer > WorkBudget.TRANSFER_MS);
-        assertEquals(transfer + ActivityTransferBudget.COMMIT_MS, ActivityTransferBudget.sendMs(bytes));
+        assertEquals(transfer + ActivityTransferBudget.commitMs(bytes), ActivityTransferBudget.sendMs(bytes));
         assertTrue(ActivityTransferBudget.receiveMs(bytes) > ActivityTransferBudget.sendMs(bytes));
         assertTrue(ActivityTransferBudget.needsExtension(bytes));
         long now = 10_000L;
@@ -35,6 +35,18 @@ public class ActivityTransferBudgetTest {
         assertTrue(ActivityTransferBudget.leaseMs(bytes) > WorkBudget.SYNC_LEASE_MS);
         assertTrue(ActivityTransferBudget.leaseMs(bytes) <= ActivityTransferBudget.WATCH_LEASE_MS);
         assertEquals(ActivityTransferBudget.leaseMs(bytes), ActivityTransferBudget.leaseExtensionMs(bytes));
+    }
+
+    @Test public void commitWindowScalesWithTheArchiveInsteadOfAFixedThirtySeconds() {
+        long observed = 69_221_514L;
+        long commit = ActivityTransferBudget.commitMs(observed);
+        assertTrue(commit >= ActivityTransferBudget.COMMIT_BASE_MS + 66_000L);
+        assertEquals(ActivityTransferBudget.COMMIT_BASE_MS + ActivityTransferBudget.COMMIT_MAX_MS,
+            ActivityTransferBudget.commitMs(ActivityTransferFiles.MAX_BYTES));
+        assertEquals(ActivityTransferBudget.commitMs(1L), ActivityTransferBudget.commitMs(0L));
+        // The whole largest-archive window must still fit inside the watch foreground lease.
+        assertTrue(ActivityTransferBudget.requiredMs(ActivityTransferFiles.MAX_BYTES)
+            < ActivityTransferBudget.WATCH_LEASE_MS);
     }
 
     @Test public void extensionNeverShortensAnExistingLaterDeadline() {

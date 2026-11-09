@@ -29,6 +29,7 @@ private class CombinedSensors(private val samsung: SensorPort, private val andro
 private class PlatformSensors(context: Context, dispatch: (() -> Unit) -> Unit): SensorPort {
     private val gyro = GyroscopeSensorAdapter(context, dispatch)
     private val gyroUncalibrated = GyroscopeUncalibratedSensorAdapter(context, dispatch)
+    private val platformAccelerometer = PlatformAccelerometerSensorAdapter(context, dispatch)
     private val accelerometerUncalibrated = AccelerometerUncalibratedSensorAdapter(context, dispatch)
     private val linearAcceleration = LinearAccelerationSensorAdapter(context, dispatch)
     private val gameRotationVector = GameRotationVectorSensorAdapter(context, dispatch)
@@ -47,6 +48,7 @@ private class PlatformSensors(context: Context, dispatch: (() -> Unit) -> Unit):
     private fun port(sensor: String): SensorPort = when(sensor) {
         "GYROSCOPE" -> gyro
         "GYROSCOPE_UNCALIBRATED" -> gyroUncalibrated
+        "PLATFORM_ACCELEROMETER" -> platformAccelerometer
         "ACCELEROMETER_UNCALIBRATED" -> accelerometerUncalibrated
         "LINEAR_ACCELERATION" -> linearAcceleration
         "GAME_ROTATION_VECTOR" -> gameRotationVector
@@ -65,14 +67,14 @@ private class PlatformSensors(context: Context, dispatch: (() -> Unit) -> Unit):
         else -> error("UNKNOWN_PLATFORM_SENSOR:$sensor")
     }
     override fun contractVersion() = SensorPort.CONTRACT_VERSION
-    override fun implementationVersion() = gyro.implementationVersion()+";"+gyroUncalibrated.implementationVersion()+";"+accelerometerUncalibrated.implementationVersion()+";"+linearAcceleration.implementationVersion()+";"+gameRotationVector.implementationVersion()+";"+rotationVector.implementationVersion()+";"+geomagneticRotationVector.implementationVersion()+";"+gravity.implementationVersion()+";"+wristTiltGesture.implementationVersion()+";"+pressure.implementationVersion()+";"+magnetic.implementationVersion()+";"+magneticUncalibrated.implementationVersion()+";"+light.implementationVersion()+";"+location.implementationVersion()+";"+steps.implementationVersion()+";"+stepDetector.implementationVersion()+";"+offBody.implementationVersion()
+    override fun implementationVersion() = gyro.implementationVersion()+";"+gyroUncalibrated.implementationVersion()+";"+platformAccelerometer.implementationVersion()+";"+accelerometerUncalibrated.implementationVersion()+";"+linearAcceleration.implementationVersion()+";"+gameRotationVector.implementationVersion()+";"+rotationVector.implementationVersion()+";"+geomagneticRotationVector.implementationVersion()+";"+gravity.implementationVersion()+";"+wristTiltGesture.implementationVersion()+";"+pressure.implementationVersion()+";"+magnetic.implementationVersion()+";"+magneticUncalibrated.implementationVersion()+";"+light.implementationVersion()+";"+location.implementationVersion()+";"+steps.implementationVersion()+";"+stepDetector.implementationVersion()+";"+offBody.implementationVersion()
     override fun connect(ready: Runnable, failed: SensorPort.Failure) = gyro.connect(ready,failed)
     override fun start(sensor:String, rows:SensorPort.Rows, failed:SensorPort.Failure)=port(sensor).start(sensor,rows,failed)
     override fun drain(sensor:String, done:SensorPort.Drain)=port(sensor).drain(sensor,done)
     override fun stop(sensor:String)=port(sensor).stop(sensor)
     override fun close(){
         var failure: Throwable? = null
-        listOf(gyro, gyroUncalibrated, accelerometerUncalibrated, linearAcceleration, gameRotationVector, rotationVector, geomagneticRotationVector, gravity, wristTiltGesture, pressure, magnetic, magneticUncalibrated, light, location, steps, stepDetector, offBody).forEach {
+        listOf(gyro, gyroUncalibrated, platformAccelerometer, accelerometerUncalibrated, linearAcceleration, gameRotationVector, rotationVector, geomagneticRotationVector, gravity, wristTiltGesture, pressure, magnetic, magneticUncalibrated, light, location, steps, stepDetector, offBody).forEach {
             try { it.close() } catch (t: Throwable) { if (failure == null) failure = t }
         }
         failure?.let { throw it }

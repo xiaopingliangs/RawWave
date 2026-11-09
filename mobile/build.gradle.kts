@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.serialization") version "2.2.10"
 }
@@ -9,8 +9,8 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 88
-        versionName = "0.12.14-step"
+        versionCode = 96
+        versionName = "0.12.22-step"
         buildConfigField("String", "DEVICE_ROLE", "\"phone\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))

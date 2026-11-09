@@ -43,6 +43,8 @@ public final class DiagnosticManifest {
         }
         boolean sdkLogs = snapshot.keySet().stream().anyMatch(name ->
             name.startsWith(role + "/sensor-sdk-") && name.endsWith(".txt"));
+        boolean sensorProbes = snapshot.keySet().stream().anyMatch(name ->
+            name.contains("/sensor-probes/"));
         boolean rotation = events.rotationObserved || observations.rotationObserved;
 
         Map<String, Object> coverage = new LinkedHashMap<>();
@@ -56,6 +58,7 @@ public final class DiagnosticManifest {
         coverage.put("corruptObservationLines", observations.corruptLines);
         coverage.put("rotationObserved", rotation);
         coverage.put("rawHealthDataIncluded", false);
+        coverage.put("sensorProbeDataIncluded", sensorProbes);
         coverage.put("activityArchivesIncluded", false);
         coverage.put("systemDumpIncluded", false);
         coverage.put("includedWatchReports", includedWatchReports);
@@ -68,6 +71,7 @@ public final class DiagnosticManifest {
         evidence.put("appJournal", events.events.isEmpty() ? "EMPTY_OR_NOT_COLLECTED" : "AVAILABLE_APP_SELF_REPORT");
         evidence.put("appObservations", observations.events.isEmpty() ? "NOT_COLLECTED" : "AVAILABLE_USER_REPORT");
         evidence.put("sensorSdkLog", sdkLogs ? "AVAILABLE_APP_SIDE_LOG" : "NOT_COLLECTED");
+        evidence.put("sensorProbeData", sensorProbes ? "INCLUDED_AS_DIAGNOSTIC_TEST_DATA" : "NONE");
         evidence.put("sensorCapability", capability == null ? "NOT_COLLECTED" : capability);
         evidence.put("activityArchive", "NOT_INCLUDED_IN_THIS_REPORT");
         evidence.put("systemDump", "NOT_COLLECTED");
@@ -110,7 +114,8 @@ public final class DiagnosticManifest {
             "App cleanup events are requests/returns, not hardware receipts.",
             "The absence of a fault in this report is not proof of correctness.",
             "A system dump must be captured separately by the user and analysed on a PC.",
-            "Activity raw health data and system logs are not included in this report."));
+            "Activity raw health data and system logs are not included in this report.",
+            "Sensor-registration probe samples may be included; they are diagnostic test data, not activity raw data."));
         List<String> nextEvidence = new ArrayList<>();
         nextEvidence.add("system dump: dumpsys sensorservice / activity services / ps / logcat");
         nextEvidence.add("watch nanohub logs: ppg_multi_25hz / ppg_multi_100hz start, stop and LED markers");

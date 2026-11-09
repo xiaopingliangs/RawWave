@@ -25,7 +25,28 @@ public final class LocationFix {
         long elapsedRealtimeNanos,
         boolean mock) {}
 
+    /** Snapshot of GnssStatus at the time of a delivered fix. Null fields mean unavailable. */
+    public record Gnss(
+        Integer satelliteCount,
+        Integer usedInFixCount,
+        Double meanCn0DbHz,
+        Double maxCn0DbHz,
+        Map<String,Integer> constellationCounts,
+        Map<String,Integer> usedConstellationCounts) {
+        public Gnss {
+            if (satelliteCount != null && satelliteCount < 0) throw new IllegalArgumentException("GNSS_SATELLITE_COUNT_NEGATIVE");
+            if (usedInFixCount != null && usedInFixCount < 0) throw new IllegalArgumentException("GNSS_USED_COUNT_NEGATIVE");
+            constellationCounts = constellationCounts == null ? null : Map.copyOf(constellationCounts);
+            usedConstellationCounts = usedConstellationCounts == null ? null : Map.copyOf(usedConstellationCounts);
+        }
+    }
+
     public static Map<String,Object> row(Fix fix, long receivedUtcMs, long receivedElapsedMs,
+                                         long callbackSequence, int callbackIndex, int callbackSize) {
+        return row(fix, null, receivedUtcMs, receivedElapsedMs, callbackSequence, callbackIndex, callbackSize);
+    }
+
+    public static Map<String,Object> row(Fix fix, Gnss gnss, long receivedUtcMs, long receivedElapsedMs,
                                          long callbackSequence, int callbackIndex, int callbackSize) {
         Objects.requireNonNull(fix, "fix");
         if (fix.provider() == null || fix.provider().isEmpty())
@@ -51,6 +72,13 @@ public final class LocationFix {
         putOptional(row, "GPS_BEARING_ACCURACY_DEGREES", fix.bearingAccuracyDegrees());
         row.put("utcTimeMs", fix.utcTimeMs());
         row.put("mock", fix.mock());
+        row.put("GNSS_SATELLITE_COUNT", gnss == null ? null : gnss.satelliteCount());
+        row.put("GNSS_USED_IN_FIX_COUNT", gnss == null ? null : gnss.usedInFixCount());
+        row.put("GNSS_MEAN_CN0_DB_HZ", gnss == null ? null : gnss.meanCn0DbHz());
+        row.put("GNSS_MAX_CN0_DB_HZ", gnss == null ? null : gnss.maxCn0DbHz());
+        row.put("GNSS_CONSTELLATION_COUNTS", gnss == null ? null : gnss.constellationCounts());
+        row.put("GNSS_USED_CONSTELLATION_COUNTS", gnss == null ? null : gnss.usedConstellationCounts());
+        row.put("gnssStatusKind", "SNAPSHOT_AT_FIX_NOT_RAW_GNSS_MEASUREMENTS");
         row.put("receivedUtcMs", receivedUtcMs);
         row.put("receivedElapsedMs", receivedElapsedMs);
         row.put("captureCallbackSequence", callbackSequence);

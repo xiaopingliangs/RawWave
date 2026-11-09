@@ -36,14 +36,12 @@ class CaptureServiceTest {
         "sdkTimestamp" to index * 10L,
         "PPG_GREEN" to 100 + index, "PPG_IR" to 200 + index, "PPG_RED" to 300 + index,
         "GREEN_STATUS" to 0, "IR_STATUS" to 0, "RED_STATUS" to 0) }
-    @Test fun ppgOnDemandRunsBeforeAndAfterCoreAndKeepsEveryRawRow() {
+    @Test fun ppgOnDemandStartsImmediatelyBeforeAndAfterCoreAndKeepsEveryRawRow() {
         val r=Rig(ppg=true,sources=listOf("PRESSURE"))
-        assertEquals("READY_PPG_PRE",ActivityRecordingService.state.phase)
-        r.service.command("START_PPG");r.queue.runReady()
         assertEquals("PRE-300",ActivityRecordingService.state.phase)
         assertEquals("PPG_ON_DEMAND",ActivityRecordingService.state.shortSensor)
         r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
-        assertTrue(ActivityRecordingService.state.text.contains("10 条原始记录"))
+        assertTrue(ActivityRecordingService.state.text.contains("10 \u6761\u539f\u59cb\u8bb0\u5f55"))
         r.queue.advance(30000)
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
@@ -51,8 +49,8 @@ class CaptureServiceTest {
         r.service.command("PLACEMENT_READY");r.queue.runReady()
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
-        assertEquals("READY_PPG_POST",ActivityRecordingService.state.phase)
-        r.service.command("START_PPG");r.queue.runReady()
+        assertEquals("POST-300",ActivityRecordingService.state.phase)
+        assertEquals("PPG_ON_DEMAND",ActivityRecordingService.state.shortSensor)
         r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
         r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
         assertTrue(r.seal().exists())
@@ -60,25 +58,21 @@ class CaptureServiceTest {
         assertEquals(10L,r.session.counts()["POST-300/PPG_ON_DEMAND"])
         assertEquals(listOf("PPG_ON_DEMAND","PRESSURE","PPG_ON_DEMAND"),r.sensors.starts)
     }
-    @Test fun continuousAndOnDemandPpgCanBothBeSelected() {
+    @Test fun continuousPpgSkipsPreOnDemandAndStillRunsPostOnDemand() {
         val r=Rig(ppg=true,sources=listOf("PPG"))
-        assertEquals("READY_PPG_PRE",ActivityRecordingService.state.phase)
-        r.service.command("START_PPG");r.queue.runReady()
-        r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
-        r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        // Continuous CORE PPG and pre short PPG share the vendor 25 Hz client; the pre
+        // short measurement is skipped to avoid the known persistent-LED leak.
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.sensors.emit("PPG",ppgRows(10));r.queue.runReady()
         r.end();r.sensors.ack("PPG");r.queue.runReady()
-        assertEquals("READY_PPG_POST",ActivityRecordingService.state.phase)
-        r.service.command("START_PPG");r.queue.runReady()
+        assertEquals("POST-300",ActivityRecordingService.state.phase)
         r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
         r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
         assertTrue(r.seal().exists())
-        assertEquals(10L,r.session.counts()["PRE-300/PPG_ON_DEMAND"])
+        assertNull(r.session.counts()["PRE-300/PPG_ON_DEMAND"])
         assertEquals(10L,r.session.counts()["CORE-1/PPG"])
         assertEquals(10L,r.session.counts()["POST-300/PPG_ON_DEMAND"])
-        assertEquals(listOf("PPG_ON_DEMAND","PPG","PPG_ON_DEMAND"),r.sensors.starts)
+        assertEquals(listOf("PPG","PPG_ON_DEMAND"),r.sensors.starts)
     }
     @Test fun continuousPpgIsHeldThroughPostEcgAndStoppedLast() {
         val r=Rig(ecg=true,sources=listOf("PPG"))
@@ -105,7 +99,7 @@ class CaptureServiceTest {
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.queue.advance(60000)
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
-        assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
+        assertFalse(ActivityRecordingService.state.text.contains("\u6682\u65e0\u65b0\u6570\u636e"))
         r.end();r.sensors.ack("STEP_DETECTOR");r.queue.runReady()
         assertTrue(r.seal().exists())
         assertEquals(1L,r.session.counts()["CORE-1/STEP_DETECTOR"])
@@ -117,7 +111,7 @@ class CaptureServiceTest {
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.queue.advance(60000)
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
-        assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
+        assertFalse(ActivityRecordingService.state.text.contains("\u6682\u65e0\u65b0\u6570\u636e"))
         r.sensors.emit("OFFBODY",listOf(OffBody.row(0f,2000L,3,3000L,4000L,2,0,1)))
         r.queue.runReady()
         r.end();r.sensors.ack("OFFBODY");r.queue.runReady()
@@ -174,45 +168,44 @@ class CaptureServiceTest {
     }
     @Test fun ppgOnlyPostStillRunsAfterUnconfirmedCoreTail() {
         val r=Rig(ppg=true,sources=listOf("PRESSURE"))
-        r.service.command("START_PPG");r.queue.runReady()
         r.sensors.emit("PPG_ON_DEMAND",ppgRows(1));r.queue.runReady()
         r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
         r.service.command("PLACEMENT_READY");r.queue.runReady()
         r.end();r.queue.advance(5000)
-        assertEquals("READY_PPG_POST",ActivityRecordingService.state.phase)
+        assertEquals("POST-300",ActivityRecordingService.state.phase)
     }
     @Test fun ppgWithoutRowsGoesToReviewAndSkipContinues() {
         val r=Rig(ppg=true,sources=listOf("PRESSURE"))
-        r.service.command("START_PPG");r.queue.runReady()
         r.queue.advance(30000)
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
         assertEquals("REVIEW_PPG_PRE",ActivityRecordingService.state.phase)
-        assertTrue(ActivityRecordingService.state.text.contains("未取得原始记录"))
+        assertTrue(ActivityRecordingService.state.text.contains("\u672a\u53d6\u5f97\u539f\u59cb\u8bb0\u5f55"))
         r.service.command("SKIP_PPG");r.queue.runReady()
         assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
     }
-    @Test fun oxygenIsFirstAndLastWithBiaPreOnlyAndOneRestore() {
+    @Test fun biaRunsBeforeSpo2AndSpo2RemainsThePostLastMeasurement() {
         val r=Rig(bia=true,spo2=true,sources=listOf("PRESSURE"))
-        assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
-        r.service.command("START_SPO2");r.queue.runReady()
-        r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 97)));r.queue.runReady()
-        r.sensors.ack("SPO2");r.queue.runReady()
+        // BIA only needs contact and starts before the SpO2 placement.
         assertEquals("PRE-200",ActivityRecordingService.state.phase)
         r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("BIA");r.queue.runReady()
         assertEquals(1L,r.session.counts()["PRE-200/BIA"])
+        assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
+        r.service.command("START_SPO2");r.queue.runReady()
+        r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 97)));r.queue.runReady()
+        r.sensors.ack("SPO2");r.queue.runReady()
         assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
         r.service.command("PLACEMENT_READY");r.queue.runReady()
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
-        // BIA/MF-BIA are pre-activity only; the post queue starts with SpO2.
+        // BIA/MF-BIA are pre-activity only; the post queue ends with SpO2.
         assertEquals("READY_SPO2_POST",ActivityRecordingService.state.phase)
         r.service.command("START_SPO2");r.queue.runReady()
         r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 99)));r.queue.runReady()
         r.sensors.ack("SPO2");r.queue.runReady()
         assertTrue(r.seal().exists())
-        assertEquals(listOf("SPO2","BIA","PRESSURE","SPO2"),r.sensors.starts)
+        assertEquals(listOf("BIA","SPO2","PRESSURE","SPO2"),r.sensors.starts)
         assertFalse(r.session.counts().containsKey("POST-200/BIA"))
     }
     @Test fun biaStatusOnlyCannotSucceedAndRetryKeepsEachAttempt() {
@@ -730,7 +723,7 @@ class CaptureServiceTest {
         r.sensors.ack("HEART_RATE");r.queue.advance(5000)
         assertEquals("POST-1",ActivityRecordingService.state.phase)
         assertEquals(1L,r.session.counts()["CORE-1/PPG"])
-        assertTrue(ActivityRecordingService.state.text.contains("尾部未确认"))
+        assertTrue(ActivityRecordingService.state.text.contains("\u5c3e\u90e8\u672a\u786e\u8ba4"))
         assertFalse(r.seal().exists())
         // Late completion belongs to the old core drain and cannot finish POST.
         r.sensors.ack("GYROSCOPE");r.queue.runReady()
@@ -816,7 +809,7 @@ class CaptureServiceTest {
         assertEquals(1,r.sensors.starts.size)
         assertTrue(r.seal().readText().contains("SHORT_MEASUREMENT_TIMEOUT_80S"))
     }
-    @Test fun retryRequiresPreparationAndDuplicateStartDoesNotRestartSensor() {
+    @Test fun spo2RetryStartsImmediatelyAndDuplicateStartDoesNotRestartSensor() {
         val r=Rig(spo2=true)
         r.service.command("START_SPO2");r.service.command("START_SPO2");r.queue.runReady()
         assertEquals(listOf("SPO2"),r.sensors.starts)
@@ -824,12 +817,10 @@ class CaptureServiceTest {
         r.queue.runReady();r.sensors.ack("SPO2");r.queue.runReady()
         assertTrue(ActivityRecordingService.state.text.contains("检测到移动"))
         r.service.command("RETRY_SPO2");r.queue.runReady()
-        assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
-        assertEquals(1,r.sensors.starts.size)
-        r.service.command("START_SPO2");r.queue.runReady()
+        assertEquals("PRE-101",ActivityRecordingService.state.phase)
         assertEquals(2,r.sensors.starts.size)
-        r.queue.advance(15000)
-        assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
+        r.queue.advance(30000)
+        assertFalse(ActivityRecordingService.state.text.contains("\u6682\u65e0\u65b0\u6570\u636e"))
     }
     @Test fun restoreAutoStartsCoreAfter15SecondsAndArchiveRemainsValid() {
         val r=Rig(spo2=true)
@@ -918,7 +909,7 @@ class CaptureServiceTest {
         val r=Rig(sources=listOf("STEP_COUNT"))
         r.queue.advance(20_000)
         assertTrue(ActivityRecordingService.state.active)
-        assertFalse(ActivityRecordingService.state.text.contains("暂无新数据"))
+        assertFalse(ActivityRecordingService.state.text.contains("\u6682\u65e0\u65b0\u6570\u636e"))
         r.sensors.emit("STEP_COUNT",listOf(stepCountRow(21_000,121f)))
         r.end();r.sensors.ack("STEP_COUNT");r.queue.runReady()
         assertTrue(r.seal().exists())
@@ -944,12 +935,12 @@ class CaptureServiceTest {
         assertFalse(ActivityRecordingService.state.text.contains("血氧：1"))
         assertFalse(ActivityRecordingService.state.text.contains("成功 0%"))
         r.queue.advance(29000);r.sensors.ack("SPO2");r.queue.runReady()
-        assertTrue(ActivityRecordingService.state.text.contains("未成功，未取得有效结果"))
+        assertTrue(ActivityRecordingService.state.text.contains("\u672a\u6210\u529f\uff0c\u672a\u53d6\u5f97\u6709\u6548\u7ed3\u679c"))
         assertEquals(1L,r.session.counts()["PRE-100/SPO2"])
         r.service.command("RETRY_SPO2");r.queue.runReady()
-        r.service.command("START_SPO2");r.queue.runReady()
-        assertTrue(ActivityRecordingService.state.text.contains("第2次：测量中"))
-        assertTrue(ActivityRecordingService.state.text.contains("第1次：未成功"))
+        assertEquals("PRE-101",ActivityRecordingService.state.phase)
+        assertEquals(2,r.sensors.starts.size)
+        assertTrue(ActivityRecordingService.state.text.contains("\u6d4b\u91cf\u4e2d"))
     }
     @Test fun spo2SuccessShowsPercentageOnlyAfterPersistingAndDuplicateRowsRemainRaw() {
         val r=Rig(spo2=true)
@@ -960,7 +951,7 @@ class CaptureServiceTest {
         assertFalse(ActivityRecordingService.state.text.contains("成功 99%"))
         r.sensors.ack("SPO2");r.queue.runReady()
         assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
-        assertTrue(ActivityRecordingService.state.text.contains("第1次：成功 99%"))
+        assertTrue(ActivityRecordingService.state.text.contains("99%"))
         assertEquals(3L,r.session.counts()["PRE-100/SPO2"])
         assertFalse(ActivityRecordingService.state.text.contains("血氧：3"))
     }

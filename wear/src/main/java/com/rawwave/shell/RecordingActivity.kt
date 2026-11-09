@@ -108,7 +108,8 @@ class RecordingActivity : ComponentActivity() {
             successBanner.setTone(RwTheme.colors(this).primaryGradientEnd, Color.WHITE)
             successBanner.visibility = View.VISIBLE
             main.removeCallbacks(hideSuccess)
-            main.postDelayed(hideSuccess, 2600)
+            // Keep the result visible long enough after the final short measurement.
+            main.postDelayed(hideSuccess, 4500)
         }
     }
     private val hideSuccess = Runnable {
@@ -405,7 +406,9 @@ class RecordingActivity : ComponentActivity() {
             }
             if (measuringEcg && s.skipAllowed)
                 button("跳过 ECG，继续本次活动") { command("SKIP_ECG") }
-            if (s.phase == "CORE-1") button("结束活动", primary = true) { command("END") }
+            if (s.phase == "CORE-1") {
+                button("结束活动", primary = true) { command("END") }
+            }
             button("中断并保留已有数据") {
                 RwDialogs.confirm(
                     this,
@@ -476,6 +479,10 @@ class RecordingActivity : ComponentActivity() {
             listOf(
                 RwDialogs.Action("记录问题现场") { openReportAction("record") },
                 RwDialogs.Action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) },
+                RwDialogs.Action("传感器注册测试（light_cct / HR A/B）") {
+                    idle?.close(); idle = null
+                    startActivity(Intent(this, SensorProbeActivity::class.java))
+                },
                 RwDialogs.Action("导出问题报告") { openReportAction("export") },
                 RwDialogs.Action("仅接收问题报告") {
                     idle?.close(); idle = null
@@ -687,7 +694,7 @@ class RecordingActivity : ComponentActivity() {
         }
         val ppgPresets = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val ppgNote = RwBodyText(this).apply {
-            text = "测试预设会清空其他采集项，便于最小对照；需要其他源时再手动勾选。先只选连续 PPG 60 秒；灯灭后再选两种都测。结束后观察红绿灯；若仍亮，导出系统 bugreport，不要重复 17 分钟活动。"
+            text = "测试预设会清空其他采集项，便于最小对照；需要其他源时再手动勾选。先只选连续 PPG 60 秒；灯灭后再选两种都测。结束后观察红绿灯；若仍亮，导出系统 bugreport，不要重复 17 分钟活动。\n\n同时勾选“连续 PPG”和“前后短测 PPG”时，为避免手表背面灯常亮，活动前 100Hz 短测会自动跳过；活动后 100Hz 仍保留。"
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setTextColor(colors.onSurfaceVariant)
             setPadding(0, dp(4), 0, dp(4))
@@ -769,6 +776,7 @@ class RecordingActivity : ComponentActivity() {
         val choices = linkedMapOf(
             SensorCatalog.HEART_RATE to check("活动中：心率（处理结果）", true),
             SensorCatalog.ACCELEROMETER to check("活动中：加速度（原始）", true),
+            SensorCatalog.PLATFORM_ACCELEROMETER to check("活动中：平台加速度（m/s²，100Hz，含重力）", true),
             SensorCatalog.LINEAR_ACCELERATION to check("活动中：线性加速度（平台去重力，无需手动校准，目标25Hz）"),
             SensorCatalog.GAME_ROTATION_VECTOR to check("活动中：姿态四元数（平台融合，无需手动校准，目标25Hz）"),
             SensorCatalog.ROTATION_VECTOR to check("活动中：绝对姿态旋转矢量（含磁力计，平台融合，目标25Hz）"),
@@ -900,6 +908,7 @@ class RecordingActivity : ComponentActivity() {
                 }
                 sensor == SensorCatalog.LIGHT -> Unit
                 sensor == SensorCatalog.OFFBODY -> Unit
+                sensor == SensorCatalog.PLATFORM_ACCELEROMETER -> Unit
                 sensor == SensorCatalog.GYROSCOPE_UNCALIBRATED || sensor == SensorCatalog.MAGNETIC_FIELD_UNCALIBRATED -> Unit
                 sensor == SensorCatalog.MAGNETIC_FIELD || sensor == SensorCatalog.PRESSURE || sensor == SensorCatalog.ACCELEROMETER || sensor == SensorCatalog.GYROSCOPE || sensor == SensorCatalog.STEP_COUNT || sensor == SensorCatalog.STEP_DETECTOR -> result += Manifest.permission.ACTIVITY_RECOGNITION
                 Build.VERSION.SDK_INT < 36 -> result += Manifest.permission.BODY_SENSORS
@@ -918,6 +927,7 @@ class RecordingActivity : ComponentActivity() {
     private fun sensorLabel(sensor: String) = when (sensor) {
         SensorCatalog.HEART_RATE -> "心率"
         SensorCatalog.ACCELEROMETER -> "加速度"
+        SensorCatalog.PLATFORM_ACCELEROMETER -> "平台加速度"
         SensorCatalog.ACCELEROMETER_UNCALIBRATED -> "未校准加速度"
         SensorCatalog.LINEAR_ACCELERATION -> "线性加速度"
         SensorCatalog.GAME_ROTATION_VECTOR -> "姿态四元数"
@@ -953,7 +963,9 @@ class RecordingActivity : ComponentActivity() {
         dialog.setOnDismissListener { if (stopDialog === dialog) stopDialog = null }
         stopDialog = dialog
     }
-    private fun command(action: String) { startService(Intent(this, ActivityRecordingService::class.java).setAction(action)) }
+    private fun command(action: String) {
+        startService(Intent(this, ActivityRecordingService::class.java).setAction(action))
+    }
     private fun idleRuntime(): DeadlineRuntime {
         val current = idle
         if (current != null && !current.isClosed()) return current
@@ -1000,7 +1012,7 @@ class RecordingActivity : ComponentActivity() {
         if (::activityTimer.isInitialized) activityTimer.visibility = View.GONE
         if (::stepCountdown.isInitialized) stepCountdown.visibility = View.GONE
         if (::stepInstruction.isInitialized) stepInstruction.visibility = View.GONE
-        if (::successBanner.isInitialized) successBanner.visibility = View.GONE
+        // The success banner has its own timeout; render() must not erase a final result.
     }
     private fun countdownText(s: ActivityRecordingService.Companion.State, mode: String, contact: Boolean): String {
         val seconds = if (mode == "ECG" && contact && s.remaining > 0) s.remaining else s.phaseRemainingSeconds
@@ -1061,6 +1073,7 @@ class RecordingActivity : ComponentActivity() {
     private fun platformSensorType(sensor: String): Int? = when(sensor) {
         SensorCatalog.GYROSCOPE -> android.hardware.Sensor.TYPE_GYROSCOPE
         SensorCatalog.GYROSCOPE_UNCALIBRATED -> android.hardware.Sensor.TYPE_GYROSCOPE_UNCALIBRATED
+        SensorCatalog.PLATFORM_ACCELEROMETER -> android.hardware.Sensor.TYPE_ACCELEROMETER
         SensorCatalog.ACCELEROMETER_UNCALIBRATED -> android.hardware.Sensor.TYPE_ACCELEROMETER_UNCALIBRATED
         SensorCatalog.LINEAR_ACCELERATION -> android.hardware.Sensor.TYPE_LINEAR_ACCELERATION
         SensorCatalog.GAME_ROTATION_VECTOR -> android.hardware.Sensor.TYPE_GAME_ROTATION_VECTOR

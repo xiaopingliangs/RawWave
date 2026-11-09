@@ -59,6 +59,7 @@ class ActivityExportActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setShowWhenLocked(true)
         val colors = RwTheme.colors(this)
         window.statusBarColor = colors.background
         window.navigationBarColor = colors.background
@@ -183,7 +184,7 @@ class ActivityExportActivity : ComponentActivity() {
     }
 
     private fun loadSessions() {
-        statusView.text = "正在校验已接收的活动包…"
+        statusView.text = "正在读取已接收活动（已校验的包不重复扫描）…"
         lifecycleScope.launch {
             val result = try {
                 withContext(Dispatchers.IO) {
@@ -225,7 +226,7 @@ class ActivityExportActivity : ComponentActivity() {
         summaryView.text = when {
             sessions.isEmpty() -> "没有已接收的活动。请先在手表结束活动并完成同步。"
             selected.isEmpty() -> "这个日期范围内没有活动。"
-            mode == Mode.LATEST -> "最近一次：${formatTime(selected.first().createdUtcMs())}\n共 1 次活动"
+            mode == Mode.LATEST -> "最近一次：${selected.first().activityName()} · ${formatTime(selected.first().createdUtcMs())}\n共 1 次活动"
             else -> "${selected.size} 次活动\n原始包约 ${bytes / 1024 / 1024} MB"
         }
         exportButton.isEnabled = !working && selected.isNotEmpty()
@@ -293,7 +294,16 @@ class ActivityExportActivity : ComponentActivity() {
         lifecycleScope.launch {
             try {
                 val results = withContext(Dispatchers.IO) {
-                    exporter().exportSessions(selected.map { it.id() })
+                    exporter().exportSessions(selected.map { it.id() }) { copied, total ->
+                        val percent = if (total > 0) (copied * 100 / total).toInt() else 0
+                        runOnUiThread {
+                            if (!isFinishing && !isDestroyed) {
+                                statusView.text = "正在导出并回读校验… $percent% " +
+                                    "(${"%.1f".format(copied / 1024.0 / 1024.0)} / " +
+                                    "${"%.1f".format(total / 1024.0 / 1024.0)} MB)"
+                            }
+                        }
+                    }
                 }
                 val first = results.firstOrNull()
                 if (first == null) {

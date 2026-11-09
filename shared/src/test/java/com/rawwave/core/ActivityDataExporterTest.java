@@ -100,8 +100,50 @@ public class ActivityDataExporterTest {
         var results=exporter.exportSelected(List.of(names.get(1)));
         assertEquals(1,results.size());assertEquals(1,visible.listFiles().length);
         assertEquals(ActivityTransferFiles.hashFile(new File(inbox,names.get(1))),results.get(0).sha256());
-        assertEquals(2,inbox.listFiles().length);
+        assertEquals(2,zipCount(inbox));
         assertThrows(IOException.class,()->exporter.exportSelected(List.of("../outside.zip")));
+    }
+    private static int zipCount(File folder) {
+        File[] files=folder.listFiles(file -> file.isFile() && file.getName().endsWith(".zip"));
+        return files==null?0:files.length;
+    }
+    @Test public void verifiedSidecarIsWrittenOnceAndStaleBytesAreRejected() throws Exception {
+        File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
+        var store=new ActivityStore(root,dir->{});
+        var session=store.start(store.createTemplate("cached",false),1792483503220L,2);
+        session.seal("DONE",1792483600000L);
+        var batch=ActivityArchive.preparePending(root,out);
+        File source=new File(inbox,batch.file().getName());
+        Files.copy(batch.file().toPath(),source.toPath());
+        var exporter=new ActivityDataExporter(inbox,new FolderDestination(visible),dir->{});
+        assertEquals(1,exporter.sessionChoices().size());
+        File sidecar=new File(inbox,batch.id()+".verified.json");
+        assertTrue(sidecar.isFile());
+        assertEquals(1,exporter.sessionChoices().size());
+        // The sidecar is only valid for the exact package bytes. A changed file is
+        // re-verified from disk and rejected instead of being listed from stale cache.
+        try (RandomAccessFile changed = new RandomAccessFile(source, "rw")) {
+            changed.setLength(source.length() - 10);
+        }
+        assertTrue(exporter.sessionChoices().isEmpty());
+        assertEquals(List.of(source.getName()),exporter.rejectedFiles());
+    }
+    @Test public void singleSessionExportCopiesOriginalPackageWithoutRepacking() throws Exception {
+        File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
+        var store=new ActivityStore(root,dir->{});
+        var session=store.start(store.createTemplate("direct",false),1792483503220L,2);
+        session.seal("DONE",1792483600000L);
+        var batch=ActivityArchive.preparePending(root,out);
+        File source=new File(inbox,batch.file().getName());
+        Files.copy(batch.file().toPath(),source.toPath());
+        var progress=new ArrayList<Long>();
+        var results=new ActivityDataExporter(inbox,new FolderDestination(visible),dir->{})
+            .exportRecent(1,(copied,total)->progress.add(copied));
+        assertEquals(1,results.size());
+        assertEquals(batch.sha256(),results.get(0).sha256());
+        File exported=new File(visible,results.get(0).name());
+        assertArrayEquals(Files.readAllBytes(source.toPath()),Files.readAllBytes(exported.toPath()));
+        assertEquals(source.length(),progress.get(progress.size()-1).longValue());
     }
     @Test public void selectedArchiveIsReverifiedAfterListing() throws Exception {
         File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
@@ -127,7 +169,7 @@ public class ActivityDataExporterTest {
         var exporter=new ActivityDataExporter(inbox,new FolderDestination(visible),dir->{});
         var results=exporter.exportRecent(3);assertEquals(1,results.size());
         assertEquals(List.of(sessions.get(3).id,sessions.get(2).id,sessions.get(1).id),results.get(0).sessions());
-        assertEquals(1,inbox.listFiles().length);assertEquals(batch.sha256(),ActivityTransferFiles.hashFile(new File(inbox,batch.file().getName())));
+        assertEquals(1,zipCount(inbox));assertEquals(batch.sha256(),ActivityTransferFiles.hashFile(new File(inbox,batch.file().getName())));
         try(var zip=new java.util.zip.ZipFile(new File(visible,results.get(0).name()))) {
             assertNull(zip.getEntry("sessions/"+sessions.get(0).id+"/plan.json"));
             for(var session:sessions.subList(1,4)) for(File original:Objects.requireNonNull(session.folder.listFiles())) {
@@ -152,6 +194,7 @@ public class ActivityDataExporterTest {
         var choices=exporter.sessionChoices();
         assertEquals(2,choices.size());
         assertEquals(sessions.get(1).id,choices.get(0).id());
+        assertEquals("session 1",choices.get(0).activityName());
         assertTrue(choices.get(0).createdUtcMs()>choices.get(1).createdUtcMs());
         assertTrue(choices.get(0).fileBytes()>0);
         var results=exporter.exportSessions(List.of(sessions.get(0).id));
@@ -169,7 +212,7 @@ public class ActivityDataExporterTest {
         }
         var results=new ActivityDataExporter(inbox,new FolderDestination(visible),dir->{}).exportRecent(3);
         assertEquals(1,results.size());assertEquals(List.of(session.id),results.get(0).sessions());
-        assertEquals(2,inbox.listFiles().length);
+        assertEquals(2,zipCount(inbox));
     }
     private static final class FolderDestination implements ExportDestination {
         private final File root; FolderDestination(File root){this.root=root;}

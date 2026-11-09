@@ -88,6 +88,9 @@ public final class StreamQualityTracker {
             case "HEART_RATE" -> row.get("HEART_RATE") instanceof Number;
             case "ACCELEROMETER" -> row.get("ACCELEROMETER_X") instanceof Number
                 && row.get("ACCELEROMETER_Y") instanceof Number && row.get("ACCELEROMETER_Z") instanceof Number;
+            case "PLATFORM_ACCELEROMETER" -> row.get("PLATFORM_ACCELEROMETER_X") instanceof Number
+                && row.get("PLATFORM_ACCELEROMETER_Y") instanceof Number
+                && row.get("PLATFORM_ACCELEROMETER_Z") instanceof Number;
             case "ACCELEROMETER_UNCALIBRATED" -> row.get("ACCELEROMETER_UNCALIBRATED_X") instanceof Number
                 && row.get("ACCELEROMETER_UNCALIBRATED_Y") instanceof Number && row.get("ACCELEROMETER_UNCALIBRATED_Z") instanceof Number;
             case "LINEAR_ACCELERATION" -> row.get("LINEAR_ACCELERATION_X") instanceof Number
@@ -119,12 +122,12 @@ public final class StreamQualityTracker {
         case "HEART_RATE" -> List.of("HEART_RATE_STATUS");
         case "PPG", "PPG_ON_DEMAND" -> List.of("GREEN_STATUS","IR_STATUS","RED_STATUS");
         case "MF_BIA", "BIA", "SKIN_TEMPERATURE", "EDA", "SPO2" -> List.of("STATUS");
-        case "MAGNETIC_FIELD", "MAGNETIC_FIELD_UNCALIBRATED", "PRESSURE", "GYROSCOPE", "GYROSCOPE_UNCALIBRATED", "LIGHT", "STEP_COUNT", "STEP_DETECTOR", "OFFBODY" -> List.of("accuracy");
+        case "MAGNETIC_FIELD", "MAGNETIC_FIELD_UNCALIBRATED", "PRESSURE", "GYROSCOPE", "GYROSCOPE_UNCALIBRATED", "PLATFORM_ACCELEROMETER", "LIGHT", "STEP_COUNT", "STEP_DETECTOR", "OFFBODY" -> List.of("accuracy");
         case "GPS" -> List.of("provider");
         default -> List.of();
     }; }
     private long gapThresholdMs(){return switch(sensor){
-        case "ECG"->100; case "ACCELEROMETER", "PPG", "PPG_ON_DEMAND", "GYROSCOPE_UNCALIBRATED"->200;
+        case "ECG"->100; case "ACCELEROMETER", "PLATFORM_ACCELEROMETER", "PPG", "PPG_ON_DEMAND", "GYROSCOPE_UNCALIBRATED"->200;
         // On-change event sources: quiet periods while stationary are expected, not missing steps.
         case "STEP_COUNT", "STEP_DETECTOR", "OFFBODY"->60_000;
         default->5_000;
