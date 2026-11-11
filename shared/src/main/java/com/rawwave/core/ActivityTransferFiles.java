@@ -27,7 +27,18 @@ public final class ActivityTransferFiles {
 
     /** Consumes exactly expected bytes, verifies the stream, atomically commits, then verifies disk again. */
     public static File commit(File folder, String id, String hash, long expected, InputStream input) throws IOException {
+        return commit(folder, id, hash, expected, input, 0L);
+    }
+
+    /**
+     * Resume-aware commit. [resumeFrom] bytes must already be durable in {@code id.part};
+     * the input carries only the suffix. A transport failure keeps the partial for the next
+     * attempt; a hash/read-back failure deletes it because the bytes are known bad.
+     */
+    public static File commit(File folder, String id, String hash, long expected, InputStream input,
+                              long resumeFrom) throws IOException {
         validate(id, hash, expected);
+        if (resumeFrom < 0L || resumeFrom >= expected) throw new IOException("INVALID_ACTIVITY_RESUME_OFFSET");
         Files.createDirectories(folder.toPath());
         if (folder.getUsableSpace() < expected + 100L * 1024 * 1024) throw new IOException("LOW_PHONE_STORAGE");
         File target = new File(folder, id + ".zip");
@@ -35,10 +46,21 @@ public final class ActivityTransferFiles {
         MessageDigest incoming = digest();
         OutputStream sink = null;
         boolean existing = target.isFile();
+        boolean resuming = false;
+        if (!existing && resumeFrom > 0L) {
+            if (!part.isFile() || part.length() != resumeFrom) throw new IOException("ACTIVITY_RESUME_OFFSET_CHANGED");
+            // The final digest must cover the durable prefix as well as the suffix.
+            try (InputStream prefix = new FileInputStream(part)) {
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = prefix.read(buffer)) != -1) incoming.update(buffer, 0, count);
+            }
+            resuming = true;
+        }
         try {
-            if (!existing) sink = new FileOutputStream(part);
+            if (!existing) sink = new FileOutputStream(part, resuming);
             byte[] buffer = new byte[64 * 1024];
-            long remaining = expected;
+            long remaining = expected - (resuming ? resumeFrom : 0L);
             while (remaining > 0) {
                 if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("ACTIVITY_RECEIVE_CANCELLED");
                 int count = input.read(buffer, 0, (int)Math.min(buffer.length, remaining));
@@ -51,7 +73,11 @@ public final class ActivityTransferFiles {
             if (sink instanceof FileOutputStream file) { file.flush(); file.getFD().sync(); }
         } catch (IOException failure) {
             try { if (sink != null) sink.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
-            if (!existing) Files.deleteIfExists(part.toPath());
+            // Keep the partial for the next resume unless the receiver cannot trust it.
+            if (!existing && failure.getMessage() != null &&
+                failure.getMessage().startsWith("ACTIVITY_RESUME_OFFSET_CHANGED")) {
+                Files.deleteIfExists(part.toPath());
+            }
             throw failure;
         } finally {
             if (sink != null) try { sink.close(); } catch (IOException ignored) {}
@@ -61,7 +87,11 @@ public final class ActivityTransferFiles {
             throw new IOException("ACTIVITY_STREAM_HASH_MISMATCH");
         }
         if (!existing) Files.move(part.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE);
-        if (target.length() != expected || !hashFile(target).equals(hash)) throw new IOException("ACTIVITY_DISK_READBACK_FAILED");
+        if (target.length() != expected || !hashFile(target).equals(hash)) {
+            // A corrupt target would make every retry fail the same way.
+            Files.deleteIfExists(target.toPath());
+            throw new IOException("ACTIVITY_DISK_READBACK_FAILED");
+        }
         byte[] receipt = ("{\"kind\":\"ACTIVITY_ARCHIVE_BYTES_COMMITTED_PENDING_DEEP_VERIFY\",\"id\":\"" + id
             + "\",\"sha256\":\"" + hash + "\",\"bytes\":" + expected + "}").getBytes(StandardCharsets.UTF_8);
         atomic(new File(folder, id + ".receipt.part"), new File(folder, id + ".receipt.json"), receipt);

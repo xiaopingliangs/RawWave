@@ -20,4 +20,17 @@ public interface ReceiveStore {
      */
     @FunctionalInterface interface Checkpoint { void run() throws IOException; }
     Receipt commit(Request request, InputStream input, Checkpoint verifying) throws IOException;
+
+    /** RAW_ACTIVITY only: bytes already durable in the partial file for this exact request. */
+    default long resumeOffset(Request request) throws IOException { return 0L; }
+
+    /**
+     * RAW_ACTIVITY only: commit the suffix after [resumeFrom] already-durable bytes.
+     * Implementations without partial storage reject a non-zero offset. The default keeps
+     * existing diagnostic/small transports unchanged.
+     */
+    default Receipt commit(Request request, InputStream input, Checkpoint verifying, long resumeFrom) throws IOException {
+        if (resumeFrom != 0L) throw new IOException("RESUME_NOT_SUPPORTED");
+        return commit(request, input, verifying);
+    }
 }

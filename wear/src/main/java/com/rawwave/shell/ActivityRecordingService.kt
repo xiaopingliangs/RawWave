@@ -34,7 +34,10 @@ class ActivityRecordingService : Service() {
     companion object {
         private const val SHORT_BUDGET_MS = 80_000L
         private const val NO_HAND_AUTOSTART_MS = 15_000L
-        private const val BIA_CONTACT_RETRY_MS = 2_000L
+        /** Let the stopped-service notification render before the process removes itself. */
+        private const val VENDOR_RELEASE_KILL_DELAY_MS = 1_500L
+        /** Rest between BIA/MF-BIA attempts; the electrode/skin state needs to settle. */
+        private const val BIA_CONTACT_RETRY_MS = 5_000L
         data class State(val active: Boolean = false, val phase: String = "",
             val text: String = "", val remaining: Int = 0, val contact: Boolean = false,
             val skipAllowed: Boolean = false, val failedAttempts: Int = 0, val shortSensor: String = "ECG",
@@ -43,6 +46,19 @@ class ActivityRecordingService : Service() {
             val biaHint: String = "", val coreElapsedSeconds: Long = 0L,
             val phaseRemainingSeconds: Int = 0, val biaModeNumber: Int = 0, val biaModeCount: Int = 0)
         @Volatile var state = State(); private set
+        /**
+         * Absolute end of the vendor release hold. A fresh Activity uses it to clear a
+         * RELEASING state left behind by a process that survived the hold (for example a
+         * manual sync or a lost timer). Zero means no release is pending.
+         */
+        @Volatile var releaseDeadlineMs = 0L; private set
+        /** Clear a stale RELEASING screen after the hold deadline or a fresh process. */
+        fun resetStaleReleaseState() {
+            if (state.phase == "RELEASING" && (releaseDeadlineMs == 0L || SystemClock.elapsedRealtime() > releaseDeadlineMs)) {
+                state = State(false, "DONE", "上次传感器释放已结束；数据保留，可手动同步。")
+                releaseDeadlineMs = 0L
+            }
+        }
         var observer: ((State) -> Unit)? = null // main thread; removed on Activity stop
         var successObserver: ((String, String) -> Unit)? = null // main thread; short measurement success
         var idleExitObserver: (() -> Unit)? = null // main thread; retained only until Activity destroy
@@ -60,6 +76,8 @@ class ActivityRecordingService : Service() {
     private var session: ActivityStore.Session? = null
     private var persistence: com.rawwave.core.CapturePersistence? = null
     internal var useDiskOwner = false
+    /** Production default: drain PPG before the SDK HR client so the vendor stop can apply. */
+    internal var drainPpgFirstForLed = true
     private fun appendRows(phase: String, sensor: String, rows: List<Map<String, Any?>>) {
         persistence?.append(phase, sensor, rows) ?: session?.append(phase, sensor, rows)
     }
@@ -67,7 +85,8 @@ class ActivityRecordingService : Service() {
     private var adapter: SensorPort? = null
     private var lock: PowerManager.WakeLock? = null
     private var phase = "PRE-1"
-    private var ecg = true
+    private var preEcg = false
+    private var postEcg = false
     private var bodySource = "BIA"
     private var bia = false
     private var biaPre = true
@@ -86,11 +105,14 @@ class ActivityRecordingService : Service() {
     private var biaProgress = -1
     private var biaHint = ""
     private var biaSummary = ""
-    private var spo2 = false
+    private var preSpo2 = false
+    private var postSpo2 = false
+    /** Which phase the current short measurement belongs to; not a template choice. */
     private var spo2Pre = true
-    private var ppg = false
     /** Continuous CORE PPG plus pre short PPG uses the same vendor 25 Hz client; skip pre to avoid the known LED leak. */
     private var skipPrePpgForVendorLed = false
+    private var prePpg = false
+    private var postPpg = false
     private var ppgPre = true
     private var shortSensor = "ECG"
     private var shortFailure = false
@@ -117,7 +139,14 @@ class ActivityRecordingService : Service() {
     private var incompleteTail = ""
     @Volatile private var destroyed = false
     @Volatile private var taskRemoved = false
-    internal fun shouldStartFinishSync(sealed: Boolean) = sealed && !destroyed && !taskRemoved && coreDataObserved
+    /**
+     * The transport ZIP is prebuilt during capture and the transfer is resumable/bounded,
+     * so capture can start the normal sync immediately. The 60-second vendor release runs
+     * independently and still ends the process after the sync (or the 5-minute pause).
+     */
+    internal var autoSyncAfterCapture = true
+    internal fun shouldStartFinishSync(sealed: Boolean) =
+        autoSyncAfterCapture && sealed && !destroyed && !taskRemoved && coreDataObserved
     private val fatalPending = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private var started = false
     private var contact = false
@@ -150,7 +179,10 @@ class ActivityRecordingService : Service() {
             persistence?.check()
             flush()
             if (lastDeviceStateMs == 0L || clock() - lastDeviceStateMs >= 60_000L) sampleDeviceState()
+            // Review pages have their own 80-second deadline set at review entry. The
+            // measurement budget must not leak into the review and cut it short.
             if (shortBudgetStartMs > 0L && shortSensor.isNotEmpty() && phase != "CORE-1" &&
+                !phase.startsWith("REVIEW_") &&
                 !(shortSensor == "BIA" && biaContactDetected) &&
                 !(shortSensor == "ECG" && ecgGate.measuring() && (phase.startsWith("PRE") || phase.startsWith("POST"))) &&
                 clock() >= shortBudgetStartMs + SHORT_BUDGET_MS) {
@@ -177,8 +209,8 @@ class ActivityRecordingService : Service() {
                 if (phase.startsWith("READY_SPO2_")) { beginSpo2(spo2Pre); return@guarded }
                 if (phase.startsWith("READY_PPG_")) { beginPpg(ppgPre); return@guarded }
                 if (phase == "RESTORE_PRE") {
-                    event("NORMAL_PLACEMENT_CONFIRMED", "auto=${NO_HAND_AUTOSTART_MS / 1000}s; next=${if(ecg) "ECG" else "CORE"}")
-                    if(ecg) beginEcg("PRE-1") else beginCore()
+                    event("NORMAL_PLACEMENT_CONFIRMED", "auto=${NO_HAND_AUTOSTART_MS / 1000}s; next=${if(preEcg) "ECG" else "CORE"}")
+                    if(preEcg) beginEcg("PRE-1") else beginCore()
                     return@guarded
                 }
                 if (phase.startsWith("WAIT_BIA_")) {
@@ -292,9 +324,12 @@ class ActivityRecordingService : Service() {
         check(session == null && !destroyed && !stopping) { "CAPTURE_SESSION_ALREADY_USED" }
         session = value
         if (useDiskOwner) persistence = com.rawwave.core.CapturePersistence(value)
-        ecg = template.ecg(); coreSources = template.coreSources().toList()
-        spo2 = template.spo2(); bia = template.bia(); ppg = template.ppg()
-        skipPrePpgForVendorLed = ppg && coreSources.contains("PPG")
+        coreSources = template.coreSources().toList()
+        preEcg = template.preEcg(); postEcg = template.postEcg()
+        preSpo2 = template.preSpo2(); postSpo2 = template.postSpo2()
+        bia = template.bia()
+        prePpg = template.prePpg(); postPpg = template.postPpg()
+        skipPrePpgForVendorLed = prePpg && coreSources.contains("PPG")
         if (skipPrePpgForVendorLed) {
             ppgResults["PRE-300"] = "已跳过：连续 PPG 与短测 PPG 同时开启时，活动前 100Hz 可能与背面灯常亮冲突"
             event("PRE_PPG_SKIPPED_FOR_VENDOR_LED",
@@ -329,7 +364,7 @@ class ActivityRecordingService : Service() {
             // LEDs on; skip only the pre short PPG and keep the post short PPG after CORE stops.
             // BIA only waits for finger contact. SpO2 still needs the elbow/wrist position, and
             // ECG is the only later placement change.
-            if (ppg && !skipPrePpgForVendorLed) beginPpg(true) else if (bia) startBia(true) else if (spo2) prepareSpo2(true) else if (ecg) beginEcg("PRE-1") else beginCore()
+            if (prePpg && !skipPrePpgForVendorLed) beginPpg(true) else if (bia) startBia(true) else if (preSpo2) prepareSpo2(true) else if (preEcg) beginEcg("PRE-1") else beginCore()
         }, { finish(it) })
         writer.post(tick)
     }
@@ -353,23 +388,55 @@ class ActivityRecordingService : Service() {
                         // before ECG makes our later final unset a second, ineffective unset.
                         // Holding PPG makes it the last 25 Hz client and gives the vendor stop
                         // request one real chance after ECG has ended.
-                        val holdPpg = ecg && coreSources.contains("PPG")
-                        drainSources(keep = if (holdPpg) setOf("PPG") else emptySet(),
-                            allowPartialPost = ecg || spo2 || bia || ppg) {
-                        when(CapturePhasePolicy.coreEnded(ecg)) {
-                            CapturePhasePolicy.Next.POST_ECG -> beginEcg("POST-1")
-                            else -> beginPostShorts()
+                        val holdPpg = postEcg && coreSources.contains("PPG")
+                        val postFlow: () -> Unit = {
+                            when(CapturePhasePolicy.coreEnded(postEcg)) {
+                                CapturePhasePolicy.Next.POST_ECG -> beginEcg("POST-1")
+                                else -> beginPostShorts()
+                            }
                         }
+                        // 2026-11-05 evidence: the vendor 25 Hz stop is applied when PPG is
+                        // unset while the SDK HEART_RATE client is still active. Drain PPG
+                        // first, then the remaining sources; do not drain both together.
+                        val ppgFirstForLed = drainPpgFirstForLed && !postEcg &&
+                            coreSources.contains(SensorCatalog.PPG) &&
+                            coreSources.contains(SensorCatalog.HEART_RATE)
+                        if (ppgFirstForLed) {
+                            event("LED_RELEASE_DRAIN_PPG_FIRST",
+                                "keep=HEART_RATE; reason=PPG_25HZ_STOP_NOT_VERIFIABLE")
+                            drainSources(keep = setOf(SensorCatalog.HEART_RATE), allowPartialPost = true,
+                                only = setOf(SensorCatalog.PPG)) {
+                                drainSources(allowPartialPost = postEcg || postSpo2 || postPpg) { postFlow() }
+                            }
+                        } else {
+                            drainSources(keep = if (holdPpg) setOf("PPG") else emptySet(),
+                                allowPartialPost = postEcg || postSpo2 || postPpg) { postFlow() }
                         }
                     }
                     "CANCEL" -> finish("USER_INTERRUPTED")
+                    "TOUCH" -> {
+                        // A user who is still trying or reaching for skip is not idle. Reset
+                        // the short-phase deadline so the 80-second safety cannot close the
+                        // page in the middle of their interaction.
+                        if (shortBudgetStartMs > 0L && phase != "CORE-1") {
+                            shortBudgetStartMs = clock()
+                            if (shortSensor == "BIA") biaContactStartMs = clock()
+                            // Extend only decision/idle windows. A BIA retry wait already
+                            // has a 5-second deadline; touching to reach skip must not
+                            // postpone the automatic retry by another 80 seconds.
+                            if (phase.startsWith("REVIEW_"))
+                                deadline = maxOf(deadline, clock() + SHORT_BUDGET_MS)
+                            else if (shortSensor == "ECG" && !ecgGate.measuring())
+                                deadline = maxOf(deadline, clock() + SHORT_BUDGET_MS)
+                        }
+                    }
                       "RETRY_BIA" -> if(phase.startsWith("REVIEW_BIA_")) retryBia()
                       "SKIP_BIA" -> if(shortSensor == "BIA" && phase != "CORE-1") skipBia()
                       "START_SPO2" -> if (phase.startsWith("READY_SPO2_")) beginSpo2(spo2Pre)
                       "START_PPG" -> if (phase.startsWith("READY_PPG_")) beginPpg(ppgPre)
                       "PLACEMENT_READY" -> if (phase == "RESTORE_PRE") {
-                          event("NORMAL_PLACEMENT_CONFIRMED", "next=${if(ecg) "ECG" else "CORE"}")
-                          if(ecg) beginEcg("PRE-1") else beginCore()
+                          event("NORMAL_PLACEMENT_CONFIRMED", "next=${if(preEcg) "ECG" else "CORE"}")
+                          if(preEcg) beginEcg("PRE-1") else beginCore()
                       }
                       // A retry is a measurement restart, not a new placement decision.
                       // SpO2/PPG have no contact gate, so start immediately.
@@ -430,11 +497,13 @@ class ActivityRecordingService : Service() {
     private fun beginEcg(next: String) {
         shortSensor = "ECG"
         phase = next; ecgPhase = next; ecgFailed = false; ecgFailureReason = ""
-        notice = ""; contact = false; ecgTotalRows = 0
+        notice = "请把手指轻放在 Home 键；检测到稳定接触后立即开始30秒。80秒没有接触才会自动退出。"
+        contact = false; ecgTotalRows = 0
         lastContactMs = 0; ecgGate = EcgContinuityGate(); ecgUpdate = null
-        // Wait for a valid batch. A later invalid batch resets the strict continuous segment.
+        // The no-contact safety starts with this ECG phase, not with the session. Pre-BIA/
+        // SpO2/PPG work must not consume the ECG contact window before ECG even begins.
         shortBudgetStartMs = clock()
-        deadline = EcgWaitBudget.initialDeadline(next == "PRE-1" && !spo2 && !bia,sessionStartedMs,clock())
+        deadline = clock() + EcgWaitBudget.IDLE_MS
         event("PHASE_START", next); startSource("ECG"); restartTick()
     }
     private fun beginCore() {
@@ -456,7 +525,7 @@ class ActivityRecordingService : Service() {
         // Body composition is intentionally pre-activity only. Post-exercise BIA/MF-BIA
         // is dominated by acute fluid shifts and is not comparable to the pre measurement.
         // PPG starts immediately after post ECG; only the final SpO2 needs a placement pause.
-        if(ppg) beginPpg(false) else if(spo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        if(postPpg) beginPpg(false) else if(postSpo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun startBia(pre: Boolean) {
         biaModeIndex=0
@@ -562,8 +631,8 @@ class ActivityRecordingService : Service() {
     }
     private fun afterBiaPhase() {
         if(biaPre) {
-            if(spo2) prepareSpo2(true) else restorePlacement()
-        } else if(spo2) prepareSpo2(false)
+            if(preSpo2) prepareSpo2(true) else restorePlacement()
+        } else if(postSpo2) prepareSpo2(false)
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun prepareSpo2(pre: Boolean) {
@@ -639,9 +708,9 @@ class ActivityRecordingService : Service() {
     private fun afterPpg() {
         if(ppgPre) {
             if(bia) startBia(true)
-            else if(spo2) prepareSpo2(true)
+            else if(preSpo2) prepareSpo2(true)
             else restorePlacement()
-        } else if(spo2) prepareSpo2(false)
+        } else if(postSpo2) prepareSpo2(false)
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun restorePlacement() {
@@ -806,12 +875,18 @@ class ActivityRecordingService : Service() {
                     ecgUpdate = update
                     when (update.status()) {
                         EcgContinuityGate.Status.STARTED -> {
+                            // The 80-second guard is "no contact", not "seconds since the phase
+                            // began". Contact just arrived, so the retry/idle budget restarts.
+                            shortBudgetStartMs = clock()
                             deadline = clock() + 45_000
                             notice = "接触有效，正在连续采集；中途断开会从头开始。"
                             event("ECG_CONTINUOUS_SEGMENT_STARTED", "segment=${update.segment()}; firstSdkTimestampMs=${update.firstTimestampMs()}")
                         }
                         EcgContinuityGate.Status.RESET -> {
                             val failures = retryPolicy(phase.startsWith("PRE")).recordFailure()
+                            // A reset is not "no contact"; the user is still holding the
+                            // electrode and may be retrying. Renew both idle timers.
+                            shortBudgetStartMs = clock()
                             deadline = clock() + 80_000
                             notice = "接触或数据连续性中断（第${failures}次），本次已作废。重新放好后从30秒开始。" +
                                 if (failures >= 2) "你也可以选择跳过 ECG，继续本次活动。" else ""
@@ -974,9 +1049,10 @@ class ActivityRecordingService : Service() {
      * [keep] is used only for the post-ECG LED case: the core PPG stays live while the ECG
      * drains, so its final unset is a real first unset after the vendor HRM re-open.
      */
-    private fun drainSources(keep: Set<String> = emptySet(), allowPartialPost: Boolean = false, next: () -> Unit) {
+    private fun drainSources(keep: Set<String> = emptySet(), allowPartialPost: Boolean = false,
+                             only: Set<String>? = null, next: () -> Unit) {
         if (draining != null || stopping) return
-        val sources = running.toList().filterNot { it in keep }
+        val sources = running.toList().filterNot { it in keep }.filter { only == null || it in only }
         val drain = CaptureDrain(sources)
         draining = drain
         writer.removeCallbacks(tick)
@@ -1096,7 +1172,7 @@ class ActivityRecordingService : Service() {
             phase.startsWith("PRE") -> "活动前 ECG"
             phase.startsWith("POST") -> "活动后 ECG"
             phase == "CORE-1" -> "活动记录中\n${coreSources.joinToString("、", transform = ::sensorLabel)}同时采集" +
-                (if (ecg) "\n结束后还会测 ECG" else "") + (if(spo2) "\n结束后还会测血氧" else "") + (if(bia) "\n结束后还会测体成分" else "")
+                (if (postEcg) "\n结束后还会测 ECG" else "") + (if(postSpo2) "\n结束后还会测血氧" else "") + (if(postPpg) "\n结束后还会测 PPG" else "")
             else -> "ECG 本次测量结束"
         }
         val ecgPhaseActive = shortSensor == "ECG" && (phase.startsWith("PRE") || phase.startsWith("POST"))
@@ -1149,8 +1225,7 @@ class ActivityRecordingService : Service() {
             "${if(attempt.startsWith("PRE")) "活动前" else "活动后"} PPG 100Hz第${attempt.substringAfter('-').toInt()-299}次：$result"
         }
         return (body + oxygen + ppgLines + raw).joinToString("\n").ifEmpty { "暂无采集记录" }
-    }
-    private fun sensorLabel(sensor: String) = when (sensor) {
+    }    private fun sensorLabel(sensor: String) = when (sensor) {
         "ECG" -> "ECG"
         "SPO2" -> "血氧"
         "BIA" -> "体成分"
@@ -1187,6 +1262,81 @@ class ActivityRecordingService : Service() {
         try { (application as ProbeApplication).journal?.fault("CAPTURE_FAILURE", error) } catch (_: Exception) { }
         finish("FAILURE:${error.javaClass.simpleName}:${error.message}")
     }
+    /**
+     * After sealing, keep the vendor connector alive for the adapter's release hold, then
+     * release it, stop the service and remove this process. A dead process is the only
+     * guarantee that no RawWave vendor handle or file descriptor survives the activity.
+     * Main thread only.
+     */
+    private fun releaseVendorThenExit(text: String) {
+        val app = application as ProbeApplication
+        val holdMs = try { adapter?.releaseHoldMs() ?: 0L } catch (_: Exception) { 0L }
+        if (holdMs <= 0L) {
+            try { adapter?.releaseConnection() } catch (_: Exception) {}
+            try { observer?.invoke(State(false, "DONE", text)) } catch (_: Exception) {}
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        val adapterRef = adapter
+        val lockRef = lock
+        val done = State(false, "DONE",
+            "$text\n传感器已停止，正在后台释放 ${holdMs / 1000} 秒；现在可以开始新的活动。")
+        state = done
+        releaseDeadlineMs = 0L
+        try { observer?.invoke(done) } catch (_: Exception) {}
+        try { app.journal?.event("WATCH_VENDOR_RELEASE_BACKGROUND",
+            mapOf("holdMs" to holdMs, "reason" to terminalReason)) } catch (_: Exception) {}
+        // Stop the capture service immediately. The application-level keeper holds the
+        // vendor connector for the LED release, so the home is usable and a new activity
+        // can start without waiting for the 60-second hold.
+        app.scheduleSensorRelease(holdMs, lockRef) {
+            try { adapterRef?.releaseConnection() } catch (e: Exception) {
+                try { app.journal?.event("WATCH_VENDOR_RELEASE_FAILED",
+                    mapOf("error" to e.toString())) } catch (_: Exception) {}
+            }
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /**
+     * Kill this process after the release hold unless a manual sync is still using it.
+     * Every deferred check rewrites the state, so the UI never stays on RELEASING.
+     */
+    private fun scheduleProcessExitWhenIdle(app: ProbeApplication, holdMs: Long, attempt: Int) {
+        if (state.active) {
+            try { app.journal?.event("WATCH_PROCESS_EXIT_SKIPPED",
+                mapOf("captureActive" to true, "deferredChecks" to attempt)) } catch (_: Exception) {}
+            return
+        }
+        if (app.activitySyncStatus.running && attempt < 120) {
+            if (state.phase == "RELEASING") {
+                val done = State(false, "DONE", "传感器已释放；同步结束后 App 会自动关闭。")
+                state = done
+                releaseDeadlineMs = 0L
+                // Repaint now: render() will show the sync page while it is running.
+                try { observer?.invoke(done) } catch (_: Exception) {}
+            }
+            main.postDelayed({ scheduleProcessExitWhenIdle(app, holdMs, attempt + 1) }, 5_000L)
+            return
+        }
+        releaseDeadlineMs = 0L
+        try { app.journal?.event("WATCH_PROCESS_EXIT",
+            mapOf("afterReleaseMs" to holdMs, "deferredChecks" to attempt,
+                "reason" to terminalReason)) } catch (_: Exception) {}
+        main.postDelayed({
+            // Re-check at the last moment: the user may have started a new capture in the
+            // short gap between scheduling and the kill.
+            if (state.active) {
+                try { app.journal?.event("WATCH_PROCESS_EXIT_SKIPPED",
+                    mapOf("captureActive" to true, "atKill" to true)) } catch (_: Exception) {}
+                return@postDelayed
+            }
+            Process.killProcess(Process.myPid())
+        }, VENDOR_RELEASE_KILL_DELAY_MS)
+    }
+
     private fun finish(reason: String, idleExit: Boolean = false) {
         if (stopping) return
         if (pendingFinish == null) pendingFinish = reason to idleExit
@@ -1248,21 +1398,27 @@ class ActivityRecordingService : Service() {
         catch (e: Exception) { result += ";NOT_SEALED:${e.message};已有块保留" }
         terminalReason = result
         persistence?.close()
-        try { lock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { result += ";LOCK_RELEASE_FAILURE:${e.message}" }
+        // The release hold keeps the capture wake lock alive until the vendor connector is
+        // unbound; otherwise the CPU can sleep before the queued unset/disconnect runs.
+        val pendingReleaseHoldMs = try { adapter?.releaseHoldMs() ?: 0L } catch (_: Exception) { 0L }
+        if (pendingReleaseHoldMs <= 0L) {
+            try { lock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { result += ";LOCK_RELEASE_FAILURE:${e.message}" }
+        }
         if (destroyed) writer.close()
         if (idleExit) {
-            val next = State(false, "DONE", if (reason.startsWith("CORE_NO_DATA_TIMEOUT"))
+            val text = if (reason.startsWith("CORE_NO_DATA_TIMEOUT"))
                 "没有收到活动数据，已停止并退出；本次不会自动同步。" else
-                "短测等待或选择超时，已停止；已有数据保留，下次打开可同步。")
+                "短测等待或选择超时，已停止；已有数据保留，下次打开可同步。"
+            val next = State(false, "DONE", text)
             state = next
             main.post {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                try { observer?.invoke(next) } catch (_: Exception) {}
                 val app = application as ProbeApplication
                 try { app.journal?.event("CAPTURE_IDLE_STOP_COMPLETED",mapOf(
                     "reason" to result,"sealed" to sealed,"autoSyncStarted" to false,
                     "wakeLockHeld" to (lock?.isHeld == true),"deadlineMs" to deadline)) } catch (_: Exception) {}
-                idleExitObserver?.invoke()
+                releaseVendorThenExit(text)
+                try { idleExitObserver?.invoke() } catch (_: Exception) {}
             }
             return
         }
@@ -1272,30 +1428,24 @@ class ActivityRecordingService : Service() {
             result.startsWith("USER_COMPLETED") -> if (incompleteTail.isEmpty()) "记录已结束并封存；传感器失败/无效数据会单独注明" else "记录已保存，但部分活动传感器尾部未确认；详情见问题报告"
             else -> "记录因异常停止，请发送问题报告\n$result"
         }
-        val restoreHint = if(spo2) "\n请将手表恢复到平时佩戴位置。" else ""
+        val restoreHint = if(preSpo2 || postSpo2) "\n请将手表恢复到平时佩戴位置。" else ""
         val counts = countText()
-        val preparing = State(false, if (sealed) "SYNC_PENDING" else "DONE",
-            "$outcome$restoreHint\n$counts\n" + if (sealed) "正在结束采集服务并准备自动同步。"
+        val preparing = State(false, "DONE",
+            "$outcome$restoreHint\n$counts\n" + if (sealed) "正在结束采集服务并释放传感器。"
             else "数据保留在手表；下次打开原波可重新同步。")
         state = preparing
         main.post {
-            observer?.invoke(preparing)
-            // Request the bounded sync owner while capture still has foreground eligibility.
+            try { observer?.invoke(preparing) } catch (_: Exception) {}
             val app = application as ProbeApplication
             val ownerBefore = app.activeSyncOwner.orEmpty()
-            // Establish the sync foreground-service owner before relinquishing capture's
-            // foreground eligibility. Sensors have already been stopped above.
             val syncStarted = shouldStartFinishSync(sealed) && app.startWatchActivitySync(ActivitySyncPolicy.CAPTURE_FINISHED)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
             try { app.journal?.event("ACTIVITY_CAPTURE_FINISH_SYNC_DECISION", mapOf(
                 "sealed" to sealed,"started" to syncStarted,"taskRemoved" to taskRemoved,"activeOwnerBefore" to ownerBefore,
+                "autoSyncAfterCapture" to autoSyncAfterCapture,
                 "trigger" to ActivitySyncPolicy.CAPTURE_FINISHED)) } catch (_: Exception) {}
-            val syncText = if (syncStarted) "正在同步活动原始数据到手机；成功后立即停止，失败也不会自动重试。"
-                else "自动同步没有启动；数据仍保留，下次打开原波可补同步。"
-            val next = State(false, if (syncStarted) "SYNC" else "DONE", "$outcome$restoreHint\n$counts\n$syncText")
-            state = next
-            observer?.invoke(next)
+            // The vendor release hold is independent of the sync service. Always run it;
+            // auto-sync must not skip the 60-second LED release before the process exits.
+            releaseVendorThenExit("$outcome$restoreHint\n$counts")
         }
     }
     override fun onTaskRemoved(rootIntent: Intent?) {

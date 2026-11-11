@@ -87,11 +87,18 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
     private fun onAttemptFinished(success: Boolean,text: String) {
         if(finished) return
         if(success) { finish(true,text); return }
+        // The hard per-attempt window is a deliberate pause, not a transient fault. Retrying
+        // immediately would turn "5 minutes" into 15 minutes of continuous drain; the next
+        // open/resume continues from the receiver's durable offset instead.
+        if(text.contains("本轮同步时间已用完")) {
+            finish(false,"已到 ${com.rawwave.core.ActivityTransferBudget.MAX_TRANSFER_MS / 60_000} 分钟单次上限，已停止；下次打开原波会从断点继续。")
+            return
+        }
         if(!ActivityRetryPolicy.shouldRetry(attempts)) { finish(false,text); return }
         try { app.journal?.event("ACTIVITY_WATCH_SYNC_RETRY_SCHEDULED",mapOf("attempt" to attempts,
             "maxAttempts" to ActivityRetryPolicy.MAX_ATTEMPTS,"text" to text.take(300),
             "trigger" to trigger,"owner" to owner)) } catch (_: Exception) {}
-        publish(true,false,"第一次同步没有完成，${ActivityRetryPolicy.RETRY_DELAY_MS / 1000} 秒后自动重试…")
+        publish(true,false,"第 ${attempts} 次同步没有完成，${ActivityRetryPolicy.RETRY_DELAY_MS / 1000} 秒后自动重试…")
         postDelayed(ActivityRetryPolicy.RETRY_DELAY_MS) {
             if(!finished && app.activeSyncOwner == owner) startRetry()
         }
@@ -131,7 +138,9 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
         val ownsStatus=app.activeSyncOwner == owner
         if(ownsStatus) {
             app.activeSyncOwner=null; app.stopBackgroundSync=null
-            app.pendingActivitySyncExit.set(completed && ActivitySyncPolicy.exitAfterSuccessfulSync(trigger))
+            // The watch home now stays on the last screen so a screen-on returns to it.
+            // The capture and sync services own their own lifetimes; the UI never removes the task.
+            app.pendingActivitySyncExit.set(false)
             publish(false,completed,text)
         }
         if(app.activeWatchActivitySync === this) app.activeWatchActivitySync=null

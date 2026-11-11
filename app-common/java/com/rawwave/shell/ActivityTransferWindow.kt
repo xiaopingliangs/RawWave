@@ -62,6 +62,8 @@ class ActivityTransferWindow(
     private var watchdogTask: ScheduledFuture<*>? = null
     @Volatile private var lastProgressMs = monotonicMs()
     @Volatile private var transferActive = false
+    /** Hard file-byte window; commit verification is a separate phase. */
+    @Volatile private var fileDeadline = 0L
     /** File-byte rate stability only; packaging, handshake and verification are separate phases. */
     private val rateMonitor = TransferRateMonitor()
     @Volatile private var rateState = "STABLE"
@@ -71,6 +73,8 @@ class ActivityTransferWindow(
     @Volatile private var id = ""
     @Volatile private var hash = ""
     @Volatile private var expected = 0L
+    /** Receiver's durable prefix for this archive; returned in READY and skipped by the sender. */
+    @Volatile private var resumeOffset = 0L
     @Volatile private var senderWindow = if (watchRole) UUID.randomUUID().toString() else ""
     @Volatile private var channel: TransportPort.Channel? = null
     @Volatile private var failure = ""
@@ -118,6 +122,7 @@ class ActivityTransferWindow(
     private fun beginFileBytes(now: Long) {
         lastProgressMs = now
         transferActive = true
+        fileDeadline = minOf(now + ActivityTransferBudget.MAX_TRANSFER_MS, deadline)
         rateMonitor.reset(now)
         rateState = "STABLE"
     }
@@ -129,11 +134,13 @@ class ActivityTransferWindow(
                     if (attemptState.isClosed()) return@scheduleWithFixedDelay
                     val now = monotonicMs()
                     val handshakeExpired = handshakeDeadline > 0L && !transferActive && now >= handshakeDeadline
+                    val fileExpired = transferActive && fileDeadline > 0L && now >= fileDeadline
                     val stalled = transferActive && now - lastProgressMs > ActivityTransferBudget.STALL_MS
                     val rateVerdict = if (transferActive) rateMonitor.check(now)
                         else TransferRateMonitor.Verdict.STABLE
                     when {
                         handshakeExpired -> abort("ACTIVITY_HANDSHAKE_TIMEOUT")
+                        fileExpired -> abort("ACTIVITY_WINDOW_EXPIRED")
                         stalled -> abort("ACTIVITY_TRANSFER_STALLED")
                         rateVerdict == TransferRateMonitor.Verdict.EXPIRED -> {
                             try { log("ACTIVITY_TRANSFER_RATE_EXPIRED", rateMonitor.evidence(now)) } catch (_: Exception) {}
@@ -188,13 +195,25 @@ class ActivityTransferWindow(
         check(signal.await(minOf(maxMs,deadline-monotonicMs()).coerceAtLeast(1),TimeUnit.MILLISECONDS)) { "${name}_TIMEOUT" }
         checkLive(); check(failure.isEmpty()) { failure }
     }
-    private fun message(type: String): CompletableFuture<Int> {
+    private fun message(type: String, resumeFrom: Long = 0L): CompletableFuture<Int> {
         val payload = JSONObject().put("protocol",1).put("kind","RAW_ACTIVITY").put("type",type)
             .put("id",id).put("hash",hash).put("bytes",expected).put("senderWindow",senderWindow)
             .put("trigger",trigger)
+        if (resumeFrom > 0L) payload.put("offset",resumeFrom)
         val bytes = payload.toString().toByteArray(Charsets.UTF_8)
         check(bytes.size <= 4096) { "ACTIVITY_CONTROL_SIZE_LIMIT" }
         return transport.send(peer,if(type == "HELLO") hello else control,bytes)
+    }
+
+    private fun skipFully(input: InputStream, bytes: Long) {
+        var remaining = bytes
+        while (remaining > 0L) {
+            checkLive()
+            val skipped = input.skip(remaining)
+            if (skipped > 0L) { remaining -= skipped; continue }
+            if (input.read() < 0) throw EOFException("ACTIVITY_RESUME_SOURCE_TRUNCATED")
+            remaining--
+        }
     }
 
     /** Repeat only the idempotent HELLO inside this one bounded transfer attempt while the phone wakes. */
@@ -246,13 +265,21 @@ class ActivityTransferWindow(
                         // HELLO names the exact archive size. Small archives keep the initial
                         // window; only a genuinely large one gets a size-based extension.
                         noteSizeKnown(incomingBytes)
+                        resumeOffset = try {
+                            receiveStore.resumeOffset(ReceiveStore.Request(ReceiveStore.Kind.RAW_ACTIVITY,
+                                incomingId,incomingHash,incomingBytes))
+                        } catch (_: Exception) { 0L }
+                        log("ACTIVITY_RESUME_OFFSET",mapOf("offset" to resumeOffset))
                         stage("ACTIVITY_HELLO_ACCEPTED","已找到手表，准备接收活动原始数据…")
-                        executor.execute { attempt { await(message("READY")); log("ACTIVITY_READY_SENT") } }
+                        executor.execute { attempt { await(message("READY",resumeOffset)); log("ACTIVITY_READY_SENT") } }
                     }
                     TransferAttempt.Action.REPEAT_HELLO -> executor.execute { attempt {
-                        await(message("READY")); log("ACTIVITY_READY_REPEATED")
+                        await(message("READY",resumeOffset)); log("ACTIVITY_READY_REPEATED")
                     } }
-                    TransferAttempt.Action.READY -> ready.countDown()
+                    TransferAttempt.Action.READY -> {
+                        resumeOffset = payload.optLong("offset",0L).coerceAtLeast(0L)
+                        ready.countDown()
+                    }
                     TransferAttempt.Action.COMMITTED -> committed.countDown()
                     TransferAttempt.Action.CONFIRM, TransferAttempt.Action.FINISHED -> confirmed.countDown()
                     else -> {}
@@ -330,8 +357,19 @@ class ActivityTransferWindow(
         handshakeDeadline=0L
         beginFileBytes(monotonicMs())
         stage("ACTIVITY_FILE_SEND_STARTED","正在发送 ${prepared.sessions().size} 次活动的原始数据…")
+        val startAt = resumeOffset.coerceIn(0L, expected)
         sendStore.open(prepared).use { input ->
-            val buffer=ByteArray(64*1024); var sent=0L; var nextUpdate=1024*1024L; var count: Int
+            if (startAt > 0L) {
+                skipFully(input, startAt)
+                val resumedAt = monotonicMs()
+                lastProgressMs = resumedAt
+                // The rate window must start at the resumed byte count, not at zero.
+                rateMonitor.reset(resumedAt); rateMonitor.progress(resumedAt, startAt)
+                stage("ACTIVITY_FILE_RESUMED","从上次中断处继续：${startAt*100/expected}%",
+                    mapOf("offset" to startAt))
+            }
+            val buffer=ByteArray(64*1024); var sent=startAt
+            var nextUpdate=((startAt / (1024*1024)) + 1) * 1024*1024; var count: Int
             while(input.read(buffer).also { count=it } != -1) {
                 checkLive(); output.write(buffer,0,count); val now=monotonicMs()
                 lastProgressMs=now; sent+=count; rateMonitor.progress(now,sent)
@@ -363,9 +401,9 @@ class ActivityTransferWindow(
     }
 
     /** Bounded progress signal for the receive path; never changes the bytes. */
-    private inner class ProgressInput(source: InputStream) : FilterInputStream(source) {
-        private var received=0L
-        private var nextUpdate=1024*1024L
+    private inner class ProgressInput(source: InputStream, startAt: Long = 0L) : FilterInputStream(source) {
+        private var received=startAt
+        private var nextUpdate=((startAt / (1024*1024)) + 1) * 1024*1024
         private fun record(count: Int) {
             if(count<=0) return
             val now=monotonicMs()
@@ -386,14 +424,14 @@ class ActivityTransferWindow(
 
     private fun receive(opened: TransportPort.Channel) {
         stage("ACTIVITY_FILE_RECEIVE_STARTED","正在接收活动原始数据…")
-        val input=ProgressInput(await(transport.input(opened)))
+        val input=ProgressInput(await(transport.input(opened)),resumeOffset)
         val verified = CommitExchange.receiver({
-            val saved=receiveStore.commit(ReceiveStore.Request(ReceiveStore.Kind.RAW_ACTIVITY,id,hash,expected),input) {
+            val saved=receiveStore.commit(ReceiveStore.Request(ReceiveStore.Kind.RAW_ACTIVITY,id,hash,expected),input,{
                 // Byte transfer is over; deep verification may take longer than the stall
                 // window, so only the absolute ceiling applies from here.
                 transferActive=false
                 stage("ACTIVITY_ARCHIVE_VERIFYING","文件已保存，正在核对内部每个原始数据块…")
-        }
+        },resumeOffset)
             transferActive=false
             checkLive()
             stage("ACTIVITY_FILE_COMMITTED","已保存并校验 ${saved.sessionIds().size} 次活动，正在通知手表。",

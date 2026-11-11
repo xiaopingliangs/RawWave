@@ -105,6 +105,26 @@ public class ReportModulesTest {
         File corruptReport=new DiagnosticReportBuilder(journal,received,reports,"phone",Map.of("buildRun","test"),summary).build(2).file();
         assertTrue(new String(entry(corruptReport,"summary-collection.json"),StandardCharsets.UTF_8).contains("CORRUPT_OR_UNREADABLE"));
     }
+    @Test public void watchProblemRecordIsExtractedToTheReportTopLevel() throws Exception {
+        byte[] observation = ("{\"schemaVersion\":1,\"deviceRole\":\"watch\",\"event\":\"DIAGNOSTIC_CAPTURE\","
+            + "\"utc\":\"2026-11-10T01:03:32Z\",\"details\":{\"diagnosticCaptureId\":\"watch-cap-1\","
+            + "\"symptoms\":[\"LED_PERSISTENT\"],\"led\":\"ON\",\"captureServiceRunning\":false}}\n")
+            .getBytes(StandardCharsets.UTF_8);
+        File archive=DiagnosticArchive.create(new File(temp.newFolder(),"watch.zip"),Map.of(
+            "watch/diagnostic-observations.jsonl",observation,
+            "fixture.bin",TransferFiles.fixture()));
+        byte[] data=Files.readAllBytes(archive.toPath());
+        File watch=TransferFiles.commit(received,UUID.randomUUID().toString(),DiagnosticArchive.hash(data),data);
+        ReportBuilder.Report report=builder.build(1);
+        String id=watch.getName().replace(".zip","");
+        String extracted=new String(entry(report.file(),"watch-observations/"+id+".jsonl"),StandardCharsets.UTF_8);
+        assertTrue(extracted.contains("watch-cap-1"));
+        JsonObject manifest=JsonParser.parseString(new String(entry(report.file(),"diagnostic-manifest.json"),StandardCharsets.UTF_8)).getAsJsonObject();
+        assertEquals(1,manifest.getAsJsonObject("coverage").get("watchObservationCount").getAsInt());
+        assertEquals(1,manifest.getAsJsonObject("coverage").get("problemSiteRecordCount").getAsInt());
+        assertEquals("USER_REPORTED",manifest.getAsJsonObject("layers").getAsJsonObject("L0_USER_UI").get("status").getAsString());
+        assertTrue(manifest.getAsJsonObject("coverage").getAsJsonArray("latestDiagnosticCaptureIds").toString().contains("watch-cap-1"));
+    }
     @Test public void attachmentsKeepExactOriginalBytesAndReceipt() throws Exception {
         File original=attachment();
         ReportBuilder.Report report=builder.build(1);

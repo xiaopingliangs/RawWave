@@ -10,8 +10,12 @@ public class ActivityRetryPolicyTest {
         assertTrue(ActivityRetryPolicy.shouldRetry(1));
     }
 
-    @Test public void secondFailureIsTerminal() {
-        assertFalse(ActivityRetryPolicy.shouldRetry(2));
+    @Test public void secondFailureAllowsAnotherRetry() {
+        assertTrue(ActivityRetryPolicy.shouldRetry(2));
+    }
+
+    @Test public void thirdFailureIsTerminal() {
+        assertFalse(ActivityRetryPolicy.shouldRetry(3));
     }
 
     @Test public void noRetryBeforeAnyAttempt() {
@@ -23,7 +27,7 @@ public class ActivityRetryPolicyTest {
         assertTrue(ActivityRetryPolicy.RETRY_DELAY_MS <= 10_000L);
     }
 
-    @Test public void maxAttemptsIsExactlyTwo() {
-        assertTrue(ActivityRetryPolicy.MAX_ATTEMPTS == 2);
+    @Test public void maxAttemptsIsExactlyThree() {
+        assertTrue(ActivityRetryPolicy.MAX_ATTEMPTS == 3);
     }
 }

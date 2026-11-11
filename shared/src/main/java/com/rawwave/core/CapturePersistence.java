@@ -89,5 +89,5 @@ public final class CapturePersistence implements AutoCloseable {
         catch(InterruptedException e){Thread.currentThread().interrupt();throw new IOException("PERSISTENCE_INTERRUPTED",e);}
         catch(ExecutionException|TimeoutException|RejectedExecutionException e){throw new IOException("PERSISTENCE_BARRIER_FAILED",e);}
     }
-    public synchronized void close(){closed=true;disk.shutdown();}
+    public synchronized void close(){closed=true;disk.shutdown();try{session.close();}catch(Exception ignored){}}
 }

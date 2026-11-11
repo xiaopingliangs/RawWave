@@ -20,7 +20,27 @@ RawWave 是一个开源的手表数据采集软件，主要面向三星 Galaxy W
 
 目前项目仍在开发中，具体支持哪些数据，取决于手表硬件和系统开放的功能。
 
-## 最新测试版（2026-11-09）
+## 最新测试版（2026-11-11）
+
+- `export-refresh-20261111-r01` / `0.12.35-step` / versionCode 109
+- 这是测试版，不是稳定发布；0.12.35 真机 `NOT_RUN`，上一版 0.12.34 r07 已在 Galaxy Watch 上完成冒烟验证。
+- 安装包、SHA256 和完整说明见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，也可以到 [Releases](https://github.com/xiaopingliangs/RawWave/releases) 下载。
+
+0.12.35 重点（包含 0.12.23–0.12.35）：
+
+- 手表首页以活动为先；活动模板改为“活动前 / 活动中 / 活动后”三段独立勾选。
+- 采集结束后的 60 秒厂商释放移到应用级 keeper，所有同步都在后台运行，首页可以立即开始下一次活动。
+- ECG 改为接触驱动：检测到接触立即开始 30 秒；80 秒只作为“始终没有接触”的退出保险，不会自动开始。
+- BIA/MF-BIA 失败后 5 秒重试；重试不再重建按钮，滑动后的“跳过”仍在原位；失败审阅页的“跳过”置顶。
+- 采集时由独立 worker 增量写 ZIP；同步支持断点续传，单次文件传输硬上限 5 分钟，到点暂停并在下次打开时续传。
+- 手机导出支持“最近一次 / 最近三次 / 今天”；选中整包时直接复制已接收 ZIP，不再解包重压；最近三次会重新读取 inbox，不会漏掉新到的包。
+- 手机首页新增一键“发送报告到手机”。
+
+**已知限制：** 0.12.35 真机未跑；MF-BIA/SpO2 在部分佩戴/接触条件下仍可能被 SDK 判为质量失败（原始状态码保留）；Samsung Health 导出是官方处理后数据，不是原始 PPG/ECG 波形；厂商传感器停止没有硬件回执。
+
+---
+
+## 历史测试版（2026-11-09）
 
 - `cache-visible-20261109-r04` / `0.12.22-step` / versionCode 96
 - 这是测试版，不是稳定发布；手机真机验收待安装后完成，手表 r04 已安装。
@@ -86,7 +106,16 @@ You can use other apps, AI tools, or your own methods to explore the exported da
 
 RawWave is still in development. Available features depend on the watch hardware and system support.
 
-### Latest test build (2026-11-09)
+### Latest test build (2026-11-11)
+
+`export-refresh-20261111-r01` / `0.12.35-step` / versionCode 109. Test build, not a stable release. Device verification for 0.12.35 is `NOT_RUN`; the previous 0.12.34 r07 passed a smoke test on a Galaxy Watch. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
+
+0.12.35 (includes 0.12.23–0.12.35) makes the watch home activity-first, splits templates into pre/in/post phases, moves the 60-second vendor release into an app-level keeper so sync never blocks the home screen, starts ECG on real contact (80 s only as a no-contact exit guard), retries BIA/MF-BIA after 5 s without resetting scroll, writes the outgoing ZIP incrementally during capture, resumes interrupted transfers with a 5-minute file window, adds “latest / latest 3 / today” phone export with direct ZIP copy when the selection matches a received package, refreshes the export inbox on every selection, and adds a one-tap “send report to phone” button.
+
+**Known limitations:** 0.12.35 device verification is pending; MF-BIA/SpO2 can still fail SDK quality checks under some contact conditions (raw status codes are retained); Samsung Health export is processed store data, not raw PPG/ECG; the vendor sensor stop has no hardware acknowledgement.
+
+
+### Historical test build (2026-11-09)
 
 `cache-visible-20261109-r04` / `0.12.22-step` / versionCode 96. Test build, not a stable release. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
 

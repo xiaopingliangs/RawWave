@@ -27,6 +27,8 @@ internal class DeviceSamsungBackend(private val context: Context,
     private companion object {
         /** Bound for handing disconnectService() to the main thread; not a hardware receipt. */
         const val DISCONNECT_MAIN_THREAD_TIMEOUT_MS = 2_000L
+        /** Short wait for a queued unsubscribe; the release hold supplies the real settle time. */
+        const val UNSET_MAIN_THREAD_WAIT_MS = 500L
     }
     private var service: HealthTrackingService? = null
     private var capabilitySnapshot: Map<String, Any> = emptyMap()
@@ -77,7 +79,22 @@ internal class DeviceSamsungBackend(private val context: Context,
         val tracker = createDeviceTracker(sensor)
         return object : SamsungTracker {
             override fun listen(listener: HealthTracker.TrackerEventListener) = tracker.setEventListener(listener)
-            override fun unset() = tracker.unsetEventListener()
+            /**
+             * Samsung's tracker samples call from the main thread. A void unset that is
+             * silently dropped off-thread is indistinguishable from a successful stop, so
+             * queue the call on main and give it a short bounded window. The owner's release
+             * hold keeps the connector alive long enough for a queued call to run.
+             */
+            override fun unset() {
+                val main = Looper.getMainLooper()
+                if (Looper.myLooper() == main) { tracker.unsetEventListener(); return }
+                val done = CountDownLatch(1)
+                val posted = Handler(main).post {
+                    try { tracker.unsetEventListener() } finally { done.countDown() }
+                }
+                check(posted) { "VENDOR_UNSET_MAIN_THREAD_UNAVAILABLE" }
+                done.await(UNSET_MAIN_THREAD_WAIT_MS, TimeUnit.MILLISECONDS)
+            }
             override fun flush() = tracker.flush()
         }
     }

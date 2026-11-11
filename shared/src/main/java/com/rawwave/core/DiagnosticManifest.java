@@ -16,12 +16,21 @@ public final class DiagnosticManifest {
     public static byte[] create(Map<String, byte[]> snapshot, String role, Map<String, Object> build,
                                 int includedWatchReports, int receivedWatchReports,
                                 List<String> includedWatchFiles) {
+        return create(snapshot, role, build, includedWatchReports, receivedWatchReports,
+            includedWatchFiles, 0, List.of());
+    }
+
+    public static byte[] create(Map<String, byte[]> snapshot, String role, Map<String, Object> build,
+                                int includedWatchReports, int receivedWatchReports,
+                                List<String> includedWatchFiles, int watchObservationCount,
+                                List<String> watchCaptureIds) {
         DiagnosticEvents.Read events = DiagnosticEvents.read(snapshot, role, false);
         DiagnosticEvents.Read observations = DiagnosticEvents.read(snapshot, role, true);
         String processRunId = "";
         String latestUtc = "";
         LinkedHashSet<String> sessions = new LinkedHashSet<>();
         LinkedHashSet<String> captureIds = new LinkedHashSet<>();
+        for (String id : watchCaptureIds) if (id != null && !id.isEmpty()) captureIds.add(id);
         JsonObject capability = null;
         for (JsonObject event : events.events) {
             String run = DiagnosticEvents.text(event, "processRunId");
@@ -66,10 +75,16 @@ public final class DiagnosticManifest {
         coverage.put("includedWatchFiles", includedWatchFiles);
         coverage.put("sensorSdkLogIncluded", sdkLogs);
         coverage.put("observationCount", observations.events.size());
+        coverage.put("watchObservationCount", watchObservationCount);
+        coverage.put("problemSiteRecordCount", observations.events.size() + watchObservationCount);
+        coverage.put("watchObservationFiles", watchObservationCount > 0 ? "watch-observations/<reportId>.jsonl" : "NONE");
 
         Map<String, Object> evidence = new LinkedHashMap<>();
+        boolean anyObservation = !observations.events.isEmpty() || watchObservationCount > 0;
         evidence.put("appJournal", events.events.isEmpty() ? "EMPTY_OR_NOT_COLLECTED" : "AVAILABLE_APP_SELF_REPORT");
-        evidence.put("appObservations", observations.events.isEmpty() ? "NOT_COLLECTED" : "AVAILABLE_USER_REPORT");
+        evidence.put("appObservations", anyObservation ? "AVAILABLE_USER_REPORT" : "NOT_COLLECTED");
+        evidence.put("watchObservations", watchObservationCount > 0
+            ? "INCLUDED_EXTRACTED_FROM_WATCH_ATTACHMENT" : "NONE_OR_NOT_INCLUDED");
         evidence.put("sensorSdkLog", sdkLogs ? "AVAILABLE_APP_SIDE_LOG" : "NOT_COLLECTED");
         evidence.put("sensorProbeData", sensorProbes ? "INCLUDED_AS_DIAGNOSTIC_TEST_DATA" : "NONE");
         evidence.put("sensorCapability", capability == null ? "NOT_COLLECTED" : capability);
@@ -78,9 +93,9 @@ public final class DiagnosticManifest {
         evidence.put("otherDeviceReports", includedWatchReports == 0 ? "NOT_COLLECTED_OR_NOT_VERIFIED" : "CACHED_INCLUDED");
 
         Map<String, Object> layers = new LinkedHashMap<>();
-        layers.put("L0_USER_UI", layer(observations.events.isEmpty() ? "NOT_COLLECTED" : "USER_REPORTED",
-            observations.events.isEmpty() ? "No structured problem-site record in this report."
-                : "User observation is present; it is not a system trace."));
+        layers.put("L0_USER_UI", layer(anyObservation ? "USER_REPORTED" : "NOT_COLLECTED",
+            anyObservation ? "A problem-site record is present, including watch records extracted from the included attachment; it is not a system trace."
+                : "No structured problem-site record in this report."));
         layers.put("L1_APP_STATE", layer(events.events.isEmpty() ? "NOT_COLLECTED" : "AVAILABLE",
             "App journal only; absence of an event is not proof that nothing happened."));
         layers.put("L2_APP_RESOURCES", layer(events.events.isEmpty() ? "NOT_COLLECTED" : "APP_SELF_REPORT",
@@ -119,7 +134,7 @@ public final class DiagnosticManifest {
         List<String> nextEvidence = new ArrayList<>();
         nextEvidence.add("system dump: dumpsys sensorservice / activity services / ps / logcat");
         nextEvidence.add("watch nanohub logs: ppg_multi_25hz / ppg_multi_100hz start, stop and LED markers");
-        if (observations.events.isEmpty()) nextEvidence.add("user observation: record LED/exit/reboot state at the time of the problem");
+        if (observations.events.isEmpty() && watchObservationCount == 0) nextEvidence.add("user observation: record LED/exit/reboot state at the time of the problem");
         if (includedWatchReports == 0) nextEvidence.add("the other device's report, if this is a two-device problem");
         manifest.put("nextEvidence", nextEvidence);
         return new GsonBuilder().setPrettyPrinting().create().toJson(manifest).getBytes(StandardCharsets.UTF_8);

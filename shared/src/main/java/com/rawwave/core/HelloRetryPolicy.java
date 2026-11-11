@@ -2,7 +2,8 @@ package com.rawwave.core;
 
 /** Pure bounds for repeating HELLO inside one transfer attempt while the phone is waking. */
 public final class HelloRetryPolicy {
-    public static final long READY_BUDGET_MS = 15_000L;
+    /** A cold phone process may need longer than 15 s to bind the receiver. */
+    public static final long READY_BUDGET_MS = 30_000L;
     public static final long INTERVAL_MS = 2_000L;
 
     private HelloRetryPolicy() {}

@@ -10,8 +10,8 @@ public class ActivitySyncPolicyTest {
         assertTrue(ActivitySyncPolicy.captureMayPreempt(ActivitySyncPolicy.OPEN_IDLE_AUTO));
     }
 
-    @Test public void completedCaptureSyncExitsOnlyAfterSuccess() {
-        assertFalse(ActivitySyncPolicy.isNonBlockingHomeSync(ActivitySyncPolicy.CAPTURE_FINISHED));
+    @Test public void syncNeverOwnsTheHomeAndCompletedCaptureStillExits() {
+        assertTrue(ActivitySyncPolicy.isNonBlockingHomeSync(ActivitySyncPolicy.CAPTURE_FINISHED));
         assertTrue(ActivitySyncPolicy.exitAfterSuccessfulSync(ActivitySyncPolicy.CAPTURE_FINISHED));
         assertTrue(ActivitySyncPolicy.captureMayPreempt(ActivitySyncPolicy.CAPTURE_FINISHED));
     }

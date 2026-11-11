@@ -41,8 +41,11 @@ public final class ActivityTransferBudget {
     public static final long MIN_RATE_BYTES_PER_SECOND = 32L * 1024L;
     /** Minimum estimated send time; the initial window supplies the rest for tiny archives. */
     public static final long BASE_TRANSFER_MS = 10_000L;
-    /** Large 30-minute activities get a real chance on a slow link; the foreground lease is longer. */
-    public static final long MAX_TRANSFER_MS = 25L * 60_000L;
+    /**
+     * Hard per-attempt file-byte window. The owner resumes from the receiver's durable offset
+     * on the next attempt, so a large archive no longer needs one 25-minute window.
+     */
+    public static final long MAX_TRANSFER_MS = 5L * 60_000L;
     /** Cleanup margin after the work deadline; the lease is a last-resort, not a second attempt. */
     public static final long LEASE_MARGIN_MS = 5_000L;
     /** Last-resort foreground-service ceiling for the watch, including packaging and cleanup. */

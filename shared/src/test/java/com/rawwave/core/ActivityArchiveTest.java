@@ -38,6 +38,67 @@ public class ActivityArchiveTest {
         assertTrue(new File(phone,"activity-inbox/"+batch.id()+".zip").isFile());
         assertFalse(new File(phone,"activity-inbox/rejected").exists());
     }
+    @Test public void sealedCapturePublishesPrebuiltTransportZipAndSurvivesRawDelete() throws Exception {
+        File root=temp.newFolder(),activities=new File(root,"activities"),outgoing=new File(root,"activity-outgoing");
+        var source=session(activities,true);
+        File prebuilt=new File(outgoing,source.id+".zip");
+        assertTrue("capture must publish a prebuilt transport ZIP",prebuilt.isFile());
+        File raw=new File(new File(activities,"sessions"),source.id);
+        File hidden=new File(raw.getParentFile(),source.id+".gone");
+        assertTrue(raw.renameTo(hidden));
+        var batch=ActivityArchive.preparePending(activities,outgoing);
+        assertNotNull("preparePending must reuse the prebuilt ZIP",batch);
+        assertEquals(source.id,batch.id());
+        assertEquals(List.of(source.id),ActivityArchive.verify(batch.file()).sessionIds());
+    }
+
+    @Test public void resumeCommitUsesDurablePrefixAndKeepsPartialOnTruncation() throws Exception {
+        File root=temp.newFolder(),out=temp.newFolder(),phone=temp.newFolder();
+        session(root,true);
+        var batch=ActivityArchive.preparePending(root,out);
+        var request=new ReceiveStore.Request(ReceiveStore.Kind.RAW_ACTIVITY,batch.id(),batch.sha256(),batch.bytes());
+        byte[] all=Files.readAllBytes(batch.file().toPath());
+        int split=Math.max(1,all.length/3);
+        File folder=new File(phone,"activity-inbox");
+        Files.createDirectories(folder.toPath());
+        File part=new File(folder,batch.id()+".part");
+        Files.write(part.toPath(),Arrays.copyOf(all,split));
+        ReceiveStore port=new FileReceiveStore(phone,dir -> {});
+        assertEquals(split,port.resumeOffset(request));
+        try(InputStream bad=new ByteArrayInputStream(Arrays.copyOfRange(all,split,all.length-1))) {
+            assertThrows(EOFException.class,() -> port.commit(request,bad,() -> {},split));
+        }
+        long kept=part.length();
+        assertEquals(all.length-1L,kept);
+        assertEquals(kept,port.resumeOffset(request));
+        try(InputStream good=new ByteArrayInputStream(Arrays.copyOfRange(all,(int)kept,all.length))) {
+            port.commit(request,good,() -> {},kept);
+        }
+        assertFalse(part.exists());
+        File target=new File(folder,batch.id()+".zip");
+        assertTrue(target.isFile());
+        assertEquals(batch.sha256(),ActivityTransferFiles.hashFile(target));
+    }
+
+    @Test public void hashMismatchDeletesResumePartial() throws Exception {
+        File root=temp.newFolder(),out=temp.newFolder(),phone=temp.newFolder();
+        session(root,true);
+        var batch=ActivityArchive.preparePending(root,out);
+        var request=new ReceiveStore.Request(ReceiveStore.Kind.RAW_ACTIVITY,batch.id(),batch.sha256(),batch.bytes());
+        byte[] all=Files.readAllBytes(batch.file().toPath());
+        int split=Math.max(1,all.length/3);
+        File folder=new File(phone,"activity-inbox");
+        Files.createDirectories(folder.toPath());
+        File part=new File(folder,batch.id()+".part");
+        Files.write(part.toPath(),Arrays.copyOf(all,split));
+        byte[] bad=all.clone(); bad[bad.length-1]^=1;
+        try(InputStream input=new ByteArrayInputStream(Arrays.copyOfRange(bad,split,bad.length))) {
+            assertThrows(IOException.class,() -> new FileReceiveStore(phone,dir -> {})
+                .commit(request,input,() -> {},split));
+        }
+        assertFalse(part.exists());
+    }
+
     @Test public void receiveContractActivityPreservesAllCatalogStreamsAcrossRestart() throws Exception {
         for (boolean sealed : List.of(true, false)) {
             File root=temp.newFolder(), outgoing=temp.newFolder(), phone=temp.newFolder();

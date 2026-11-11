@@ -32,6 +32,17 @@ public interface SensorPort {
     void drain(String sensor, Drain completed);
     void stop(String sensor);
     void close();
+    /**
+     * Optional post-close step: release the vendor connector after the owner's hold.
+     * It never delivers rows and never reconnects. Ports without a vendor connector
+     * use the no-op default.
+     */
+    default void releaseConnection() {}
+    /**
+     * Optional: how long the owner should keep this process and connector alive after
+     * close() before calling releaseConnection(). Zero means release immediately.
+     */
+    default long releaseHoldMs() { return 0L; }
 
     @FunctionalInterface interface Rows { void accept(List<Map<String, Object>> rows); }
     @FunctionalInterface interface Failure { void accept(String reason); }

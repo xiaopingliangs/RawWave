@@ -1,6 +1,10 @@
 package com.rawwave.shell
 
 import android.app.Application
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
 import android.os.Process
 import com.rawwave.core.ActivitySyncAttemptGuard
 import com.rawwave.core.ActivitySyncPolicy
@@ -42,7 +46,10 @@ class ProbeApplication : Application() {
 
     /** Explicit UI/capture trigger only. No alarm, worker, receiver or retry loop calls this on watch. */
     fun startWatchActivitySync(trigger: String): Boolean {
-        if (BuildConfig.DEVICE_ROLE != "watch" || activeWatchActivitySync != null || activeSyncOwner != null) return false
+        if (BuildConfig.DEVICE_ROLE != "watch") return false
+        // A dead transfer must not block every later retry with "已有工作正在进行".
+        reconcileStaleSyncState()
+        if (activeWatchActivitySync != null || activeSyncOwner != null) return false
         pendingActivitySyncExit.set(false)
         val normalized = ActivitySyncPolicy.normalize(trigger)
         activitySyncAttemptGuard.markStarted(normalized)
@@ -57,6 +64,58 @@ class ProbeApplication : Application() {
             "activityRunning" to activitySyncStatus.running,
             "activeOwner" to activeSyncOwner.orEmpty())) } catch (_: Exception) {}
         stopBackgroundSync?.invoke(source)
+    }
+
+    /**
+     * Clear a sync owner/status that no longer has a live session or bounded lease.
+     * A process can survive a missed callback; the home must never stay blocked by a
+     * transfer that is already gone. Called on every home start and before capture.
+     */
+    fun reconcileStaleSyncState() {
+        val session = activeWatchActivitySync
+        val leaseActive = try { SyncGuardService.hasActiveLease() } catch (_: Exception) { false }
+        if (activeSyncOwner != null && session == null && !leaseActive) {
+            try { journal?.event("ACTIVITY_SYNC_STALE_OWNER_CLEARED",
+                mapOf("owner" to activeSyncOwner.orEmpty(),
+                    "running" to activitySyncStatus.running,
+                    "trigger" to activitySyncStatus.trigger)) } catch (_: Exception) {}
+            activeSyncOwner = null
+            stopBackgroundSync = null
+        }
+        if (activitySyncStatus.running && session == null && !leaseActive) {
+            try { journal?.event("ACTIVITY_SYNC_STALE_STATUS_CLEARED",
+                mapOf("trigger" to activitySyncStatus.trigger,
+                    "text" to activitySyncStatus.text.take(200))) } catch (_: Exception) {}
+            activitySyncStatus = ActivitySyncStatus(false, false,
+                "上次同步已结束；数据仍保留，可重新同步。", activitySyncStatus.trigger)
+        }
+    }
+
+    private val releaseHandler = Handler(Looper.getMainLooper())
+    private var releaseWakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * Keep the vendor connector alive for [holdMs] after capture stops the sensor, then
+     * release it. This runs outside the capture service so the home is immediately usable
+     * and a new activity can start; the 60-second LED hold no longer blocks the UI.
+     */
+    fun scheduleSensorRelease(holdMs: Long, wakeLock: PowerManager.WakeLock?, release: () -> Unit) {
+        if (holdMs <= 0L) {
+            try { release() } catch (_: Exception) {}
+            try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+            return
+        }
+        val held = wakeLock ?: try {
+            getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RawWave:SensorRelease")
+                .apply { setReferenceCounted(false); acquire(holdMs + 15_000L) }
+        } catch (_: Exception) { null }
+        releaseWakeLock = held
+        releaseHandler.postDelayed({
+            try { release() } catch (_: Exception) {}
+            try { if (held != null && held.isHeld) held.release() } catch (_: Exception) {}
+            if (releaseWakeLock === held) releaseWakeLock = null
+        }, holdMs)
     }
 
     override fun onCreate() {

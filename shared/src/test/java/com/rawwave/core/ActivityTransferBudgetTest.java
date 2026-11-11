@@ -23,7 +23,8 @@ public class ActivityTransferBudgetTest {
     @Test public void observedLargeArchiveGetsOneSizeAwareExtension() {
         long bytes = 16_860_445L;
         long transfer = ActivityTransferBudget.transferMs(bytes);
-        assertEquals(514_540L, transfer);
+        // A hard 5-minute window; the next attempt resumes from the durable offset.
+        assertEquals(ActivityTransferBudget.MAX_TRANSFER_MS, transfer);
         assertTrue(transfer > WorkBudget.TRANSFER_MS);
         assertEquals(transfer + ActivityTransferBudget.commitMs(bytes), ActivityTransferBudget.sendMs(bytes));
         assertTrue(ActivityTransferBudget.receiveMs(bytes) > ActivityTransferBudget.sendMs(bytes));
@@ -47,6 +48,15 @@ public class ActivityTransferBudgetTest {
         // The whole largest-archive window must still fit inside the watch foreground lease.
         assertTrue(ActivityTransferBudget.requiredMs(ActivityTransferFiles.MAX_BYTES)
             < ActivityTransferBudget.WATCH_LEASE_MS);
+    }
+
+    @Test public void hardTransferWindowIsFiveMinutes() {
+        assertEquals(5L * 60_000L, ActivityTransferBudget.MAX_TRANSFER_MS);
+        assertEquals(ActivityTransferBudget.MAX_TRANSFER_MS,
+            ActivityTransferBudget.transferMs(ActivityTransferFiles.MAX_BYTES));
+        // Commit is a local verification phase and keeps its separate allowance.
+        assertTrue(ActivityTransferBudget.sendMs(ActivityTransferFiles.MAX_BYTES)
+            > ActivityTransferBudget.MAX_TRANSFER_MS);
     }
 
     @Test public void extensionNeverShortensAnExistingLaterDeadline() {

@@ -16,13 +16,29 @@ public final class ActivityStore {
         this.root = root; this.directorySync = directorySync;
         Files.createDirectories(root.toPath());
     }
-    public record Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia, boolean ppg, boolean biaBoth) {
+    /**
+     * Pre/activity/post choices are independent. The legacy {@code ecg}/{@code spo2}/{@code ppg}
+     * accessors remain "selected in any phase" so old plans, permissions and summaries keep
+     * working; new writes always include the per-phase flags.
+     */
+    public record Template(String id, String name,
+                           boolean preEcg, boolean postEcg,
+                           List<String> coreSources,
+                           boolean preSpo2, boolean postSpo2,
+                           BiaProfile biaProfile, boolean mfBia, boolean biaBoth,
+                           boolean prePpg, boolean postPpg) {
         public Template {
             Objects.requireNonNull(id); Objects.requireNonNull(name);
             coreSources = SensorCatalog.normalizeCoreSources(coreSources);
         }
+        /** Source-compatible constructor for templates written before phases were split. */
+        public Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2,
+                        BiaProfile biaProfile, boolean mfBia, boolean ppg, boolean biaBoth) {
+            this(id, name, ecg, ecg, coreSources, spo2, spo2, biaProfile, mfBia, biaBoth, ppg, ppg);
+        }
         /** Source-compatible constructor for templates written before the two-BIA-mode option existed. */
-        public Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2, BiaProfile biaProfile, boolean mfBia, boolean ppg) {
+        public Template(String id, String name, boolean ecg, List<String> coreSources, boolean spo2,
+                        BiaProfile biaProfile, boolean mfBia, boolean ppg) {
             this(id, name, ecg, coreSources, spo2, biaProfile, mfBia, ppg, false);
         }
         /** Source-compatible constructor for templates written before the PPG short measurement existed. */
@@ -33,6 +49,12 @@ public final class ActivityStore {
             this(id,name,ecg,sources,spo2,profile,false);
         }
         public boolean bia() { return biaProfile != null; }
+        /** Legacy aggregate: true when ECG is selected before or after the activity. */
+        public boolean ecg() { return preEcg || postEcg; }
+        /** Legacy aggregate: true when SpO2 is selected before or after the activity. */
+        public boolean spo2() { return preSpo2 || postSpo2; }
+        /** Legacy aggregate: true when the 100 Hz PPG short measurement is selected in any phase. */
+        public boolean ppg() { return prePpg || postPpg; }
         public Template(String id, String name, boolean ecg, List<String> sources, boolean spo2) {
             this(id,name,ecg,sources,spo2,null);
         }
@@ -63,14 +85,21 @@ public final class ActivityStore {
         return createTemplate(name,ecg,coreSources,spo2,profile,mfBia,ppg,false);
     }
     public Template createTemplate(String name, boolean ecg, Collection<String> coreSources, boolean spo2, BiaProfile profile, boolean mfBia, boolean ppg, boolean biaBoth) throws IOException {
+        return createTemplate(name, ecg, ecg, coreSources, spo2, spo2, profile, mfBia, biaBoth, ppg, ppg);
+    }
+    /** Explicit pre/activity/post choices; the editor always uses this overload. */
+    public Template createTemplate(String name, boolean preEcg, boolean postEcg, Collection<String> coreSources,
+            boolean preSpo2, boolean postSpo2, BiaProfile profile, boolean mfBia, boolean biaBoth,
+            boolean prePpg, boolean postPpg) throws IOException {
         name = name.trim();
         if (name.isEmpty() || name.length() > 40) throw new IOException("活动名称需要1至40个字");
         final List<String> normalized;
         try { normalized = SensorCatalog.normalizeCoreSources(coreSources); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage(),e); }
-        Template t = new Template(UUID.randomUUID().toString(), name, ecg, normalized, spo2, profile, mfBia, ppg, biaBoth);
+        Template t = new Template(UUID.randomUUID().toString(), name, preEcg, postEcg, normalized,
+            preSpo2, postSpo2, profile, mfBia, biaBoth, prePpg, postPpg);
         File folder = new File(root,"templates"); Files.createDirectories(folder.toPath());
-        write(new File(folder,t.id()+".json"),t); return t;
+        write(new File(folder,t.id()+".json"),templateJson(t)); return t;
     }
     /** Replace only this template; existing session plans remain immutable snapshots. */
     public synchronized Template updateTemplate(String id, String name, boolean ecg,
@@ -88,24 +117,45 @@ public final class ActivityStore {
         return updateTemplate(id,name,ecg,sources,spo2,profile,mfBia,ppg,false);
     }
     public synchronized Template updateTemplate(String id,String name,boolean ecg,Collection<String> sources,boolean spo2,BiaProfile profile,boolean mfBia,boolean ppg,boolean biaBoth) throws IOException {
+        return updateTemplate(id, name, ecg, ecg, sources, spo2, spo2, profile, mfBia, biaBoth, ppg, ppg);
+    }
+    /** Explicit pre/activity/post choices; the editor always uses this overload. */
+    public synchronized Template updateTemplate(String id, String name, boolean preEcg, boolean postEcg,
+            Collection<String> sources, boolean preSpo2, boolean postSpo2, BiaProfile profile,
+            boolean mfBia, boolean biaBoth, boolean prePpg, boolean postPpg) throws IOException {
         if (id == null || !id.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"))
             throw new IOException("INVALID_TEMPLATE_ID");
         name = name.trim();
         if (name.isEmpty() || name.length() > 40) throw new IOException("活动名称需要1至40个字");
         final Template updated;
-        try { updated = new Template(id, name, ecg, SensorCatalog.normalizeCoreSources(sources), spo2, profile, mfBia, ppg, biaBoth); }
+        try { updated = new Template(id, name, preEcg, postEcg, SensorCatalog.normalizeCoreSources(sources),
+            preSpo2, postSpo2, profile, mfBia, biaBoth, prePpg, postPpg); }
         catch (IllegalArgumentException e) { throw new IOException(e.getMessage(), e); }
         File folder = new File(root,"templates"), target = new File(folder,id+".json");
         if (!target.isFile()) throw new IOException("活动已不存在，请返回重新选择");
         File temporary = File.createTempFile("edit-", ".part", folder);
         try {
             try (FileOutputStream out = new FileOutputStream(temporary)) {
-                out.write(JSON.toJson(updated).getBytes(StandardCharsets.UTF_8)); out.getFD().sync();
+                out.write(JSON.toJson(templateJson(updated)).getBytes(StandardCharsets.UTF_8)); out.getFD().sync();
             }
             Files.move(temporary.toPath(),target.toPath(),StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
             directorySync.sync(folder);
         } finally { Files.deleteIfExists(temporary.toPath()); }
         return updated;
+    }
+    /**
+     * Template JSON keeps the legacy aggregate keys for older readers and adds the exact
+     * per-phase flags used by the capture service.
+     */
+    static Map<String,Object> templateJson(Template t) {
+        Map<String,Object> value = new LinkedHashMap<>();
+        value.put("id", t.id()); value.put("name", t.name());
+        value.put("preEcg", t.preEcg()); value.put("postEcg", t.postEcg()); value.put("ecg", t.ecg());
+        value.put("coreSources", t.coreSources());
+        value.put("preSpo2", t.preSpo2()); value.put("postSpo2", t.postSpo2()); value.put("spo2", t.spo2());
+        value.put("biaProfile", t.biaProfile()); value.put("mfBia", t.mfBia()); value.put("biaBoth", t.biaBoth());
+        value.put("prePpg", t.prePpg()); value.put("postPpg", t.postPpg()); value.put("ppg", t.ppg());
+        return value;
     }
     public List<Template> templates() throws IOException {
         File[] files = new File(root,"templates").listFiles((d,n)->n.endsWith(".json"));
@@ -117,12 +167,21 @@ public final class ActivityStore {
                 coreSources = new ArrayList<>();
                 for (JsonElement value : object.getAsJsonArray("coreSources")) coreSources.add(value.getAsString());
             }
+            boolean legacyEcg = flag(object, "ecg", false);
+            boolean legacySpo2 = flag(object, "spo2", false);
+            boolean legacyPpg = flag(object, "ppg", false);
             result.add(new Template(object.get("id").getAsString(), object.get("name").getAsString(),
-                object.get("ecg").getAsBoolean(), coreSources, object.has("spo2") && object.get("spo2").getAsBoolean(),
-                object.has("biaProfile") ? JSON.fromJson(object.get("biaProfile"), BiaProfile.class) : null, object.has("mfBia") && object.get("mfBia").getAsBoolean(),
-                object.has("ppg") && object.get("ppg").getAsBoolean(), object.has("biaBoth") && object.get("biaBoth").getAsBoolean()));
+                flag(object, "preEcg", legacyEcg), flag(object, "postEcg", legacyEcg), coreSources,
+                flag(object, "preSpo2", legacySpo2), flag(object, "postSpo2", legacySpo2),
+                object.has("biaProfile") && !object.get("biaProfile").isJsonNull()
+                    ? JSON.fromJson(object.get("biaProfile"), BiaProfile.class) : null,
+                flag(object, "mfBia", false), flag(object, "biaBoth", false),
+                flag(object, "prePpg", legacyPpg), flag(object, "postPpg", legacyPpg)));
         }
         result.sort(Comparator.comparing(Template::name)); return result;
+    }
+    private static boolean flag(JsonObject object, String key, boolean fallback) {
+        return object.has(key) && !object.get(key).isJsonNull() ? object.get(key).getAsBoolean() : fallback;
     }
     public Session start(Template template, long utcMs, long elapsedMs) throws IOException {
         return new Session(template,utcMs,elapsedMs);
@@ -186,6 +245,8 @@ public final class ActivityStore {
         public final File folder;
         private final Map<String,Object> files = new TreeMap<>();
         private final Map<String,Long> rows = new TreeMap<>();
+        private ActivityTransportWriter transport;
+        private File transportOutgoing;
         private final String activityName;
         private final String activityTemplateId;
         private int sequence;
@@ -194,7 +255,7 @@ public final class ActivityStore {
             activityName = t.name(); activityTemplateId = t.id();
             folder = new File(new File(root,"sessions"),id); Files.createDirectories(folder.toPath());
             Map<String,Object> plan=new LinkedHashMap<>();
-            plan.put("schema",5); plan.put("sessionId",id); plan.put("template",t);
+            plan.put("schema",5); plan.put("sessionId",id); plan.put("template",templateJson(t));
             plan.put("createdUtcMs",utc); plan.put("createdElapsedMs",elapsed);
             plan.put("coreSources",t.coreSources());
             plan.put("source","Samsung Health Sensor SDK 1.4.1; GYROSCOPE, GYROSCOPE_UNCALIBRATED, PLATFORM_ACCELEROMETER, PRESSURE, MAGNETIC_FIELD, MAGNETIC_FIELD_UNCALIBRATED, LIGHT, STEP_COUNT, STEP_DETECTOR and OFFBODY use Android SensorManager; GPS uses Android LocationManager with a GnssStatus snapshot and is platform location, not raw GNSS measurements");
@@ -233,6 +294,12 @@ public final class ActivityStore {
             plan.put("durability","Periodic immutable blocks; uncommitted memory and .part tail may be lost on power failure");
             write(new File(folder,"plan.json"),plan);
             directorySync.sync(folder.getParentFile());
+            // Build the transport ZIP while blocks are written. This is a derived copy; if it
+            // fails, the raw session remains and preparePending rebuilds it later.
+            try {
+                transport = new ActivityTransportWriter(root, id, new File(folder,"plan.json"));
+                transportOutgoing = transport.outgoing();
+            } catch (IOException ignored) { transport = null; }
         }
         public synchronized void append(String phase,String sensor,List<? extends Map<String,?>> samples) throws IOException {
             if(sealed) throw new IOException("SESSION_SEALED");
@@ -249,6 +316,8 @@ public final class ActivityStore {
             byte[] bytes=Files.readAllBytes(file.toPath());
             files.put(name,Map.of("bytes",bytes.length,"sha256",DiagnosticArchive.hash(bytes),"rows",samples.size()));
             rows.merge(phase+"/"+sensor,(long)samples.size(),Long::sum);
+            ActivityTransportWriter writer=transport;
+            if(writer!=null) writer.add(name,file);
         }
         public synchronized Map<String,Long> counts(){return Map.copyOf(rows);}
         public synchronized void seal(String reason,long utcMs) throws IOException {
@@ -264,6 +333,18 @@ public final class ActivityStore {
             write(new File(folder,"seal.json"),Map.of("schema",1,"sessionId",id,"reason",reason,"endedUtcMs",utcMs,
                 "fileIntegrity","SEALED_VERIFIED","coverage","See per-source events; file integrity is not sensor success", "counts",rows,"files",manifest));
             sealed=true;
+            ActivityTransportWriter writer=transport;
+            if(writer!=null) {
+                writer.finish(new File(folder,"seal.json"));
+                try { if(transportOutgoing!=null) directorySync.sync(transportOutgoing); } catch (IOException ignored) {}
+                writer.close();
+                transport=null;
+            }
+        }
+        /** Abandon an unfinished derived transport ZIP; raw blocks stay authoritative. */
+        public synchronized void close() {
+            ActivityTransportWriter writer=transport; transport=null;
+            if(writer!=null) writer.close();
         }
     }
 }

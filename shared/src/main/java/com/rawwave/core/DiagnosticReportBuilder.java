@@ -47,6 +47,24 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         result.sort(Comparator.comparingLong(File::lastModified).reversed().thenComparing(File::getName));
         return result;
     }
+    /** Reads one entry by suffix from a received attachment ZIP; null when absent or oversized. */
+    private static byte[] zipEntry(byte[] zip, String suffix) {
+        try (java.util.zip.ZipInputStream input = new java.util.zip.ZipInputStream(new ByteArrayInputStream(zip))) {
+            java.util.zip.ZipEntry entry;
+            while ((entry = input.getNextEntry()) != null) {
+                if (entry.isDirectory() || !entry.getName().endsWith(suffix)) continue;
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    out.write(buffer, 0, read);
+                    if (out.size() > 4 * 1024 * 1024) return null;
+                }
+                return out.toByteArray();
+            }
+        } catch (Exception ignored) { }
+        return null;
+    }
     @Override public Report build(long operation) throws IOException {
         ReportExporter.checkCancelled();
         state("正在收集本机日志…");
@@ -73,6 +91,8 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         state("正在校验最近的手表报告…");
         List<File> received = zipFiles(receivedFolder, false);
         List<String> included = new ArrayList<>(), rejected = new ArrayList<>();
+        List<String> watchCaptureIds = new ArrayList<>();
+        int watchObservationCount = 0;
         for (File file : received.subList(0, Math.min(3, received.size()))) {
             ReportExporter.checkCancelled();
             String id = file.getName().substring(0, file.getName().length() - 4);
@@ -88,8 +108,28 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
                 payload.put("received-watch/" + file.getName(), content);
                 payload.put("received-watch/" + receipt.getName(), proofBytes);
                 included.add(file.getName());
+                // Surface the other device's problem-site records at the top level. They were
+                // always in the attachment, but the phone index counted only its own records.
+                byte[] observations = zipEntry(content, "diagnostic-observations.jsonl");
+                if (observations != null) {
+                    payload.put("watch-observations/" + id + ".jsonl", observations);
+                    for (String line : new String(observations, StandardCharsets.UTF_8).split("\n")) {
+                        if (line.trim().isEmpty()) continue;
+                        watchObservationCount++;
+                        try {
+                            JsonObject row = JsonParser.parseString(line).getAsJsonObject();
+                            JsonObject details = row.has("details") && row.get("details").isJsonObject()
+                                ? row.getAsJsonObject("details") : new JsonObject();
+                            if (details.has("diagnosticCaptureId"))
+                                watchCaptureIds.add(details.get("diagnosticCaptureId").getAsString());
+                        } catch (RuntimeException ignored) { }
+                    }
+                }
             } catch (Exception failure) { rejected.add(file.getName() + ": " + failure.getClass().getSimpleName() + ": " + failure.getMessage()); }
         }
+        json(payload, "watch-observations/index.json", Map.of(
+            "kind", "WATCH_PROBLEM_SITE_RECORDS_EXTRACTED_FROM_INCLUDED_REPORTS",
+            "sourceReports", included, "observationCount", watchObservationCount));
         Map<String, Object> collection = new LinkedHashMap<>();
         collection.put("localLogs", "AVAILABLE");
         collection.put("otherDevice", included.isEmpty() ? "NOT_COLLECTED_OR_NOT_VERIFIED" : "CACHED_RECEIVED_LAST_3_NOT_CURRENT_WINDOW_PROOF");
@@ -97,6 +137,7 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         collection.put("included", included);
         collection.put("rejected", rejected);
         collection.put("omittedOlderCount", Math.max(0, received.size() - 3));
+        collection.put("watchObservationCount", watchObservationCount);
         collection.put("systemPowerEvidence", "NOT_COLLECTED");
         boolean sensorProbes = payload.keySet().stream().anyMatch(name -> name.contains("/sensor-probes/"));
         collection.put("healthData", sensorProbes
@@ -109,7 +150,7 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         json(payload, "collection-status.json", collection);
         try {
             payload.put("postconditions.json", DiagnosticPostconditions.create(payload, role));
-            payload.put("diagnostic-manifest.json", DiagnosticManifest.create(payload, role, build, included.size(), received.size(), included));
+            payload.put("diagnostic-manifest.json", DiagnosticManifest.create(payload, role, build, included.size(), received.size(), included, watchObservationCount, watchCaptureIds));
         } catch (Exception failure) {
             payload.put("postconditions.json", ("{\"schemaVersion\":1,\"kind\":\"APP_LEVEL_POSTCONDITIONS\",\"error\":\""
                 + failure.getClass().getSimpleName() + "\",\"status\":\"UNKNOWN\"}").getBytes(StandardCharsets.UTF_8));
@@ -124,8 +165,7 @@ public final class DiagnosticReportBuilder implements ReportBuilder {
         json(payload, "file-audit.json", Map.of("healthSessions", "NOT_VERIFIED_BY_THIS_REPORT", "reportValidation", "ZIP_REOPEN_AND_TARGET_SHA256"));
         payload.put("resources.jsonl", (new Gson().toJson(Map.of("owner", operation, "resource", "diagnostic_export_worker",
             "state", "ACTIVE_AT_SNAPSHOT", "systemVerification", "NOT_COLLECTED")) + "\n").getBytes(StandardCharsets.UTF_8));
-        state("正在写入报告 ZIP…");
-        Files.createDirectories(reportFolder.toPath());
+        state("正在写入报告 ZIP…");        Files.createDirectories(reportFolder.toPath());
         List<File> cached = zipFiles(reportFolder, true);
         for (File old : cached.subList(Math.min(2, cached.size()), cached.size())) Files.delete(old.toPath());
         ReportExporter.checkCancelled();

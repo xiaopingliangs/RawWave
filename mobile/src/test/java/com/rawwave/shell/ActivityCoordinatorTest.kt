@@ -180,6 +180,42 @@ class ActivityCoordinatorTest {
             if(dropReady)assertTrue(wire.readyCount.get()>=2)
         } finally {watch.cancel();phone.cancel();wire.dispose()}
     }
+    @Test fun activityResumeUsesDurablePartialInsteadOfRestartingFromZero() {
+        val watchRoot=temp.newFolder();val phoneRoot=temp.newFolder()
+        val store=ActivityStore(File(watchRoot,"activities")){}
+        val session=store.start(store.createTemplate("续传",false),1000,1)
+        session.append("CORE-1","HEART_RATE",(0 until 400).map { index ->
+            mapOf("HEART_RATE" to 70+index%10,"sdkTimestamp" to index.toLong())
+        })
+        session.seal("DONE",2000)
+        val sender=FileSendStore(watchRoot,ReceiveStore.Kind.RAW_ACTIVITY){}
+        val payload=sender.prepare(null)!!
+        val original=payload.file().readBytes()
+        val split=original.size/2
+        val part=File(phoneRoot,"activity-inbox/${payload.id()}.part")
+        part.parentFile?.mkdirs()
+        part.writeBytes(original.copyOfRange(0,split))
+        val wire=Wire(false);val receiverReady=CountDownLatch(1)
+        val watchDone=CompletableFuture<Pair<Boolean,String>>()
+        val phoneDone=CompletableFuture<Pair<Boolean,String>>()
+        val app=ProbeApplication();val clock={System.nanoTime()/1_000_000}
+        val phone=ActivityTransferWindow(app,app,{if(it.contains("手机已准备接收"))receiverReady.countDown()},
+            {ok,text->phoneDone.complete(ok to text)},receiveStore=FileReceiveStore(phoneRoot){},
+            transportPort=wire.phone,sendStore=FileSendStore(phoneRoot,ReceiveStore.Kind.RAW_ACTIVITY){},
+            watchRole=false,monotonicMs=clock,environment={emptyMap()})
+        val watch=ActivityTransferWindow(app,app,{}, {ok,text->watchDone.complete(ok to text)},
+            receiveStore=FileReceiveStore(watchRoot){},transportPort=wire.watch,sendStore=sender,
+            watchRole=true,monotonicMs=clock,environment={emptyMap()})
+        try {
+            phone.start();assertTrue(receiverReady.await(5,TimeUnit.SECONDS));watch.start()
+            val w=watchDone.get(10,TimeUnit.SECONDS);val p=phoneDone.get(10,TimeUnit.SECONDS)
+            assertTrue(w.second,w.first);assertTrue(p.second,p.first)
+            assertFalse(part.exists())
+            val target=File(phoneRoot,"activity-inbox/${payload.id()}.zip")
+            assertArrayEquals(original,target.readBytes())
+        } finally {watch.cancel();phone.cancel();wire.dispose()}
+    }
+
     @Test fun activityLargeSlowTransferUsesSizeAwareBudget() {
         val watchRoot=temp.newFolder();val phoneRoot=temp.newFolder()
         val store=ActivityStore(File(watchRoot,"activities")){}

@@ -21,19 +21,30 @@ class SamsungSensorAdapter internal constructor(
     private val dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null,
     private val releaseGraceMs: Long = 0L,
     private val postRetryGraceMs: Long = 0L,
+    private val releaseHoldWindowMs: Long = 0L,
     private val pause: (Long) -> Unit = { Thread.sleep(it) }
 ) : SensorPort {
     constructor(context: Context, dispatch: (() -> Unit) -> Unit, biaProfile: com.rawwave.core.BiaProfile? = null,
                 dispatchRows: ((List<Map<String, Any?>>, () -> Unit) -> Unit)? = null) :
         this(DeviceSamsungBackend(context, biaProfile), dispatch, SensorReleaseDiagnostics(context)::record,
             dispatchRows = dispatchRows, releaseGraceMs = PRODUCTION_RELEASE_GRACE_MS,
-            postRetryGraceMs = PRODUCTION_POST_RETRY_GRACE_MS)
+            postRetryGraceMs = PRODUCTION_POST_RETRY_GRACE_MS,
+            releaseHoldWindowMs = PRODUCTION_RELEASE_HOLD_MS)
     private companion object {
         /** A short pause between the last unset and connector teardown; not a hardware receipt. */
         const val PRODUCTION_RELEASE_GRACE_MS = 300L
         /** Extra time after the final unset retry, before the vendor connector is unbound. */
-        const val PRODUCTION_POST_RETRY_GRACE_MS = 300L
+        const val PRODUCTION_POST_RETRY_GRACE_MS = 800L
+        /**
+         * Keep the vendor connector alive after the final unset so the sensor service can
+         * apply the stop before the binder is torn down. The 2026-11-05 short test had a
+         * 24 s gap and the LED went off; the 2026-11-10 session had about 2 s and it stayed on.
+         */
+        const val PRODUCTION_RELEASE_HOLD_MS = 60_000L
     }
+    private var backendReleased = false
+    private var hadTrackers = false
+    private var retainedTypesForRelease: List<String> = emptyList()
     private val ownerId = java.util.UUID.randomUUID().toString()
     private var attemptSequence = 0L
     override fun contractVersion() = SensorPort.CONTRACT_VERSION
@@ -313,6 +324,7 @@ class SamsungSensorAdapter internal constructor(
     override fun close() {
         if (closed) return
         closed = true
+        hadTrackers = trackers.isNotEmpty()
         var failure: Exception? = null
         deliveries.keys.toList().forEach { try { stop(it) } catch (e: Exception) { failure = e } }
         trackers.forEach { (sensor, tracker) ->
@@ -353,7 +365,25 @@ class SamsungSensorAdapter internal constructor(
         cleanupEvidence("REFS_CLEARED_BEFORE_DISCONNECT", "ALL",
             "trackers=$retainedTypes; deliveries=$retainedDeliveries")
         trackers.clear(); deliveries.clear()
-        cleanupEvidence("DISCONNECT_REQUEST", "ALL", "retainedTypes=$retainedTypes")
+        retainedTypesForRelease = retainedTypes
+        if (hadTrackers && releaseHoldWindowMs > 0L) {
+            // The owner keeps this process and connector alive for releaseHoldWindowMs so the
+            // vendor sensor service can apply the final unset before the binder is unbound.
+            cleanupEvidence("RELEASE_HOLD_STARTED", "ALL",
+                "holdMs=$releaseHoldWindowMs; retainedTypes=$retainedTypes")
+        } else {
+            try { releaseConnection() } catch (e: Exception) { failure = e }
+        }
+        failure?.let { throw it }
+    }
+
+    override fun releaseHoldMs(): Long = if (hadTrackers) releaseHoldWindowMs else 0L
+
+    override fun releaseConnection() {
+        if (backendReleased) return
+        backendReleased = true
+        var failure: Exception? = null
+        cleanupEvidence("DISCONNECT_REQUEST", "ALL", "retainedTypes=$retainedTypesForRelease")
         try { backend.disconnect(); cleanupEvidence("DISCONNECT_RETURNED", "ALL") }
         catch (e: Exception) { cleanupEvidence("DISCONNECT_FAILED", "ALL", e.toString()); failure = e }
         cleanupEvidence("DISCONNECT_RECHECK", "ALL",

@@ -33,7 +33,13 @@ public final class ActivityArchive {
                     Verified verified = verify(file);
                     if (verified.sessionIds().stream().anyMatch(id -> !isAcknowledged(activitiesRoot, id)))
                         return batch(file, verified);
-                } catch (IOException ignored) { /* A bad generated copy is never sent; source sessions remain. */ }
+                    // Every session in this derived copy is already acknowledged; remove it.
+                    Files.deleteIfExists(file.toPath());
+                } catch (IOException ignored) {
+                    // A bad/unacknowledged generated copy is never sent; rebuild from raw.
+                    // Delete it so it cannot be re-verified on every sync attempt.
+                    try { Files.deleteIfExists(file.toPath()); } catch (IOException ignoredDelete) {}
+                }
             }
         }
 

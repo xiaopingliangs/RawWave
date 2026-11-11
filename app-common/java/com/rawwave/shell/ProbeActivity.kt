@@ -42,6 +42,17 @@ class ProbeActivity : ComponentActivity() {
     private var transfer: TransferWindow? = null
     private var guard: SyncGuardService.Lease? = null
     private var background = false
+    private var activitySyncSucceeded = false
+    private var sawRunningActivitySync = false
+    private var lastSyncTerminalFailed = false
+    private val phonePostSyncExitMs = 30_000L
+    private val postSyncExit = Runnable {
+        if (!exiting && !working && transfer == null && !app.activitySyncStatus.running && !background) {
+            val reason = if (lastSyncTerminalFailed) "PHONE_SYNC_FAILED_AUTO_EXIT" else "PHONE_SYNC_SUCCESS_AUTO_EXIT"
+            record(reason, mapOf("delayMs" to phonePostSyncExitMs))
+            exitNow(reason, force = true)
+        }
+    }
     private val ownerToken = java.util.UUID.randomUUID().toString()
     private val diagnosticPreempt: () -> Unit = { preemptDiagnosticForActivity() }
     private val syncObserver: (String) -> Unit = { reason ->
@@ -63,7 +74,25 @@ class ProbeActivity : ComponentActivity() {
             if (sync.running) holdIdleForActivitySync() else releaseIdleForActivitySync()
         }
         if (!exiting) keepPhoneHomeVisible()
-        if (!exiting && !sync.running && sync.success) refreshReceivedSummary()
+        if (sync.running) sawRunningActivitySync = true
+        if (!exiting && !sync.running && sawRunningActivitySync) {
+            refreshReceivedSummary()
+            // The phone home used to stay forever (0.12.22). Any terminal activity sync —
+            // success or failure — now closes it after a bounded pause, unless the user is
+            // touching it or another RawWave screen/export owns the page. A failed sync no
+            // longer leaves the page open forever.
+            sawRunningActivitySync = false
+            lastSyncTerminalFailed = !sync.success
+            activitySyncSucceeded = true
+            main.removeCallbacks(postSyncExit)
+            if (BuildConfig.DEVICE_ROLE == "phone" && !background && !working && transfer == null) {
+                main.postDelayed(postSyncExit, phonePostSyncExitMs)
+                record(if (sync.success) "PHONE_SYNC_SUCCESS_AUTO_EXIT_ARMED" else "PHONE_SYNC_FAILED_AUTO_EXIT_ARMED",
+                    mapOf("delayMs" to phonePostSyncExitMs))
+            }
+        } else if (!sync.running) {
+            if (!activitySyncSucceeded) main.removeCallbacks(postSyncExit)
+        }
     }
     private val activityIdleHold: () -> Boolean = { holdIdleForActivitySync() }
     private val activityIdleRelease: () -> Boolean = { releaseIdleForActivitySync() }
@@ -689,16 +718,28 @@ class ProbeActivity : ComponentActivity() {
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (exiting || !runtime.check("TOUCH")) return true
-        if (event.action == MotionEvent.ACTION_DOWN) scheduleIdle()
+        if (event.action == MotionEvent.ACTION_DOWN) {
+            scheduleIdle()
+            cancelPostSyncExit("TOUCH")
+        }
         return super.dispatchTouchEvent(event)
     }
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (exiting || !runtime.check("KEY")) return true
         scheduleIdle()
+        cancelPostSyncExit("KEY")
         return super.onKeyDown(keyCode, event)
     }
     private fun scheduleIdle() {
         if (!working && !exiting) runtime.touchIdle()
+    }
+    /** A touch or leaving the page cancels the one-shot post-sync auto-exit. */
+    private fun cancelPostSyncExit(origin: String) {
+        main.removeCallbacks(postSyncExit)
+        if (activitySyncSucceeded) {
+            activitySyncSucceeded = false
+            record("PHONE_SYNC_SUCCESS_AUTO_EXIT_CANCELLED", mapOf("origin" to origin))
+        }
     }
     /** Phone home stays alive until the explicit exit button; no idle timeout kills it. */
     private fun keepPhoneHomeVisible() {
@@ -869,6 +910,7 @@ class ProbeActivity : ComponentActivity() {
         exiting = true; ++operation
         app.lastStopReason = reason
         runtime.close()
+        main.removeCallbacks(postSyncExit)
         if (app.syncFinished === syncObserver) app.syncFinished = null
         if (app.activitySyncObserver === activitySyncObserver) app.activitySyncObserver = null
         if (app.activityIdleHold === activityIdleHold) app.activityIdleHold = null
@@ -913,6 +955,7 @@ class ProbeActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         background = true
+        cancelPostSyncExit("BACKGROUND")
         if (!exiting && !working && transfer == null) parkIdle()
         if (!exiting && runtime.check("BACKGROUND")) record("ACTIVITY_BACKGROUND",
             runtime.evidence() + mapOf("working" to working,"deadlineRenewed" to false))

@@ -60,6 +60,8 @@ class SyncGuardService : Service() {
             leases.remove(lease.id)
             lease.service?.release(lease, "OWNER_CLOSED", notify = false)
         }
+        /** A live bounded sync still owns the process; a stale UI flag may be cleared. */
+        fun hasActiveLease(): Boolean = leases.isNotEmpty()
         private fun budgetText(ms: Long): String {
             val seconds=(ms.coerceAtLeast(1L)+999L)/1000L
             return if(seconds>=120L) "约 ${(seconds+59L)/60L} 分钟" else "$seconds 秒"

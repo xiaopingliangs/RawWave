@@ -38,7 +38,7 @@ import kotlinx.coroutines.withContext
  */
 class ActivityExportActivity : ComponentActivity() {
 
-    private enum class Mode { LATEST, TODAY, RANGE }
+    private enum class Mode { LATEST, RECENT3, TODAY, RANGE }
 
     private val app get() = application as ProbeApplication
     private val zone: ZoneId get() = ZoneId.systemDefault()
@@ -47,6 +47,7 @@ class ActivityExportActivity : ComponentActivity() {
     private lateinit var statusView: TextView
     private lateinit var exportButton: TextView
     private lateinit var latestButton: TextView
+    private lateinit var recent3Button: TextView
     private lateinit var todayButton: TextView
     private lateinit var startButton: TextView
     private lateinit var endButton: TextView
@@ -55,7 +56,10 @@ class ActivityExportActivity : ComponentActivity() {
     private var startDate: LocalDate = LocalDate.now()
     private var endDate: LocalDate = LocalDate.now()
     private var loaded = false
+    private var loading = false
     private var working = false
+    private var firstResume = true
+    private var modeSelectedByUser = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -71,6 +75,17 @@ class ActivityExportActivity : ComponentActivity() {
         }
         setContentView(buildUi())
         loadSessions()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // A new activity package may arrive while this screen is in the back stack. Reload the
+        // session list when the user returns; otherwise "最近三次" can silently use a stale list.
+        if (firstResume) {
+            firstResume = false
+            return
+        }
+        if (loaded && !working) loadSessions(initial = false)
     }
 
     private fun buildUi(): View {
@@ -98,18 +113,25 @@ class ActivityExportActivity : ComponentActivity() {
         val quickRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         latestButton = RwPrimaryButton(this).apply {
             text = "最近一次"
-            setOnClickListener { mode = Mode.LATEST; refreshSelection() }
+            setOnClickListener { selectMode(Mode.LATEST) }
+        }
+        recent3Button = RwSecondaryButton(this).apply {
+            text = "最近三次"
+            setOnClickListener { selectMode(Mode.RECENT3) }
         }
         todayButton = RwSecondaryButton(this).apply {
             text = "今天"
-            setOnClickListener { mode = Mode.TODAY; refreshSelection() }
+            setOnClickListener { selectMode(Mode.TODAY) }
         }
         quickRow.addView(latestButton, LinearLayout.LayoutParams(
             0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f,
-        ).apply { setMargins(0, dp(8), dp(4), 0) })
+        ).apply { setMargins(0, dp(8), dp(3), 0) })
+        quickRow.addView(recent3Button, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f,
+        ).apply { setMargins(dp(3), dp(8), dp(3), 0) })
         quickRow.addView(todayButton, LinearLayout.LayoutParams(
             0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f,
-        ).apply { setMargins(dp(4), dp(8), 0, 0) })
+        ).apply { setMargins(dp(3), dp(8), 0, 0) })
         quickCard.addView(quickRow)
         root.addView(quickCard, cardParams(16))
 
@@ -183,8 +205,21 @@ class ActivityExportActivity : ComponentActivity() {
         return screen
     }
 
-    private fun loadSessions() {
-        statusView.text = "正在读取已接收活动（已校验的包不重复扫描）…"
+    private fun selectMode(next: Mode) {
+        if (working) return
+        mode = next
+        modeSelectedByUser = true
+        refreshSelection()
+        // Re-read the inbox now, not only when the Activity was first created. This makes
+        // "最近三次" include a package that arrived while this page was already open.
+        if (loaded) loadSessions(initial = false)
+    }
+
+    private fun loadSessions(initial: Boolean = true) {
+        if (loading) return
+        loading = true
+        statusView.text = if (initial) "正在读取已接收活动（已校验的包不重复扫描）…"
+            else "正在刷新已接收活动…"
         lifecycleScope.launch {
             val result = try {
                 withContext(Dispatchers.IO) {
@@ -195,14 +230,18 @@ class ActivityExportActivity : ComponentActivity() {
                     }
                 }
             } catch (failure: Exception) {
+                loading = false
                 loaded = true
                 statusView.text = "读取失败：${failure.javaClass.simpleName}: ${failure.message}"
                 refreshSelection()
                 return@launch
             }
+            loading = false
             sessions = result
             loaded = true
-            if (sessions.any { isToday(it) }) mode = Mode.TODAY else mode = Mode.LATEST
+            if (initial && !modeSelectedByUser) {
+                if (sessions.any { isToday(it) }) mode = Mode.TODAY else mode = Mode.LATEST
+            }
             statusView.text = if (sessions.isEmpty()) "手机还没有收到活动数据。" else ""
             refreshSelection()
         }
@@ -213,12 +252,15 @@ class ActivityExportActivity : ComponentActivity() {
         val selected = selectedSessions()
         rangeView.text = when (mode) {
             Mode.LATEST -> "最近一次活动"
+            Mode.RECENT3 -> "最近三次活动"
             Mode.TODAY -> "今天（${LocalDate.now().format(DAY_FORMAT)}）"
             Mode.RANGE -> "${startDate.format(DAY_FORMAT)} → ${endDate.format(DAY_FORMAT)}"
         }
         latestButton.text = if (mode == Mode.LATEST) "● 最近一次" else "最近一次"
+        recent3Button.text = if (mode == Mode.RECENT3) "● 最近三次" else "最近三次"
         todayButton.text = if (mode == Mode.TODAY) "● 今天" else "今天"
         latestButton.alpha = if (mode == Mode.LATEST) 1f else 0.72f
+        recent3Button.alpha = if (mode == Mode.RECENT3) 1f else 0.72f
         todayButton.alpha = if (mode == Mode.TODAY) 1f else 0.72f
         startButton.alpha = if (mode == Mode.RANGE) 1f else 0.72f
         endButton.alpha = if (mode == Mode.RANGE) 1f else 0.72f
@@ -236,6 +278,7 @@ class ActivityExportActivity : ComponentActivity() {
         if (!loaded) return emptyList()
         return when (mode) {
             Mode.LATEST -> sessions.maxByOrNull { it.createdUtcMs() }?.let { listOf(it) }.orEmpty()
+            Mode.RECENT3 -> sessions.sortedByDescending { it.createdUtcMs() }.take(3)
             Mode.TODAY -> sessions.filter(::isToday)
             Mode.RANGE -> sessions.filter { inRange(it.createdUtcMs()) }
         }
@@ -298,9 +341,13 @@ class ActivityExportActivity : ComponentActivity() {
                         val percent = if (total > 0) (copied * 100 / total).toInt() else 0
                         runOnUiThread {
                             if (!isFinishing && !isDestroyed) {
-                                statusView.text = "正在导出并回读校验… $percent% " +
-                                    "(${"%.1f".format(copied / 1024.0 / 1024.0)} / " +
-                                    "${"%.1f".format(total / 1024.0 / 1024.0)} MB)"
+                                statusView.text = if (total > 0 && copied >= total) {
+                                    // Copy is done; the read-back SHA-256 pass has no byte
+                                    // progress. Say so instead of leaving a misleading 100%.
+                                    "导出已写入，正在回读校验 SHA-256…（${sizeText(total)}）"
+                                } else {
+                                    "正在导出… $percent% (${sizeText(copied)} / ${sizeText(total)})"
+                                }
                             }
                         }
                     }
@@ -347,6 +394,11 @@ class ActivityExportActivity : ComponentActivity() {
 
     private fun formatTime(utcMs: Long): String =
         Instant.ofEpochMilli(utcMs).atZone(zone).format(TIME_FORMAT)
+
+    /** Small sessions must not look like 0.0 MB; the five-second PRE test is 33 KB. */
+    private fun sizeText(bytes: Long): String =
+        if (bytes < 1024L * 1024L) "${(bytes + 1023L) / 1024L} KB"
+        else "%.1f MB".format(bytes / 1024.0 / 1024.0)
 
     private fun cardParams(top: Int) = LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT,

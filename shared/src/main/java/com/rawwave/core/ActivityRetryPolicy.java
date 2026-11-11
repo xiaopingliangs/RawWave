@@ -9,8 +9,8 @@ package com.rawwave.core;
  * already-exhausted request never retries.</p>
  */
 public final class ActivityRetryPolicy {
-    /** One first attempt plus one automatic retry. */
-    public static final int MAX_ATTEMPTS = 2;
+    /** One first attempt plus two automatic retries; transient phone-wake failures are common. */
+    public static final int MAX_ATTEMPTS = 3;
     /** Short pause so the receiver can close the failed channel before the new HELLO arrives. */
     public static final long RETRY_DELAY_MS = 3_000L;
 

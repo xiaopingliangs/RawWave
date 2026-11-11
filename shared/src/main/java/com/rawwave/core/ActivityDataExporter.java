@@ -148,14 +148,16 @@ public final class ActivityDataExporter {
     }
 
     private List<Result> exportSessionChoices(List<SessionChoice> chosen, Progress progress) throws IOException {
-        // A package that already contains exactly this one session is immutable and already
-        // named after its batch id. Copying it directly avoids extracting and re-zipping every
-        // raw file for the common "export latest" case.
-        if(chosen.size()==1) {
-            var only=chosen.get(0);
-            File source=new File(inbox,only.file());
+        // If the selected sessions already live in one immutable received package and the
+        // selection covers that package exactly, copy the verified ZIP as-is. This avoids
+        // extracting 677 MB of raw JSON and re-compressing it just to re-create bytes that
+        // already exist. It also avoids a second deep verification of unchanged data.
+        Set<String> selectedIds=chosen.stream().map(SessionChoice::id).collect(java.util.stream.Collectors.toSet());
+        Set<String> sourceFiles=chosen.stream().map(SessionChoice::file).collect(java.util.stream.Collectors.toSet());
+        if(sourceFiles.size()==1) {
+            File source=new File(inbox,sourceFiles.iterator().next());
             Cached cached=cached(source);
-            if(cached!=null && cached.sessions().size()==1 && cached.sessions().get(0).equals(only.id())) {
+            if(cached!=null && new HashSet<>(cached.sessions()).equals(selectedIds)) {
                 var verified=new ActivityArchive.Verified(cached.id(),cached.sessions(),0,0,false);
                 return List.of(exportOne(source,verified,cached.sha256(),progress));
             }
@@ -181,7 +183,11 @@ public final class ActivityDataExporter {
             }
             String id=UUID.randomUUID().toString();File output=new File(scratch.toFile(),id+".zip");
             ActivityArchive.create(output,id,folders);
-            return List.of(exportOne(output,ActivityArchive.verify(output),null,progress));
+            // create() already hashed every raw entry while writing. A full ActivityArchive.verify()
+            // here would re-read and re-parse the whole 8x-larger raw payload for no new evidence.
+            var ids=chosen.stream().map(SessionChoice::id).toList();
+            var verified=new ActivityArchive.Verified(id,ids,0,0,true);
+            return List.of(exportOne(output,verified,ActivityTransferFiles.hashFile(output),progress));
         } finally {
             try(var paths=java.nio.file.Files.walk(scratch)) {
                 for(var path:paths.sorted(Comparator.reverseOrder()).toList()) java.nio.file.Files.deleteIfExists(path);

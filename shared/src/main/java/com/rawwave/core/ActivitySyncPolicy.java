@@ -14,9 +14,12 @@ public final class ActivitySyncPolicy {
         return UNKNOWN;
     }
 
-    /** Opening-time backlog sync remains visible but never replaces the capture home screen. */
+    /**
+     * A sync is always a background job. It must never replace the capture home or stop the
+     * user from starting a new activity; the home shows its status and capture can preempt it.
+     */
     public static boolean isNonBlockingHomeSync(String trigger) {
-        return OPEN_IDLE_AUTO.equals(normalize(trigger));
+        return true;
     }
 
     /** A user choosing an activity may cancel any bounded sync; committed data remains retryable. */

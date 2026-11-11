@@ -23,6 +23,8 @@ private class CombinedSensors(private val samsung: SensorPort, private val andro
     override fun drain(sensor:String, done:SensorPort.Drain)=port(sensor).drain(sensor,done)
     override fun stop(sensor:String)=port(sensor).stop(sensor)
     override fun close(){try{samsung.close()}finally{android.close()}}
+    override fun releaseConnection(){samsung.releaseConnection()}
+    override fun releaseHoldMs()=samsung.releaseHoldMs()
 }
 
 /** Separate listeners/fences let each platform source drain independently. */

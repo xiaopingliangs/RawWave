@@ -145,6 +145,28 @@ public class ActivityDataExporterTest {
         assertArrayEquals(Files.readAllBytes(source.toPath()),Files.readAllBytes(exported.toPath()));
         assertEquals(source.length(),progress.get(progress.size()-1).longValue());
     }
+    @Test public void fullMultiSessionPackageIsCopiedWithoutRepacking() throws Exception {
+        File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
+        var store=new ActivityStore(root,dir -> {});
+        List<String> ids=new ArrayList<>();
+        for(int i=0;i<3;i++) {
+            var session=store.start(store.createTemplate("session "+i,false),1792483503220L+i*1000,1);
+            session.append("CORE-1","HEART_RATE",List.of(Map.of("HEART_RATE",70+i,"sdkTimestamp",123L)));
+            session.seal("DONE",1792483600000L+i*1000);
+            ids.add(session.id);
+        }
+        var batch=ActivityArchive.preparePending(root,out);
+        File source=new File(inbox,batch.file().getName());
+        Files.copy(batch.file().toPath(),source.toPath());
+        var exporter=new ActivityDataExporter(inbox,new FolderDestination(visible),dir -> {});
+        exporter.sessionChoices(); // writes the verified sidecar
+        var results=exporter.exportSessions(ids);
+        assertEquals(1,results.size());
+        assertEquals(batch.sha256(),results.get(0).sha256());
+        File exported=new File(visible,results.get(0).name());
+        assertArrayEquals(Files.readAllBytes(source.toPath()),Files.readAllBytes(exported.toPath()));
+    }
+
     @Test public void selectedArchiveIsReverifiedAfterListing() throws Exception {
         File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
         var store=new ActivityStore(root,dir -> {});
@@ -179,6 +201,38 @@ public class ActivityDataExporterTest {
             }
         }
     }
+    @Test public void recentThreeSpansAnOldPackageAndANewlyReceivedPackage() throws Exception {
+        File oldRoot=temp.newFolder(),oldOut=temp.newFolder();
+        var oldStore=new ActivityStore(oldRoot,dir->{});
+        List<String> oldIds=new ArrayList<>();
+        for(int i=0;i<3;i++) {
+            var session=oldStore.start(oldStore.createTemplate("old "+i,false,List.of("GYROSCOPE"),true),1000L+i*1000,1);
+            session.append("CORE-1","GYROSCOPE",List.of(Map.of("GYROSCOPE_X",0.1*i,"sensorTimestampNs",1234567L)));
+            session.seal("DONE",2000L+i*1000);oldIds.add(session.id);
+        }
+        var oldBatch=ActivityArchive.preparePending(oldRoot,oldOut);
+        File newRoot=temp.newFolder(),newOut=temp.newFolder();
+        var newStore=new ActivityStore(newRoot,dir->{});
+        List<String> newIds=new ArrayList<>();
+        for(int i=0;i<2;i++) {
+            var session=newStore.start(newStore.createTemplate("new "+i,false,List.of("GYROSCOPE"),true),10_000L+i*1000,1);
+            session.append("CORE-1","GYROSCOPE",List.of(Map.of("GYROSCOPE_X",0.1*i,"sensorTimestampNs",1234567L)));
+            session.seal("DONE",11_000L+i*1000);newIds.add(session.id);
+        }
+        var newBatch=ActivityArchive.preparePending(newRoot,newOut);
+        File inbox=temp.newFolder();
+        Files.copy(oldBatch.file().toPath(),new File(inbox,oldBatch.file().getName()).toPath());
+        Files.copy(newBatch.file().toPath(),new File(inbox,newBatch.file().getName()).toPath());
+        var exporter=new ActivityDataExporter(inbox,new FolderDestination(temp.newFolder()),dir->{});
+        var choices=exporter.sessionChoices();
+        assertEquals(5,choices.size());
+        assertEquals(newIds.get(1),choices.get(0).id());
+        assertEquals(newIds.get(0),choices.get(1).id());
+        assertEquals(oldIds.get(2),choices.get(2).id());
+        var results=exporter.exportRecent(3);
+        assertEquals(List.of(newIds.get(1),newIds.get(0),oldIds.get(2)),results.get(0).sessions());
+    }
+
     @Test public void sessionChoicesExposeDatesAndDateSelectionExportsOnlyChosenSessions() throws Exception {
         File root=temp.newFolder(),out=temp.newFolder(),inbox=temp.newFolder(),visible=temp.newFolder();
         var store=new ActivityStore(root,dir->{});List<ActivityStore.Session> sessions=new ArrayList<>();
