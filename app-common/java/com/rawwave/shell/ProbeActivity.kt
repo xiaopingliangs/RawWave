@@ -32,8 +32,8 @@ class ProbeActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var powerNote: TextView
     private lateinit var receivedSummary: TextView
+    private lateinit var connectionStatus: TextView
     private lateinit var reportStatus: TextView
-    private lateinit var batteryState: TextView
     private var summaryOperation = 0L
     private var summaryLoading = false
     private var working = false
@@ -42,15 +42,25 @@ class ProbeActivity : ComponentActivity() {
     private var transfer: TransferWindow? = null
     private var guard: SyncGuardService.Lease? = null
     private var background = false
-    private var activitySyncSucceeded = false
     private var sawRunningActivitySync = false
-    private var lastSyncTerminalFailed = false
-    private val phonePostSyncExitMs = 30_000L
-    private val postSyncExit = Runnable {
-        if (!exiting && !working && transfer == null && !app.activitySyncStatus.running && !background) {
-            val reason = if (lastSyncTerminalFailed) "PHONE_SYNC_FAILED_AUTO_EXIT" else "PHONE_SYNC_SUCCESS_AUTO_EXIT"
-            record(reason, mapOf("delayMs" to phonePostSyncExitMs))
-            exitNow(reason, force = true)
+    private var returningToCaller = false
+    private val returnOnDone: Boolean by lazy { intent.getBooleanExtra("returnOnDone", false) }
+    private val autoExitSettings by lazy { PhoneExitSettings(this) }
+    private val autoExit = Runnable {
+        if (exiting || working || transfer != null || app.activitySyncStatus.running || background) {
+            return@Runnable
+        }
+        val minutes = autoExitSettings.autoExitMinutes
+        if (minutes <= 0) return@Runnable
+        record("PHONE_IDLE_AUTO_EXIT_FIRED", mapOf("minutes" to minutes))
+        exitNow("PHONE_IDLE_AUTO_EXIT", force = true)
+    }
+    /** Re-read the persisted last-contact time so "刚刚" does not stay frozen on screen. */
+    private val connectionTick = object : Runnable {
+        override fun run() {
+            if (exiting) return
+            updateConnectionStatus()
+            main.postDelayed(this, 30_000L)
         }
     }
     private val ownerToken = java.util.UUID.randomUUID().toString()
@@ -62,11 +72,8 @@ class ProbeActivity : ComponentActivity() {
     }
     private val activitySyncObserver: (ProbeApplication.ActivitySyncStatus) -> Unit = { sync ->
         if (!exiting && ::status.isInitialized) {
-            status.text = when {
-                sync.running -> "正在同步：${sync.text}"
-                sync.text.isNotBlank() -> "上次同步：${sync.text}"
-                else -> currentSyncText()
-            }
+            status.text = currentSyncText()
+            updateConnectionStatus()
         }
         // The bounded lease owns a CPU wake lock; receiving must not depend on this page being lit.
         window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -74,24 +81,16 @@ class ProbeActivity : ComponentActivity() {
             if (sync.running) holdIdleForActivitySync() else releaseIdleForActivitySync()
         }
         if (!exiting) keepPhoneHomeVisible()
-        if (sync.running) sawRunningActivitySync = true
-        if (!exiting && !sync.running && sawRunningActivitySync) {
-            refreshReceivedSummary()
-            // The phone home used to stay forever (0.12.22). Any terminal activity sync —
-            // success or failure — now closes it after a bounded pause, unless the user is
-            // touching it or another RawWave screen/export owns the page. A failed sync no
-            // longer leaves the page open forever.
+        if (sync.running) {
+            sawRunningActivitySync = true
+            armAutoExit("SYNC_RUNNING")
+        } else if (sawRunningActivitySync) {
             sawRunningActivitySync = false
-            lastSyncTerminalFailed = !sync.success
-            activitySyncSucceeded = true
-            main.removeCallbacks(postSyncExit)
-            if (BuildConfig.DEVICE_ROLE == "phone" && !background && !working && transfer == null) {
-                main.postDelayed(postSyncExit, phonePostSyncExitMs)
-                record(if (sync.success) "PHONE_SYNC_SUCCESS_AUTO_EXIT_ARMED" else "PHONE_SYNC_FAILED_AUTO_EXIT_ARMED",
-                    mapOf("delayMs" to phonePostSyncExitMs))
-            }
-        } else if (!sync.running) {
-            if (!activitySyncSucceeded) main.removeCallbacks(postSyncExit)
+            refreshReceivedSummary()
+            updateConnectionStatus()
+            // The configurable inactivity window starts after the terminal result. A failed
+            // sync keeps the page visible just like a successful one; the user can read it.
+            armAutoExit("SYNC_FINISHED")
         }
     }
     private val activityIdleHold: () -> Boolean = { holdIdleForActivitySync() }
@@ -111,7 +110,23 @@ class ProbeActivity : ComponentActivity() {
         app.activityIdleHold = activityIdleHold
         app.activityIdleRelease = activityIdleRelease
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() { exitNow("USER_BACK") }
+            override fun handleOnBackPressed() {
+                if (returnOnDone) {
+                    if (working || transfer != null) {
+                        status.text = "正在处理，完成后即可返回；现在离开不会中断。"
+                        return
+                    }
+                    returnToCaller()
+                    return
+                }
+                // The phone home is a persistent receive screen. Back backgrounds it instead of
+                // stopping a watch transfer; use 完全退出软件 for an explicit stop.
+                if (BuildConfig.DEVICE_ROLE == "phone" && !working && transfer == null) {
+                    moveTaskToBack(true)
+                    return
+                }
+                exitNow("USER_BACK")
+            }
         })
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
@@ -119,7 +134,11 @@ class ProbeActivity : ComponentActivity() {
         if (watch) buildWatchConsole() else buildPhoneHome()
         record("ACTIVITY_CREATED", mapOf("screenRound" to resources.configuration.isScreenRound))
         try { app.journal?.mark("RUNNING") } catch (error: Exception) { showError(error) }
-        if (watch) scheduleIdle() else keepPhoneHomeVisible()
+        if (watch) scheduleIdle() else {
+            keepPhoneHomeVisible()
+            armAutoExit("CREATE")
+            main.postDelayed(connectionTick, 30_000L)
+        }
         if (watch) {
             val autoAction = intent.getStringExtra("autoAction")
             if (!autoAction.isNullOrBlank()) main.post {
@@ -127,7 +146,6 @@ class ProbeActivity : ComponentActivity() {
                 when (autoAction) {
                     "send" -> startTransfer()
                     "export" -> exportReport()
-                    "record" -> recordDiagnosticCapture()
                 }
             }
         }
@@ -152,7 +170,7 @@ class ProbeActivity : ComponentActivity() {
             setPadding(0, dp(4), 0, dp(2))
         })
         body.addView(RwBodyText(this).apply {
-            text = "问题报告工具\n${BuildConfig.VERSION_NAME}\n${BuildConfig.BUILD_RUN}"
+            text = "问题报告工具\n版本 ${BuildConfig.VERSION_NAME}"
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
             gravity = Gravity.CENTER
             setTextColor(colors.onSurfaceVariant)
@@ -200,16 +218,13 @@ class ProbeActivity : ComponentActivity() {
             ).apply { topMargin = dp(6) })
         }
         action("发送报告到手机", primary = true) { startTransfer() }
-        action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
-        action("记录问题现场") { recordDiagnosticCapture() }
         action("导出问题报告") { exportReport() }
-        action("后台运行设置") { openBackgroundSettings() }
         action("退出（停止所有工作）") { exitNow("USER_EXIT") }
         scroll.addView(body)
         setContentView(scroll)
     }
 
-    /** Consumer phone home: four jobs, no developer menu on the first screen. */
+    /** Consumer phone home: receive status first, then the four export/entry actions. */
     private fun buildPhoneHome() {
         val colors = RwTheme.colors(this)
         window.statusBarColor = colors.background
@@ -239,19 +254,32 @@ class ProbeActivity : ComponentActivity() {
 
         val dataCard = RwCard(this)
         dataCard.addView(
-            phoneText("活动原始数据", 18f, colors.onSurface, medium = true),
+            phoneText("接收状态", 18f, colors.onSurface, medium = true),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
         status = RwBodyText(this).apply {
             text = currentSyncText()
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setTextColor(colors.onSurface)
             setPadding(0, dp(6), 0, 0)
         }
         dataCard.addView(
             status,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
+        connectionStatus = RwBodyText(this).apply {
+            text = watchConnectionText()
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(colors.onSurfaceVariant)
+            setPadding(0, dp(4), 0, 0)
+        }
+        dataCard.addView(
+            connectionStatus,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
         powerNote = RwBodyText(this).apply {
             text = ""
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, dp(4), 0, 0)
         }
         dataCard.addView(
@@ -260,6 +288,7 @@ class ProbeActivity : ComponentActivity() {
         )
         receivedSummary = RwBodyText(this).apply {
             text = "正在读取已接收活动…"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12.5f)
             setPadding(0, dp(6), 0, 0)
         }
         dataCard.addView(
@@ -267,126 +296,76 @@ class ProbeActivity : ComponentActivity() {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
         dataCard.addView(
-            phoneText("同步由手表发起；手表首页可手动同步/重试。", 12f, colors.onSurfaceVariant).apply {
+            phoneText("同步由手表发起。", 12f, colors.onSurfaceVariant).apply {
                 setPadding(0, dp(6), 0, 0)
             },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        dataCard.addView(
-            RwPrimaryButton(this).apply {
-                text = "导出原始活动数据"
-                setOnClickListener { openActivityExport() }
-            },
-            phoneButtonParams(12),
         )
         dataCard.addView(
             RwSecondaryButton(this).apply {
                 text = "刷新接收状态"
-                setOnClickListener { refreshReceivedSummary() }
-            },
-            phoneButtonParams(8, compact = true),
-        )
-        content.addView(dataCard, cardParams(16))
-
-        val officialCard = RwCard(this)
-        officialCard.addView(
-            phoneText("Samsung Health 官方数据", 18f, colors.onSurface, medium = true),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        officialCard.addView(
-            phoneText("仅读取官方允许的健康记录，按你的逻辑日界线导出。", 14f, colors.onSurfaceVariant).apply {
-                setPadding(0, dp(6), 0, 0)
-            },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        officialCard.addView(
-            RwSecondaryButton(this).apply {
-                text = "导出官方健康数据"
-                setOnClickListener { openOfficialExport() }
+                setOnClickListener {
+                    status.text = currentSyncText()
+                    updatePowerNote()
+                    refreshReceivedSummary()
+                    updateConnectionStatus()
+                }
             },
             phoneButtonParams(12, compact = true),
         )
-        content.addView(officialCard, cardParams(12))
+        content.addView(dataCard, cardParams(16))
 
-        val reportCard = RwCard(this)
-        reportCard.addView(
-            phoneText("问题报告", 18f, colors.onSurface, medium = true),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        reportCard.addView(
-            phoneText("问题报告与活动原始数据分开保存、分开传输。", 14f, colors.onSurfaceVariant).apply {
-                setPadding(0, dp(6), 0, 0)
-            },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        reportCard.addView(
+        // Only the live receive status keeps detail on the home. Everything else is a plain
+        // action button; explanations live at the bottom of the second-level pages.
+        content.addView(
             RwPrimaryButton(this).apply {
+                text = "导出原始活动数据"
+                setOnClickListener { openActivityExport() }
+            },
+            phoneButtonParams(18),
+        )
+        content.addView(
+            RwSecondaryButton(this).apply {
+                text = "导出三星健康官方数据"
+                setOnClickListener { openOfficialExport() }
+            },
+            phoneButtonParams(10),
+        )
+        content.addView(
+            RwSecondaryButton(this).apply {
                 text = "导出问题报告"
                 setOnClickListener { exportReport() }
             },
-            phoneButtonParams(12),
+            phoneButtonParams(10),
         )
         reportStatus = RwBodyText(this).apply {
-            text = "导出时会在这里显示进度。"
+            text = ""
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(colors.onSurfaceVariant)
             setPadding(0, dp(8), 0, 0)
         }
-        reportCard.addView(
+        content.addView(
             reportStatus,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
-        reportCard.addView(
-            RwSecondaryButton(this).apply {
-                text = "诊断 / 记录问题现场"
-                setOnClickListener { showReportTools() }
-            },
-            phoneButtonParams(8, compact = true),
-        )
-        content.addView(reportCard, cardParams(12))
-
-        val backgroundCard = RwCard(this)
-        backgroundCard.addView(
-            phoneText("后台运行", 18f, colors.onSurface, medium = true),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        batteryState = RwBodyText(this).apply {
-            text = batteryStateText()
-            setPadding(0, dp(6), 0, 0)
-        }
-        backgroundCard.addView(
-            batteryState,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        backgroundCard.addView(
-            RwSecondaryButton(this).apply {
-                text = "允许后台一直运行"
-                setOnClickListener { requestBatteryExemption() }
-            },
-            phoneButtonParams(10, compact = true),
-        )
-        content.addView(backgroundCard, cardParams(12))
-
         content.addView(
             RwSecondaryButton(this).apply {
-                text = "退出软件"
+                text = "更多"
+                setOnClickListener { openMore() }
+            },
+            phoneButtonParams(16),
+        )
+        content.addView(
+            RwSecondaryButton(this).apply {
+                text = "完全退出软件"
                 setOnClickListener { exitNow("USER_EXIT") }
             },
-            phoneButtonParams(20, compact = true),
-        )
-        content.addView(
-            phoneText(
-                "RawWave 仍会在本轮工作结束后自行退出；后台权限只用于熄屏时完成数据接收。",
-                12f,
-                colors.onSurfaceVariant,
-            ),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(12)
-            },
+            phoneButtonParams(10),
         )
         setContentView(screen)
         refreshReceivedSummary()
-        updateBatteryState()
+        updatePowerNote()
+        updateConnectionStatus()
     }
 
     private fun cardParams(top: Int) = LinearLayout.LayoutParams(
@@ -399,6 +378,10 @@ class ProbeActivity : ComponentActivity() {
         return when {
             sync.running -> "正在同步：${sync.text}"
             sync.text.isNotBlank() -> "上次同步：${sync.text}"
+            // The phone has no watch-owned sync status in memory after a restart. The inbox
+            // summary below is the durable truth; say we are checking instead of claiming
+            // "waiting for the watch" while activities are already saved.
+            BuildConfig.DEVICE_ROLE == "phone" -> "数据同步：正在核对已接收活动…"
             else -> "等待手表发送活动数据。"
         }
     }
@@ -455,6 +438,7 @@ class ProbeActivity : ComponentActivity() {
         receivedSummary.text = "正在读取已接收活动…"
         if (worker.isShutdown) worker = Executors.newSingleThreadExecutor()
         worker.execute {
+            var dataState: String? = null
             val text = try {
                 val exporter = ActivityDataExporter(
                     File(filesDir, "activity-inbox"),
@@ -465,6 +449,7 @@ class ProbeActivity : ComponentActivity() {
                 }
                 val sessions = exporter.sessionChoices()
                 if (sessions.isEmpty()) {
+                    dataState = "数据同步：还没有收到活动数据。"
                     "还没有收到活动数据。\n在手表结束活动后，保持两台设备靠近即可自动同步。"
                 } else {
                     val latest = sessions.maxByOrNull { it.createdUtcMs() }
@@ -475,9 +460,11 @@ class ProbeActivity : ComponentActivity() {
                             .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
                     } ?: "时间未知"
                     val name = latest?.activityName()?.takeIf { it.isNotBlank() } ?: "未命名活动"
+                    dataState = "数据同步：已收到 ${sessions.size} 次活动\n最近：$name · $time"
                     "已接收 ${sessions.size} 次活动\n最近：$name · $time\n原始包约 ${"%.1f".format(bytes / 1024.0 / 1024.0)} MB"
                 }
             } catch (_: ActivityDataExporter.NoDataException) {
+                dataState = "数据同步：还没有收到活动数据。"
                 "还没有收到活动数据。\n在手表结束活动后，保持两台设备靠近即可自动同步。"
             } catch (failure: Exception) {
                 "读取活动失败：${failure.javaClass.simpleName}: ${failure.message}"
@@ -486,173 +473,71 @@ class ProbeActivity : ComponentActivity() {
                 if (op == summaryOperation) summaryLoading = false
                 if (!exiting && op == summaryOperation && ::receivedSummary.isInitialized) {
                     receivedSummary.text = text
+                    if (dataState != null && BuildConfig.DEVICE_ROLE == "phone" &&
+                        !app.activitySyncStatus.running && ::status.isInitialized) {
+                        status.text = dataState!!
+                    }
                 }
             }
         }
     }
 
-    private fun openBackgroundSettings() {
-        try {
-            startActivity(android.content.Intent(
-                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                android.net.Uri.parse("package:$packageName"),
-            ))
+    /** The home only hints at the background permission; the setting itself lives in 更多. */
+    private fun updatePowerNote() {
+        if (!::powerNote.isInitialized) return
+        val exempt = try {
+            getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
         } catch (_: Exception) {
-            status.text = "当前设备没有提供应用设置入口，请在系统设置中查看原波的后台限制。"
+            false
+        }
+        powerNote.text = if (exempt) "后台运行：已允许" else "后台运行：未允许（只影响熄屏接收）"
+    }
+
+    private fun watchConnectionText(): String {
+        val last = WatchContact.lastUtcMs(this)
+        if (last <= 0L) {
+            return "手表连接：还没有收到手表消息。\n保持两台设备靠近；同步由手表发起。"
+        }
+        val elapsed = System.currentTimeMillis() - last
+        val stamp = java.time.Instant.ofEpochMilli(last)
+            .atZone(java.time.ZoneId.systemDefault())
+            .format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm"))
+        return when {
+            elapsed < 0L -> "手表连接：刚刚有消息（$stamp）"
+            elapsed < 2 * 60_000L -> "手表连接：刚刚有消息（$stamp）"
+            elapsed < 60 * 60_000L -> "手表连接：上次消息 ${elapsed / 60_000L} 分钟前（$stamp）"
+            else -> "手表连接：上次消息 $stamp。\n这只是最后消息时间，不代表手表此刻一定在线。"
         }
     }
 
-    private fun batteryStateText(): String {
-        val exempt = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
-        return if (exempt) {
-            "已允许不受限制。熄屏后仍可完成本轮数据接收。"
-        } else {
-            "未允许。手机熄屏后系统可能暂停接收；大包同步需要更长时间。"
-        }
+    private fun updateConnectionStatus() {
+        if (::connectionStatus.isInitialized) connectionStatus.text = watchConnectionText()
     }
 
-    private fun updateBatteryState() {
-        if (::batteryState.isInitialized) batteryState.text = batteryStateText()
-        if (::powerNote.isInitialized) {
-            val exempt = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
-            powerNote.text = if (exempt) "后台运行：已允许" else "后台运行：未允许（只影响熄屏接收）"
-        }
+    /**
+     * Start the user's inactivity window. It is reset by any touch, by leaving/re-entering the
+     * home, and after a transfer finishes; it never counts down while the page is backgrounded
+     * or a sync/export is actively using the process.
+     */
+    private fun armAutoExit(origin: String) {
+        main.removeCallbacks(autoExit)
+        if (BuildConfig.DEVICE_ROLE != "phone" || exiting || background) return
+        val minutes = autoExitSettings.autoExitMinutes
+        if (minutes <= 0) return
+        if (working || transfer != null || app.activitySyncStatus.running) return
+        main.postDelayed(autoExit, minutes * 60_000L)
+        record("PHONE_IDLE_AUTO_EXIT_ARMED", mapOf("minutes" to minutes, "origin" to origin))
     }
 
-    private fun requestBatteryExemption() {
-        val exempt = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
-        if (exempt) {
-            RwDialogs.message(this, "后台运行", "原波已经允许不受电池优化限制。\n本轮工作结束后仍会自行退出。")
-            return
-        }
-        RwDialogs.confirm(
-            this,
-            "允许后台运行",
-            "为保证手机熄屏时仍能接收手表的大活动包，请允许原波不受电池优化限制。\n\n原波只在同步期间保活，完成后会自行退出。",
-            confirmLabel = "去设置",
-            cancelLabel = "稍后",
-        ) {
-            try {
-                startActivity(android.content.Intent(
-                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    android.net.Uri.parse("package:$packageName"),
-                ))
-            } catch (_: Exception) {
-                try {
-                    startActivity(android.content.Intent(
-                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        android.net.Uri.parse("package:$packageName"),
-                    ))
-                } catch (_: Exception) {
-                    status.text = "当前设备没有提供后台运行设置入口，请在系统应用设置中查看原波。"
-                }
-            }
-        }
-    }
-
-    private fun showAbout() {
-        RwDialogs.message(
-            this,
-            "关于 RawWave",
-            "版本 ${BuildConfig.VERSION_NAME}\n\n" +
-                "RawWave 只读取、保存和导出数据，不会写回 Samsung Health，也不会修改手表原始记录。",
-            confirmLabel = "知道了",
-        )
-    }
-
-    private fun showReportTools() {
-        RwDialogs.actions(
-            this,
-            "问题报告",
-            "问题报告与活动原始数据分开保存、分开传输",
-            listOf(
-                RwDialogs.Action("导出问题报告", primary = true) { exportReport() },
-                RwDialogs.Action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) },
-                RwDialogs.Action("记录问题现场") { recordDiagnosticCapture() },
-                RwDialogs.Action("仅接收问题报告（不接收活动数据）") { startTransfer() },
-                RwDialogs.Action("关于与版本") { showAbout() },
-            ),
-            cancelLabel = "关闭",
-        )
-    }
-
-    private fun recordDiagnosticCapture() {
-        if (working || exiting) return
-        val symptoms = linkedMapOf(
-            "LED_PERSISTENT" to "红/绿灯持续亮",
-            "WATCH_NOT_EXITED" to "手表没有退出/没有回表盘",
-            "DATA_NOT_ARRIVED" to "活动数据没有到手机",
-            "APP_CRASH_OR_FREEZE" to "应用崩溃/卡死/被系统停止",
-            "OTHER_OR_UNKNOWN" to "其他/不确定"
-        )
-        val keys = symptoms.keys.toList()
-        val labels = symptoms.values.toTypedArray()
-        RwDialogs.checklist(
-            this,
-            "记录问题现场",
-            "可多选；保存后会写进问题报告",
-            labels,
-            BooleanArray(labels.size),
-            confirmLabel = "保存",
-        ) { checked ->
-            val selected = keys.filterIndexed { index, _ -> checked[index] }
-            saveDiagnosticCapture(selected)
-        }
-    }
-
-    private fun captureServiceRunning(): Boolean = try {
-        getSystemService(android.app.ActivityManager::class.java)
-            .getRunningServices(64)
-            .any { it.service.className == "com.rawwave.shell.ActivityRecordingService" }
-    } catch (_: Exception) {
-        false
-    }
-
-    private fun saveDiagnosticCapture(selected: List<String>) {        val journal = app.journal
-        if (journal == null) { status.text = app.journalFailure ?: "诊断存储未初始化，无法记录问题现场。"; return }
-        val captureId = java.util.UUID.randomUUID().toString()
-        val led = if ("LED_PERSISTENT" in selected) "ON" else "NOT_OBSERVED"
-        val watchExit = if ("WATCH_NOT_EXITED" in selected) "NOT_EXITED" else "NOT_OBSERVED"
-        val dataArrival = if ("DATA_NOT_ARRIVED" in selected) "NOT_ARRIVED" else "NOT_OBSERVED"
-        val crash = if ("APP_CRASH_OR_FREEZE" in selected) "REPORTED" else "NOT_OBSERVED"
-        val details = linkedMapOf<String, Any>(
-            "diagnosticCaptureId" to captureId,
-            "symptoms" to selected,
-            "led" to led,
-            "watchExit" to watchExit,
-            "dataArrival" to dataArrival,
-            "appCrashOrFreeze" to crash,
-            "rebootState" to "NOT_RECORDED",
-            "role" to BuildConfig.DEVICE_ROLE,
-            "versionCode" to BuildConfig.VERSION_CODE,
-            "versionName" to BuildConfig.VERSION_NAME,
-            "buildRun" to BuildConfig.BUILD_RUN,
-            "utcMs" to System.currentTimeMillis(),
-            "elapsedRealtimeMs" to SystemClock.elapsedRealtime(),
-            "uptimeMs" to SystemClock.uptimeMillis(),
-            "activeSyncOwner" to app.activeSyncOwner.orEmpty(),
-            "activitySyncRunning" to app.activitySyncStatus.running,
-            "activitySyncTrigger" to app.activitySyncStatus.trigger,
-            "captureServiceRunning" to captureServiceRunning(),
-            "lastStopReason" to app.lastStopReason.orEmpty(),
-            "processState" to (try { journal.previousState() } catch (_: Exception) { "UNKNOWN" })
-        )
+    private fun openMore() {
         try {
-            journal.observation("DIAGNOSTIC_CAPTURE", details)
-            journal.event("DIAGNOSTIC_CAPTURE_RECORDED", mapOf(
-                "diagnosticCaptureId" to captureId,
-                "symptoms" to selected,
-                "led" to led,
-                "watchExit" to watchExit,
-                "dataArrival" to dataArrival,
-                "appCrashOrFreeze" to crash))
-            status.text = "已记录问题现场。\nID ${captureId.take(8)}\n症状：${selected.joinToString("、").ifEmpty { "未选择" }}\n" +
-                "导出问题报告会包含此记录；系统层证据需按“诊断详情”里的说明另抓 dump。"
-        } catch (failure: Exception) {
-            showError(failure)
-            status.append("\n问题现场没有保存成功；请拍照本页并保留。")
+            startActivity(android.content.Intent(this, PhoneMoreActivity::class.java))
+        } catch (error: Exception) {
+            status.text = "无法打开“更多”：${error.javaClass.simpleName}: ${error.message}"
         }
     }
+
+    private fun captureServiceRunning(): Boolean = ProblemCapture.captureServiceRunning(this)
 
     private fun initialStatus(): String {
         app.journalFailure?.let { return it + "\n请拍照保存本页。" }
@@ -683,9 +568,23 @@ class ProbeActivity : ComponentActivity() {
                     SyncGuardService.close(guard); guard = null
                     if (app.preemptDiagnosticReceive === diagnosticPreempt) app.preemptDiagnosticReceive = null
                     if (app.activeSyncOwner == ownerToken) { app.activeSyncOwner = null; app.receiveHello = null }
-                    status.text = text + if (success) "\n已确认保存，正在退出。" else "\n本轮截止不变；恢复运行若已超时先退出，下次打开可重试。"
-                    exitNow(if (success) "TRANSFER_SUCCESS" else "TRANSFER_FAILED", force = true)
-                    // The original deadline is never renewed by failures, UI updates or export.
+                    if (success) {
+                        status.text = text + "\n已确认保存，正在退出。"
+                        // The original deadline is never renewed by failures, UI updates or export.
+                        exitNow("TRANSFER_SUCCESS", force = true)
+                    } else {
+                        // A failed send must keep its reason on screen. Exiting immediately made
+                        // the message invisible and gave the user no chance to retry.
+                        runtime.finishTransfer()
+                        status.text = text + "\n本轮没有完成；数据仍保留，可以重试。"
+                        armAutoExit("TRANSFER_FAILED")
+                        RwDialogs.message(
+                            this,
+                            "传输没有完成",
+                            text.ifBlank { "本轮没有完成。" } + "\n\n数据仍保留在当前设备，可以重试。",
+                            confirmLabel = "知道了",
+                        )
+                    }
                 }
             } })
         if (BuildConfig.DEVICE_ROLE == "phone") app.receiveHello = { node, bytes -> transfer?.offerHello(node, bytes) }
@@ -720,26 +619,18 @@ class ProbeActivity : ComponentActivity() {
         if (exiting || !runtime.check("TOUCH")) return true
         if (event.action == MotionEvent.ACTION_DOWN) {
             scheduleIdle()
-            cancelPostSyncExit("TOUCH")
+            armAutoExit("TOUCH")
         }
         return super.dispatchTouchEvent(event)
     }
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (exiting || !runtime.check("KEY")) return true
         scheduleIdle()
-        cancelPostSyncExit("KEY")
+        armAutoExit("KEY")
         return super.onKeyDown(keyCode, event)
     }
     private fun scheduleIdle() {
         if (!working && !exiting) runtime.touchIdle()
-    }
-    /** A touch or leaving the page cancels the one-shot post-sync auto-exit. */
-    private fun cancelPostSyncExit(origin: String) {
-        main.removeCallbacks(postSyncExit)
-        if (activitySyncSucceeded) {
-            activitySyncSucceeded = false
-            record("PHONE_SYNC_SUCCESS_AUTO_EXIT_CANCELLED", mapOf("origin" to origin))
-        }
     }
     /** Phone home stays alive until the explicit exit button; no idle timeout kills it. */
     private fun keepPhoneHomeVisible() {
@@ -861,6 +752,7 @@ class ProbeActivity : ComponentActivity() {
                                 "含本机日志及已收到且校验通过的最近 ${report.includedWatchReports()} 份手表包。\n" +
                                 "已回读校验；旧附件不代表本轮成功。",
                             confirmLabel = "知道了",
+                            onConfirm = { if (returnOnDone && !exiting) returnToCaller() },
                         )
                     }
                 }
@@ -877,6 +769,7 @@ class ProbeActivity : ComponentActivity() {
                                     "注意：已校验的导出文件已发布并保留；失败发生在后续诊断记录。"
                                 else "本机日志仍保留，可稍后重试。",
                             confirmLabel = "知道了",
+                            onConfirm = { if (returnOnDone && !exiting) returnToCaller() },
                         )
                     }
                 }
@@ -886,6 +779,7 @@ class ProbeActivity : ComponentActivity() {
                         working = false; runtime.finishExport()
                         if (app.activeSyncOwner == ownerToken) app.activeSyncOwner = null
                         keepPhoneHomeVisible()
+                        armAutoExit("REPORT_EXPORT")
                         if (background) parkIdle()
                     }
                 }
@@ -904,13 +798,17 @@ class ProbeActivity : ComponentActivity() {
     private fun record(event: String, values: Map<String, Any>) {
         try { app.journal?.event(event, values) } catch (failure: Exception) { if (::status.isInitialized) showError(failure) }
     }
+    private fun returnToCaller() {
+        returningToCaller = true
+        finish()
+    }
     private fun exitNow(reason: String, force: Boolean = false, deadlineEvidence: Map<String, Any> = emptyMap()) {
         if (exiting) return
         if (working && !force && transfer == null) { status.text = "数据正在安全写出，请等待完成；不会把未校验文件报告为成功。"; return }
         exiting = true; ++operation
         app.lastStopReason = reason
         runtime.close()
-        main.removeCallbacks(postSyncExit)
+        main.removeCallbacks(autoExit)
         if (app.syncFinished === syncObserver) app.syncFinished = null
         if (app.activitySyncObserver === activitySyncObserver) app.activitySyncObserver = null
         if (app.activityIdleHold === activityIdleHold) app.activityIdleHold = null
@@ -936,7 +834,7 @@ class ProbeActivity : ComponentActivity() {
         finishAndRemoveTask()
     }
     override fun onDestroy() {
-        if (isFinishing && !exiting) exitNow("ACTIVITY_FINISHED", force = true)
+        if (isFinishing && !exiting && !returningToCaller) exitNow("ACTIVITY_FINISHED", force = true)
         ++operation
         runtime.close()
         SyncGuardService.close(guard); guard = null
@@ -955,7 +853,8 @@ class ProbeActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         background = true
-        cancelPostSyncExit("BACKGROUND")
+        main.removeCallbacks(autoExit)
+        main.removeCallbacks(connectionTick)
         if (!exiting && !working && transfer == null) parkIdle()
         if (!exiting && runtime.check("BACKGROUND")) record("ACTIVITY_BACKGROUND",
             runtime.evidence() + mapOf("working" to working,"deadlineRenewed" to false))
@@ -966,8 +865,9 @@ class ProbeActivity : ComponentActivity() {
         // Re-register after a preview/other screen temporarily owned the observer. Without this,
         // returning to the data console would leave its status frozen.
         if (!exiting) app.activitySyncObserver = activitySyncObserver
-        updateBatteryState()
+        updatePowerNote()
         if (!exiting && !working) refreshReceivedSummary()
+        updateConnectionStatus()
         // Background time counts toward the same absolute idle deadline (phone: 3 minutes;
         // watch: 80 seconds). Returning is not itself a user interaction and cannot renew it.
         if (!exiting && transfer == null && !working) {
@@ -975,6 +875,9 @@ class ProbeActivity : ComponentActivity() {
             else if (runtime.isClosed()) releaseIdleForActivitySync()
         }
         if (!exiting) keepPhoneHomeVisible()
+        armAutoExit("RESUME")
+        main.removeCallbacks(connectionTick)
+        if (BuildConfig.DEVICE_ROLE == "phone" && !exiting) main.postDelayed(connectionTick, 30_000L)
         if (!exiting && runtime.resumeIdle()) record("IDLE_PAGE_RETURNED_WITHIN_EXISTING_DEADLINE", runtime.evidence())
         if (!exiting && runtime.check("RESUME")) record("ACTIVITY_RESUMED", runtime.evidence())
     }

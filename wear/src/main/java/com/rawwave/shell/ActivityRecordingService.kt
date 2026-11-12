@@ -208,11 +208,6 @@ class ActivityRecordingService : Service() {
                 event("CAPTURE_DEADLINE_OBSERVED", "phase=$phase; deadlineMs=$deadline; observedMs=${clock()}; lateMs=${clock()-deadline}; wakeLockHeld=${lock?.isHeld == true}; uptimeMs=${SystemClock.uptimeMillis()}")
                 if (phase.startsWith("READY_SPO2_")) { beginSpo2(spo2Pre); return@guarded }
                 if (phase.startsWith("READY_PPG_")) { beginPpg(ppgPre); return@guarded }
-                if (phase == "RESTORE_PRE") {
-                    event("NORMAL_PLACEMENT_CONFIRMED", "auto=${NO_HAND_AUTOSTART_MS / 1000}s; next=${if(preEcg) "ECG" else "CORE"}")
-                    if(preEcg) beginEcg("PRE-1") else beginCore()
-                    return@guarded
-                }
                 if (phase.startsWith("WAIT_BIA_")) {
                     if (clock() >= biaContactStartMs + SHORT_BUDGET_MS) {
                         event("BIA_CONTACT_TIMEOUT_80S", "mode=$bodySource; pre=$biaPre")
@@ -359,12 +354,16 @@ class ActivityRecordingService : Service() {
             if (phase != "CONNECTING") return@connect
             if (clock() >= deadline) { finish("SDK_CONNECT_TIMEOUT"); return@connect }
             writer.removeCallbacks(tick)
-            // PPG needs no placement; run it first unless continuous CORE PPG is also enabled.
-            // In that combination the vendor 25 Hz client can be left behind and keep the back
-            // LEDs on; skip only the pre short PPG and keep the post short PPG after CORE stops.
-            // BIA only waits for finger contact. SpO2 still needs the elbow/wrist position, and
-            // ECG is the only later placement change.
-            if (prePpg && !skipPrePpgForVendorLed) beginPpg(true) else if (bia) startBia(true) else if (preSpo2) prepareSpo2(true) else if (preEcg) beginEcg("PRE-1") else beginCore()
+            // SpO2 is the only pre measurement that needs a different strap position. Samsung
+            // requires the watch 1-2 finger widths above the wrist bone for SpO2, while BIA,
+            // ECG and PPG are measured with the watch in its normal position. SpO2 therefore
+            // runs first once; the user restores the normal position a single time and every
+            // remaining pre measurement runs without touching the watch again, so the activity
+            // starts from the normal position. Post keeps SpO2 last for the same reason: the
+            // session ends right after that one position change.
+            // If continuous CORE PPG is enabled, skip only the pre short PPG to avoid the known
+            // vendor 25 Hz client/LED leak; the post short PPG still runs after CORE stops.
+            if (preSpo2) prepareSpo2(true) else if (bia) startBia(true) else if (preEcg) beginEcg("PRE-1") else if (prePpg && !skipPrePpgForVendorLed) beginPpg(true) else beginCore()
         }, { finish(it) })
         writer.post(tick)
     }
@@ -434,10 +433,6 @@ class ActivityRecordingService : Service() {
                       "SKIP_BIA" -> if(shortSensor == "BIA" && phase != "CORE-1") skipBia()
                       "START_SPO2" -> if (phase.startsWith("READY_SPO2_")) beginSpo2(spo2Pre)
                       "START_PPG" -> if (phase.startsWith("READY_PPG_")) beginPpg(ppgPre)
-                      "PLACEMENT_READY" -> if (phase == "RESTORE_PRE") {
-                          event("NORMAL_PLACEMENT_CONFIRMED", "next=${if(preEcg) "ECG" else "CORE"}")
-                          if(preEcg) beginEcg("PRE-1") else beginCore()
-                      }
                       // A retry is a measurement restart, not a new placement decision.
                       // SpO2/PPG have no contact gate, so start immediately.
                       "RETRY_SPO2" -> if (phase.startsWith("REVIEW_SPO2")) beginSpo2(spo2Pre)
@@ -497,7 +492,10 @@ class ActivityRecordingService : Service() {
     private fun beginEcg(next: String) {
         shortSensor = "ECG"
         phase = next; ecgPhase = next; ecgFailed = false; ecgFailureReason = ""
-        notice = "请把手指轻放在 Home 键；检测到稳定接触后立即开始30秒。80秒没有接触才会自动退出。"
+        notice = "前臂自然放在桌上，用另一只手的指尖完全盖住上键，轻放、不要按压，手指不要碰表框。\n" +
+            "手表要贴紧腕部；如果一直接触不好，可把手表稍微向肘部移一点再试。\n" +
+            "保持不动、不要说话；检测到稳定接触后立即开始30秒连续记录。\n" +
+            "80秒没有接触才会退出。"
         contact = false; ecgTotalRows = 0
         lastContactMs = 0; ecgGate = EcgContinuityGate(); ecgUpdate = null
         // The no-contact safety starts with this ECG phase, not with the session. Pre-BIA/
@@ -520,7 +518,7 @@ class ActivityRecordingService : Service() {
         startingSources = false
         if (running.isEmpty()) finish("ALL_CORE_SOURCES_FAILED") else restartTick()
     }
-    private fun placementWaiting() = phase.startsWith("READY_SPO2_") || phase.startsWith("READY_PPG_") || phase == "RESTORE_PRE"
+    private fun placementWaiting() = phase.startsWith("READY_SPO2_") || phase.startsWith("READY_PPG_")
     private fun beginPostShorts() {
         // Body composition is intentionally pre-activity only. Post-exercise BIA/MF-BIA
         // is dominated by acute fluid shifts and is not comparable to the pre measurement.
@@ -550,7 +548,12 @@ class ActivityRecordingService : Service() {
         biaRetrying=false;biaHint="";biaProgress=-1;biaAttempt++
         biaResults[phase]="正在等待双指接触，尚无完整有效结果";biaModeByPhase[phase]=bodySource
         deadline=clock()+60_000
-        notice="准备：${biaModeLabel()}。保持手表背面贴紧皮肤即可，不需要调整到肘部。中指轻触上键、无名指轻触下键；双手不要相碰，抬起手臂使腋下张开。\n正在等待双指接触；检测到后自动开始；接触错误会立即自动重试；最多80秒。"
+        notice="准备：${biaModeLabel()}。${if (biaPre) "如果刚测过血氧，请先把手表戴回腕骨下方的正常位置。" else ""}表带贴合即可。\n" +
+            "中指、无名指分别轻触上键、下键，手指不要碰表框；双臂抬到胸口高度，腋下张开，双手不要相碰；保持不动、不要说话。\n" +
+            "最好在早晨进食前、如厕后测；运动或洗澡后不要立即测。\n" +
+            "装有心脏起搏器/除颤器、怀孕或月经期不要测；测前摘掉金属饰品。\n" +
+            "皮肤太干可少量润肤，手湿/出汗先擦干；每次用同样的两指。\n" +
+            "检测到双指接触后自动开始；接触错误会自动重试；最多80秒。"
         event("BIA_CONTACT_WAIT_STARTED","source=$bodySource; pre=$biaPre; mode=$bodySource; deadlineMs=$deadline; profileInPlan=true")
         startSource(bodySource);restartTick()
     }
@@ -630,16 +633,25 @@ class ActivityRecordingService : Service() {
         afterBiaPhase()
     }
     private fun afterBiaPhase() {
-        if(biaPre) {
-            if(preSpo2) prepareSpo2(true) else restorePlacement()
-        } else if(postSpo2) prepareSpo2(false)
+        if (biaPre) {
+            when {
+                preEcg -> beginEcg("PRE-1")
+                prePpg && !skipPrePpgForVendorLed -> beginPpg(true)
+                else -> beginCore()
+            }
+        } else if (postSpo2) prepareSpo2(false)
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun prepareSpo2(pre: Boolean) {
         shortSensor = "SPO2"; spo2Pre = pre
         phase = if(pre) "READY_SPO2_PRE" else "READY_SPO2_POST"
         shortBudgetStartMs = clock()
-        notice = "请将手表向肘部上移并贴合皮肤，手肘放在桌上，手腕靠近心脏，保持静止。\n${NO_HAND_AUTOSTART_MS / 1000}秒后自动开始；也可提前点开始。80秒内没有有效结果会保存并退出。"
+        val restore = if (pre) "测完请把手表戴回腕骨下方的正常位置。" else "这是最后一项，测完直接结束，不用再戴回。"
+        notice = "血氧需要把表戴在腕骨上方：把手表沿前臂上移约1–2指宽，表带贴合但不要勒紧。\n" +
+            "手肘放在桌上，手腕靠近心脏，手掌放松；最好先安静休息5分钟。\n" +
+            "测量时保持静止、不要说话；手冷时先搓暖手腕。\n" +
+            "$restore\n" +
+            "${NO_HAND_AUTOSTART_MS / 1000}秒后自动开始；也可提前点开始。80秒内没有有效结果会保存并退出。"
         deadline = clock() + NO_HAND_AUTOSTART_MS
         event("SPO2_PLACEMENT_PREPARATION", "pre=$pre; autostartMs=$NO_HAND_AUTOSTART_MS; sensorsNotStarted=true")
         holdDecisionWindow(); restartTick()
@@ -668,16 +680,22 @@ class ActivityRecordingService : Service() {
                     "SDK_STATUS_-6", "MEASUREMENT_TIMEOUT_30S" -> "30秒内未取得有效结果"
                     else -> "测量未完成"
                 }
-                notice = "血氧未成功：$explanation（$reason）。已有数据已保存；点重测会立即开始，或跳过继续；80秒不操作则退出。"
+                notice = "血氧未成功：$explanation（$reason）。请确认手表背面贴紧皮肤、表带不过松；手冷时先搓暖手腕。已有数据已保存；点重测会立即开始，或跳过继续；80秒不操作则退出。"
                 deadline=clock()+80_000; holdDecisionWindow(); restartTick()
             }
         }
     }
     private fun afterSpo2() {
-        // Pre PPG/BIA already ran before SpO2. After SpO2 the only remaining placement
-        // change is ECG (or a normal-position restore before CORE).
-        if(spo2Pre) restorePlacement()
-        else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        if (spo2Pre) {
+            when {
+                // SpO2 ran first (watch above the wrist bone). BIA follows after the user
+                // restores the normal position; the BIA screen repeats that reminder.
+                bia -> startBia(true)
+                preEcg -> beginEcg("PRE-1")
+                prePpg && !skipPrePpgForVendorLed -> beginPpg(true)
+                else -> beginCore()
+            }
+        } else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     /** PPG has no placement gate; start immediately instead of showing a 15 s wait screen. */
     private fun preparePpg(pre: Boolean) = beginPpg(pre)
@@ -689,7 +707,9 @@ class ActivityRecordingService : Service() {
         ppgRows = 0
         ppgResults[phase] = "测量中，尚无原始记录"
         deadline = clock() + 30_000
-        notice = "PPG 测量中，请保持静止；最多采集30秒，原始绿/红外/红记录会原样保存。"
+        notice = "PPG：手表正常佩戴即可，不需要调整表带或改变姿势。\n" +
+            "手臂放松，保持静止；检测到正常佩戴后立即开始，无倒数，最多采集30秒。\n" +
+            "原始绿/红外/红记录会原样保存。"
         event("PPG_MEASUREMENT_STARTED", "pre=$pre; deadlineMs=$deadline")
         startSource("PPG_ON_DEMAND"); restartTick()
     }
@@ -700,25 +720,15 @@ class ActivityRecordingService : Service() {
             event("PPG_MEASUREMENT_SAVED", "success=$success; reason=$reason; pre=$ppgPre; rawRows=$ppgRows")
             if(success) { publishSuccess("PPG", "已采集 $ppgRows 条原始记录"); afterPpg() } else {
                 phase = if(ppgPre) "REVIEW_PPG_PRE" else "REVIEW_PPG_POST"
-                notice = "PPG 未取得原始记录（$reason）。已有数据已保存；点重测会立即开始，或跳过继续；80秒不操作则退出。"
+                notice = "PPG 未取得原始记录（$reason）。请确认手表背面贴紧皮肤、表带不过松，手臂保持静止。已有数据已保存；点重测会立即开始，或跳过继续；80秒不操作则退出。"
                 deadline = clock() + 80_000; holdDecisionWindow(); restartTick()
             }
         }
     }
     private fun afterPpg() {
-        if(ppgPre) {
-            if(bia) startBia(true)
-            else if(preSpo2) prepareSpo2(true)
-            else restorePlacement()
-        } else if(postSpo2) prepareSpo2(false)
+        if (ppgPre) beginCore()
+        else if (postSpo2) prepareSpo2(false)
         else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
-    }
-    private fun restorePlacement() {
-            phase = "RESTORE_PRE"; shortSensor = ""; shortBudgetStartMs = 0L
-            notice = "请将手表调回平时运动位置，保持贴合。\n${NO_HAND_AUTOSTART_MS / 1000}秒后自动继续；也可点“已恢复佩戴”。"
-            deadline = clock() + NO_HAND_AUTOSTART_MS
-            event("NORMAL_PLACEMENT_REQUESTED", "autostartMs=$NO_HAND_AUTOSTART_MS; sensorsNotStarted=true")
-            holdDecisionWindow(); restartTick()
     }
     /** Any non-empty raw row from a core source disarms the no-data watchdog. Not a clinical validity judgment. */
     private fun noteCoreData(origin: String, sensor: String, rows: List<Map<String, Any?>>) {
@@ -963,7 +973,9 @@ class ActivityRecordingService : Service() {
                 event("ECG_RAW_INCLUDES_INVALID_SEGMENTS", "rawRows=$ecgTotalRows; acceptedContinuousSamples=${update.continuousSamples()}; all rows retained")
             publishSuccess("ECG", "已取得连续 30 秒记录")
             if (!wasPre) continueAfterPostEcg { beginPostShorts() }
-            else if (next == CapturePhasePolicy.Next.CORE) beginCore() else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+            else if (next == CapturePhasePolicy.Next.CORE) {
+                if (prePpg && !skipPrePpgForVendorLed) beginPpg(true) else beginCore()
+            } else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
         }
     }
     private fun publishSuccess(kind: String, text: String) {
@@ -1140,7 +1152,7 @@ class ActivityRecordingService : Service() {
         buffers.forEach { (sensor, rows) -> if (rows.isNotEmpty()) { appendRows(streamPhase(), sensor, rows); rows.clear() } }
     }
     private fun streamPhase() = when (phase) {
-        "CONNECTING", "WAIT_BIA_PRE", "READY_SPO2_PRE", "READY_PPG_PRE", "RESTORE_PRE" -> "PRE-1"
+        "CONNECTING", "WAIT_BIA_PRE", "READY_SPO2_PRE", "READY_PPG_PRE" -> "PRE-1"
         "WAIT_BIA_POST", "READY_SPO2_POST", "READY_PPG_POST" -> "POST-1"
         "REVIEW_PRE", "REVIEW_POST" -> ecgPhase
         "REVIEW_BIA_PRE", "REVIEW_BIA_POST" -> biaPhase
@@ -1164,7 +1176,6 @@ class ActivityRecordingService : Service() {
     private fun publish() {
         val count = countText()
         val title = when {
-            phase == "RESTORE_PRE" -> "恢复运动佩戴位置"
             shortSensor == "BIA" -> if(biaPre) "活动前 ${biaModeLabel()}" else "活动后 ${biaModeLabel()}"
             shortSensor == "SPO2" -> if(spo2Pre) "活动前血氧 SpO₂" else "活动后血氧 SpO₂"
             shortSensor == "PPG_ON_DEMAND" -> if(ppgPre) "活动前 PPG 100Hz" else "活动后 PPG 100Hz"

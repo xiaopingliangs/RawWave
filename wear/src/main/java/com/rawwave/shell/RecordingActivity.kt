@@ -1,6 +1,7 @@
 package com.rawwave.shell
 
 import android.Manifest
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.*
@@ -17,6 +18,7 @@ import com.rawwave.core.AutoSyncGate
 import com.rawwave.core.SensorCatalog
 import com.rawwave.core.SyncStopScope
 import com.rawwave.designsystem.RwBodyText
+import com.rawwave.designsystem.RwCard
 import com.rawwave.designsystem.RwCheckBox
 import com.rawwave.designsystem.RwDialogs
 import com.rawwave.designsystem.RwGradientTitle
@@ -26,6 +28,7 @@ import com.rawwave.designsystem.RwPrimaryButton
 import com.rawwave.designsystem.RwRadioButton
 import com.rawwave.designsystem.RwSecondaryButton
 import com.rawwave.designsystem.RwSectionHeader
+import com.rawwave.designsystem.RwStackedButton
 import com.rawwave.designsystem.RwStatusPill
 import com.rawwave.designsystem.RwTheme
 import java.io.File
@@ -65,8 +68,9 @@ class RecordingActivity : ComponentActivity() {
         if (start) { syncCycleSeen = true; startPendingSync(ActivitySyncPolicy.OPEN_IDLE_AUTO) }
     }
     private val syncListener: (ProbeApplication.ActivitySyncStatus) -> Unit = syncListener@{ sync ->
-        if (inActivityManagement() && !ActivityRecordingService.state.active) {
+        if (inWatchPage() && !ActivityRecordingService.state.active) {
             if (!sync.running) releaseIdleAfterSync()
+            if (mode == "SYNC_STATUS") showSyncStatus()
             return@syncListener
         }
         syncCycleSeen = true
@@ -208,7 +212,9 @@ class RecordingActivity : ComponentActivity() {
             LinearLayout.LayoutParams.WRAP_CONTENT,
         ))
         guide = HomeKeyGuide(this)
-        body.addView(guide, LinearLayout.LayoutParams(-1, dp(120)))
+        // 84 dp leaves room for the two-line instruction below it on the 480 px round screen;
+        // 120 dp pushed the last instruction line off-screen on the SpO2/BIA placement pages.
+        body.addView(guide, LinearLayout.LayoutParams(-1, dp(84)))
         stepInstruction = RwBodyText(this).apply {
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
             gravity = Gravity.CENTER
@@ -245,8 +251,15 @@ class RecordingActivity : ComponentActivity() {
         if (consumeSyncExit()) { finishAndRemoveTask(); return }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (mode == "EDIT_TEMPLATE") { showActivityManagement(); return }
-                if (mode == "MANAGE_ACTIVITIES") { returnHome(); return }
+                when (mode) {
+                    "EDIT_TEMPLATE" -> { confirmDiscardForm(); return }
+                    "MANAGE_ACTIVITIES" -> { showMorePage(); return }
+                    "DELETE_ACTIVITIES" -> { showActivityManagement(); return }
+                    "HOME_MORE" -> { returnHome(); return }
+                    "REPORT_TOOLS" -> { showMorePage(); return }
+                    "LOCAL_RECORDS" -> { showMorePage(); return }
+                    "SYNC_STATUS" -> { returnHome(); return }
+                }
                 if (ActivityRecordingService.state.active) {
                     // Back is ambiguous while capture is running: make the user choose
                     // between a saved early stop and continuing in the background.
@@ -262,12 +275,27 @@ class RecordingActivity : ComponentActivity() {
         super.onStart(); resumed = true
         ActivityRecordingService.observer = listener
         ActivityRecordingService.successObserver = successListener
+        // A child screen (problem-report export, diagnostics) may have replaced the app-level
+        // observer and cleared it on exit. Re-register before restoring the page.
+        app.activitySyncObserver = syncListener
         if (consumeSyncExit()) { finishAndRemoveTask(); return }
         // A fresh Activity is the user's recovery path: never keep a RELEASING screen that
         // outlived its hold, and never keep a sync page whose session/lease is already gone.
         (application as ProbeApplication).reconcileStaleSyncState()
         ActivityRecordingService.resetStaleReleaseState()
-        if (app.activitySyncStatus.running && !ActivitySyncPolicy.isNonBlockingHomeSync(app.activitySyncStatus.trigger))
+        if (inWatchPage()) {
+            // Returning from a child screen (problem-report export, diagnostics) must restore
+            // the page the user came from, not silently replace it with the home list.
+            when (mode) {
+                "HOME_MORE" -> showMorePage()
+                "MANAGE_ACTIVITIES" -> showActivityManagement()
+                "DELETE_ACTIVITIES" -> showDeleteActivitiesPage()
+                "REPORT_TOOLS" -> showReportToolsPage()
+                "LOCAL_RECORDS" -> showLocalRecords()
+                "SYNC_STATUS" -> showSyncStatus()
+                // EDIT_TEMPLATE keeps the form exactly as the user left it.
+            }
+        } else if (app.activitySyncStatus.running && !ActivitySyncPolicy.isNonBlockingHomeSync(app.activitySyncStatus.trigger))
             renderSync(app.activitySyncStatus)
         else render(ActivityRecordingService.state)
         scheduleAutoSync("ON_START")
@@ -309,7 +337,7 @@ class RecordingActivity : ComponentActivity() {
         return super.dispatchTouchEvent(event)
     }
     private fun render(s: ActivityRecordingService.Companion.State) {
-        if (inActivityManagement() && !s.active) return
+        if (inWatchPage() && !s.active) return
         // The vendor release hold is a bounded 60-second step: the process is about to
         // remove itself so no sensor handle survives the activity. It must always end;
         // a stale RELEASING state is cleared by resetStaleReleaseState() on a fresh open.
@@ -344,11 +372,9 @@ class RecordingActivity : ComponentActivity() {
         val waitingContact = waitingBiaContact || waitingEcgContact
         val shortPhase = s.active && (
             s.phase.startsWith("PRE") || s.phase.startsWith("POST") ||
-                s.phase.startsWith("READY_") || s.phase.startsWith("WAIT_BIA_") ||
-                s.phase == "RESTORE_PRE"
+                s.phase.startsWith("READY_") || s.phase.startsWith("WAIT_BIA_")
             )
         val guideMode = when {
-            s.phase == "RESTORE_PRE" -> "RESTORE"
             s.shortSensor == "BIA" || s.phase.startsWith("WAIT_BIA_") -> "BIA"
             s.shortSensor == "SPO2" -> "SPO2"
             s.shortSensor == "PPG_ON_DEMAND" -> "PPG"
@@ -385,8 +411,7 @@ class RecordingActivity : ComponentActivity() {
                         if (s.biaModeCount > 0) "$name ${s.biaModeNumber}/${s.biaModeCount}" else name
                     }
                     "SPO2" -> if (s.phase.startsWith("READY_")) "血氧 · 准备" else "血氧 · 测量中"
-                    "PPG" -> if (s.phase.startsWith("READY_")) "PPG · 准备" else "PPG · 测量中"
-                    "RESTORE" -> "恢复平时佩戴位置"
+                    "PPG" -> "PPG · 测量中"
                     else -> "测量"
                 }
                 "$title\n${if (contactDetected) "接触已确认，保持不动" else "按下方说明操作"}"
@@ -406,16 +431,15 @@ class RecordingActivity : ComponentActivity() {
                     s.phase == "DRAINING" -> "正在结束采集，请稍候"
                     s.phase.startsWith("REVIEW") -> if (s.shortSensor == "PPG_ON_DEMAND")
                         "可以调整手臂后重测，或跳过继续" else "可以松开手指后重测，或跳过继续"
-                    s.phase == "RESTORE_PRE" -> "恢复平时佩戴位置后继续"
-                    s.shortSensor == "SPO2" -> "手臂放稳，与心脏大致同高\n测量期间保持静止"
+                    s.shortSensor == "SPO2" -> "手表上移到腕骨上方\n表带贴合，手肘放桌\n静止、不说话"
                     s.shortSensor == "BIA" && !s.biaContact && s.biaRetrying ->
                         "上次测量${if(s.biaProgress > 0) "在 ${s.biaProgress}% " else ""}中断（${s.biaHint}）\n请保持双指接触，稍后自动重试"
                     s.shortSensor == "BIA" && !s.biaContact ->
-                        "中指轻触上键、无名指轻触下键\n双手不要相碰，手臂抬起使腋下张开"
+                        "先把手表戴回正常位置\n双臂抬到胸口，腋下张开\n两指轻触上下键，不要相碰"
                     s.shortSensor == "BIA" ->
-                        "保持双指接触，双手不要相碰\n手臂抬起使腋下张开，直至测量完成"
-                    s.shortSensor == "PPG_ON_DEMAND" -> "正常佩戴，保持贴合\n手臂静止，采集30秒"
-                    measuringEcg -> "手指轻触 Home 键，不要按下\n保持接触，手臂静止"
+                        "保持双指接触，双手不要相碰\n双臂抬到胸口，直至测量完成"
+                    s.shortSensor == "PPG_ON_DEMAND" -> "正常佩戴即可，不用调表带\n无倒数，手臂静止采集30秒"
+                    measuringEcg -> "前臂放桌上，指尖盖住上键，不要按\n保持不动，不要说话"
                     s.phase == "CORE-1" -> "正常活动即可\n结束时点击下方按钮"
                     else -> "请稍候"
                 }
@@ -450,12 +474,7 @@ class RecordingActivity : ComponentActivity() {
             } else if (s.shortSensor == "BIA") {
                 button("跳过体成分，继续") { command("SKIP_BIA") }
             } else if (s.phase.startsWith("READY_SPO2_")) {
-                button("已调整好，开始血氧", primary = true) { command("START_SPO2") }
-            } else if (s.phase.startsWith("READY_PPG_")) {
-                button("已调整好，开始 PPG 30秒", primary = true) { command("START_PPG") }
-                button("跳过 PPG，继续") { command("SKIP_PPG") }
-            } else if (s.phase == "RESTORE_PRE") {
-                button("已恢复佩戴，继续", primary = true) { command("PLACEMENT_READY") }
+                button("手已放好，开始血氧", primary = true) { command("START_SPO2") }
             } else if (s.phase.startsWith("REVIEW_SPO2")) {
                 // Skip first: a failed retry must not trap the user in the review page.
                 button("跳过血氧，继续", primary = true) { command("SKIP_SPO2") }
@@ -495,6 +514,7 @@ class RecordingActivity : ComponentActivity() {
     private fun showHome() {
         // showHome() is called from render() and from recovery paths. Always rebuild the
         // list here; appending to a previous list produced a duplicate exit button.
+        mode = ""
         controls.removeAllViews()
         try {
             val store = ActivityRecordingService.store(this)
@@ -503,42 +523,83 @@ class RecordingActivity : ComponentActivity() {
             val latestUnsealed = try {
                 store.history().firstOrNull()?.contains("未封存/") == true
             } catch (_: Exception) { false }
-            val statusNeedsAction = !sync.running &&
-                (pendingSync > 0 || latestUnsealed || (sync.text.isNotBlank() && !sync.success))
             hideHomeChrome()
             val templates = orderedTemplates(store.templates())
             if (templates.isEmpty()) {
                 button("新建活动", primary = true) { createForm() }
             } else {
+                if (templates.size > 1) {
+                    label("长按活动可拖动排序", controls).apply {
+                        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+                        setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+                    }
+                }
                 templates.forEachIndexed { index, template ->
                     activityButton(template, primary = index == 0, reorderable = templates.size > 1)
                 }
             }
             if (filesDir.usableSpace < 1_000_000_000L) label("存储不足1GB，请清理不需要的软件。原始数据尚未同步，请勿卸载原波。", controls)
-            button("更多") { showMoreMenu() }
-            button(syncButtonText(sync, pendingSync, latestUnsealed), primary = statusNeedsAction) {
-                // A tap on the home sync button means "sync now", not "stop". If a bounded
-                // sync is already running, startPendingSync asks it to stop and retries.
-                if (pendingSync > 0) startPendingSync(ActivitySyncPolicy.USER_MANUAL)
-                else if (sync.running) app.requestStopBackgroundSync("WATCH_SYNC_STOP_BUTTON")
-                else if (latestUnsealed) showLocalHistory()
-                else startPendingSync(ActivitySyncPolicy.USER_MANUAL)
-            }
-            if (!sync.running && !sync.success && sync.text.isNotBlank())
-                label("上次同步：${sync.text.take(120)}", controls)
-            if (!sync.running && pendingSync > 0 && !isBatteryExempt())
-                button("允许后台运行") { showBackgroundPermission() }
-            // A direct shortcut: sending a problem report must not require a second menu.
-            button("发送报告到手机") { openReportAction("send") }
-            button("退出") {
-                app.requestStopBackgroundSync("WATCH_EXPLICIT_EXIT_BUTTON")
-                finishAndRemoveTask()
-            }
+            button("更多") { showMorePage() }
+            button("发送问题报告到手机") { sendReportToPhone() }
+            stackedButton("同步状态", syncButtonText(sync, pendingSync, latestUnsealed)) { showSyncStatus() }
+            button("完全退出") { exitWatchCompletely() }
         } catch (e: Exception) {
             status.visibility = View.VISIBLE
             status.text = "读取活动失败：${e.message}。请保留数据并导出问题报告。"
         }
         scheduleAutoSync("HOME_RENDERED")
+    }
+
+    private fun startActivityDrag(source: View, template: ActivityStore.Template) {
+        cancelAutoSync("DRAG_ORDER")
+        val clip = ClipData.newPlainText("activity-order", template.id())
+        try {
+            source.startDragAndDrop(clip, View.DragShadowBuilder(source), null, 0)
+        } catch (_: Exception) {
+            // A device that refuses drag-and-drop keeps the tap-to-start action intact.
+        }
+    }
+
+    private fun dragListenerFor(target: ActivityStore.Template) = View.OnDragListener { view, event ->
+        when (event.action) {
+            DragEvent.ACTION_DRAG_STARTED -> true
+            DragEvent.ACTION_DRAG_ENTERED -> {
+                view.alpha = 0.55f
+                true
+            }
+            DragEvent.ACTION_DRAG_EXITED -> {
+                view.alpha = 1f
+                true
+            }
+            DragEvent.ACTION_DROP -> {
+                view.alpha = 1f
+                val dragged = event.clipData?.getItemAt(0)?.text?.toString()
+                if (!dragged.isNullOrBlank() && dragged != target.id()) {
+                    val ids = try {
+                        orderedTemplates(ActivityRecordingService.store(this).templates()).map { it.id() }
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    val from = ids.indexOf(dragged)
+                    val to = ids.indexOf(target.id())
+                    if (from >= 0 && to >= 0) {
+                        val moved = ActivityOrder.move(ids, dragged, to - from)
+                        orderPrefs().edit().putString("ids", moved.joinToString(",")).apply()
+                        try {
+                            app.journal?.event("ACTIVITY_ORDER_DRAGGED",
+                                mapOf("from" to from, "to" to to, "count" to moved.size))
+                        } catch (_: Exception) {}
+                        view.post { returnHome() }
+                    }
+                }
+                true
+            }
+            DragEvent.ACTION_DRAG_ENDED -> {
+                view.alpha = 1f
+                true
+            }
+            else -> true
+        }
     }
 
     private fun syncButtonText(sync: ProbeApplication.ActivitySyncStatus, pendingSync: Int, latestUnsealed: Boolean): String = when {
@@ -559,10 +620,18 @@ class RecordingActivity : ComponentActivity() {
     private fun activityButton(template: ActivityStore.Template, primary: Boolean, reorderable: Boolean) {
         val view = if (primary) RwPrimaryButton(this) else RwSecondaryButton(this)
         view.text = template.name()
+        view.contentDescription = if (reorderable)
+            "${template.name()}，点击开始，长按后拖动可调整顺序"
+        else "${template.name()}，点击开始"
         view.setOnClickListener { cancelAutoSync("OPEN_ACTIVITY"); prepare(template) }
-        if (reorderable) view.setOnLongClickListener {
-            showReorder(template)
-            true
+        if (reorderable) {
+            // Long-press starts a real drag; the old "move up/down" dialog is gone so the
+            // list itself is the order editor the user asked for.
+            view.setOnLongClickListener {
+                startActivityDrag(it, template)
+                true
+            }
+            view.setOnDragListener(dragListenerFor(template))
         }
         controls.addView(view, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -580,41 +649,116 @@ class RecordingActivity : ComponentActivity() {
         return ActivityOrder.apply(all.map { it.id() }, savedOrder()).mapNotNull { byId[it] }
     }
 
-    private fun showReorder(template: ActivityStore.Template) {
-        val templates = orderedTemplates(ActivityRecordingService.store(this).templates())
-        val index = templates.indexOfFirst { it.id() == template.id() }
-        if (index < 0 || templates.size < 2) return
-        val ids = templates.map { it.id() }
-        val actions = mutableListOf<RwDialogs.Action>()
-        if (index > 0) actions.add(RwDialogs.Action("上移") { moveTemplate(ids, template.id(), -1) })
-        actions.add(RwDialogs.Action("置顶") { moveTemplate(ids, template.id(), -index) })
-        if (index < templates.size - 1) actions.add(RwDialogs.Action("下移") { moveTemplate(ids, template.id(), 1) })
-        actions.add(RwDialogs.Action("置底") { moveTemplate(ids, template.id(), templates.size - 1 - index) })
-        RwDialogs.actions(this, template.name(), "调整顺序", actions, cancelLabel = "关闭")
+    private fun pageHeader(title: String) {
+        // Child pages are for browsing and editing. The 80-second home idle deadline must not
+        // close the task while the user is reading a page or filling in the activity form.
+        idle?.close(); idle = null
+        hideTimer()
+        val colors = RwTheme.colors(this)
+        measurementHeader.visibility = View.VISIBLE
+        measurementHeader.text = title
+        measurementHeader.textSize = 27f
+        measurementHeader.setTextColor(colors.onSurface)
+        guide.visibility = View.GONE
+        guide.animateContact = false
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        status.visibility = View.GONE
+        controls.removeAllViews()
+        // A secondary page opened from a scrolled home kept the old offset and started halfway
+        // down, hiding its title. Every page starts at the top.
+        topPane.post { topPane.scrollTo(0, 0) }
     }
 
-    private fun moveTemplate(ids: List<String>, id: String, delta: Int) {
-        orderPrefs().edit().putString("ids", ActivityOrder.move(ids, id, delta).joinToString(",")).apply()
-        mode = ""
-        render(ActivityRecordingService.state)
+    private fun showMorePage() {
+        if (ActivityRecordingService.state.active) return
+        cancelAutoSync("MORE_PAGE")
+        ensureIdle()
+        mode = "HOME_MORE"
+        pageHeader("更多")
+        button("活动管理") { showActivityManagement() }
+        button("问题报告工具") { showReportToolsPage() }
+        button("本地记录") { showLocalRecords() }
+        button("返回首页") { returnHome() }
     }
 
-    private fun showMoreMenu() {
-        RwDialogs.actions(
-            this,
-            "更多",
-            null,
-            listOf(
-                RwDialogs.Action("活动管理") { showActivityManagement() },
-                RwDialogs.Action("问题报告工具") { showReportTools() },
-                RwDialogs.Action("查看本地记录") { showLocalHistory() },
-                RwDialogs.Action("退出") {
-                    app.requestStopBackgroundSync("WATCH_EXPLICIT_EXIT_BUTTON")
-                    finishAndRemoveTask()
-                },
-            ),
-            cancelLabel = "关闭",
-        )
+    private fun showSyncStatus() {
+        if (ActivityRecordingService.state.active) return
+        cancelAutoSync("SYNC_STATUS_PAGE")
+        ensureIdle()
+        mode = "SYNC_STATUS"
+        pageHeader("同步状态")
+        val sync = app.activitySyncStatus
+        val pending = pendingSyncCount()
+        val latestUnsealed = try {
+            ActivityRecordingService.store(this).history().firstOrNull()?.contains("未封存/") == true
+        } catch (_: Exception) { false }
+        val summary = buildString {
+            append("当前：")
+            append(when {
+                sync.running -> "同步中"
+                pending > 0 -> "待同步 $pending 次"
+                latestUnsealed -> "上次未完整封存"
+                sync.text.isNotBlank() && !sync.success -> "上次同步未完成"
+                else -> "已全部同步"
+            })
+            if (sync.text.isNotBlank()) append("\n${sync.text}")
+        }
+        val summaryCard = RwCard(this)
+        summaryCard.addView(RwBodyText(this).apply {
+            text = summary
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTextColor(RwTheme.colors(this@RecordingActivity).onSurface)
+            setLineSpacing(dp(2).toFloat(), 1f)
+        })
+        controls.addView(summaryCard, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(4) })
+        val actionLabel: String
+        val actionPrimary: Boolean
+        val action: () -> Unit
+        if (sync.running) {
+            actionLabel = "停止同步"
+            actionPrimary = true
+            action = { app.requestStopBackgroundSync("WATCH_SYNC_STOP_BUTTON") }
+        } else if (pending > 0) {
+            actionLabel = "立即同步"
+            actionPrimary = true
+            action = { startPendingSync(ActivitySyncPolicy.USER_MANUAL) }
+        } else {
+            actionLabel = "重新检查"
+            actionPrimary = false
+            action = { showSyncStatus() }
+        }
+        // Two stacked buttons plus the summary never fit on the first screen; the row keeps the
+        // action and the way back visible without hiding the explanation below the fold.
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val actionView = if (actionPrimary) RwPrimaryButton(this) else RwSecondaryButton(this)
+        actionView.text = actionLabel
+        actionView.setSingleLine(true)
+        // Half-width buttons: the default 16-24 dp side padding clipped the last character.
+        actionView.setPadding(dp(8), dp(6), dp(8), dp(6))
+        actionView.setOnClickListener { cancelAutoSync("SYNC_ROW_$actionLabel"); action() }
+        val backView = RwSecondaryButton(this).apply {
+            text = "返回首页"
+            setSingleLine(true)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setOnClickListener { cancelAutoSync("SYNC_ROW_BACK"); returnHome() }
+        }
+        row.addView(actionView, LinearLayout.LayoutParams(0, dp(48), 1f))
+        row.addView(backView, LinearLayout.LayoutParams(0, dp(48), 1f).apply { leftMargin = dp(6) })
+        controls.addView(row, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(8) })
+        if (!sync.running && pending > 0 && !isBatteryExempt())
+            button("允许后台运行") { showBackgroundPermission() }
+        // The explanation is secondary: keep it below the actions so the first screen always
+        // shows what can be done, even when the sync line above grows.
+        label("手机校验后，手表才会标记已同步。", controls).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+        }
     }
 
     private fun showActivityManagement() {
@@ -622,54 +766,163 @@ class RecordingActivity : ComponentActivity() {
         cancelAutoSync("MANAGE_ACTIVITIES")
         ensureIdle()
         mode = "MANAGE_ACTIVITIES"
-        hideTimer()
-        measurementHeader.visibility = View.VISIBLE
-        measurementHeader.text = "活动管理"
-        measurementHeader.textSize = 28f
-        measurementHeader.setTextColor(RwTheme.colors(this).onSurface)
-        guide.visibility = View.GONE; guide.animateContact = false
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        status.visibility = View.GONE
-        controls.removeAllViews()
-        button("创建活动", primary = true) { createForm() }
+        pageHeader("活动管理")
+        button("新增活动", primary = true) { createForm() }
+        button("修改活动") { showEditPicker() }
+        button("删除活动") { showDeleteActivitiesPage() }
         try {
             val templates = orderedTemplates(ActivityRecordingService.store(this).templates())
-            if (templates.isEmpty()) label("还没有活动", controls)
-            templates.forEach { template ->
-                controls.addView(RwSecondaryButton(this).apply {
-                    text = template.name()
-                    setOnClickListener { createForm(template) }
-                }, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = dp(6) })
-                label(summaryFor(template), controls)
+            if (templates.isEmpty()) {
+                label("还没有活动。请先点“新增活动”。", controls)
+            } else {
+                label("现有活动", controls).apply {
+                    setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+                }
+                templates.forEach { template ->
+                    val card = RwCard(this)
+                    card.addView(RwBodyText(this).apply {
+                        text = template.name()
+                        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15f)
+                        typeface = RwTheme.boldTypeface()
+                        setTextColor(RwTheme.colors(this@RecordingActivity).onSurface)
+                    })
+                    card.addView(RwBodyText(this).apply {
+                        text = summaryFor(template)
+                        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                        setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+                        setPadding(0, dp(4), 0, 0)
+                    })
+                    controls.addView(card, LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { topMargin = dp(8) })
+                }
             }
         } catch (e: Exception) {
             status.visibility = View.VISIBLE
             status.text = "读取活动失败：${e.message}。请保留数据并导出问题报告。"
         }
-        button("返回主页") { returnHome() }
+        button("返回上一页") { showMorePage() }
+    }
+
+    private fun showEditPicker() {
+        if (ActivityRecordingService.state.active) return
+        val templates = try {
+            orderedTemplates(ActivityRecordingService.store(this).templates())
+        } catch (e: Exception) {
+            status.visibility = View.VISIBLE
+            status.text = "读取活动失败：${e.message}"
+            return
+        }
+        if (templates.isEmpty()) {
+            RwDialogs.message(this, "修改活动", "还没有活动。请先新增一个活动。", confirmLabel = "知道了")
+            return
+        }
+        RwDialogs.actions(
+            this,
+            "修改活动",
+            "选择要修改的活动",
+            templates.map { template ->
+                RwDialogs.Action(template.name()) { createForm(template) }
+            },
+            cancelLabel = "返回",
+        )
+    }
+
+    private fun showDeleteActivitiesPage() {
+        if (ActivityRecordingService.state.active) return
+        cancelAutoSync("DELETE_ACTIVITIES")
+        ensureIdle()
+        mode = "DELETE_ACTIVITIES"
+        pageHeader("删除活动")
+        val templates = try {
+            orderedTemplates(ActivityRecordingService.store(this).templates())
+        } catch (e: Exception) {
+            status.visibility = View.VISIBLE
+            status.text = "读取活动失败：${e.message}"
+            button("返回上一页") { showActivityManagement() }
+            return
+        }
+        if (templates.isEmpty()) {
+            label("还没有活动。", controls)
+            button("返回上一页", primary = true) { showActivityManagement() }
+            return
+        }
+        label("勾选要删除的活动。已采集的历史数据会保留。", controls).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+        }
+        val boxes = mutableListOf<Pair<ActivityStore.Template, RwCheckBox>>()
+        templates.forEach { template ->
+            val box = RwCheckBox(this).apply {
+                text = template.name()
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f)
+                minHeight = dp(52)
+                setPadding(0, dp(6), 0, dp(6))
+            }
+            boxes += template to box
+            controls.addView(box)
+        }
+        button("删除所选并返回", primary = true) {
+            val chosen = boxes.filter { it.second.isChecked }.map { it.first }
+            if (chosen.isEmpty()) {
+                RwDialogs.message(this, "还没有选择", "请先勾选要删除的活动。", confirmLabel = "知道了")
+                return@button
+            }
+            RwDialogs.confirm(
+                this,
+                "删除活动",
+                "删除 ${chosen.size} 个活动？已采集的历史数据保留。",
+                confirmLabel = "删除",
+                cancelLabel = "取消",
+            ) {
+                try {
+                    val store = ActivityRecordingService.store(this)
+                    chosen.forEach { store.deleteTemplate(it.id()) }
+                    showActivityManagement()
+                } catch (e: Exception) {
+                    status.visibility = View.VISIBLE
+                    status.text = "删除失败：${e.message}"
+                }
+            }
+        }
+        button("返回上一页") { showActivityManagement() }
     }
 
     private fun summaryFor(t: ActivityStore.Template): String {
+        // Listed in execution order: SpO2 first (watch above the wrist bone), then everything
+        // that runs on the normal position, so the listed order matches what the user does.
         val pre = listOfNotNull(
-            if (t.preEcg()) "ECG" else null,
             if (t.preSpo2()) "血氧" else null,
-            if (t.prePpg()) "PPG 100Hz" else null,
             if (t.bia()) (when { t.biaBoth() -> "体成分+多频阻抗"; t.mfBia() -> "多频阻抗"; else -> "体成分" }) else null,
+            if (t.preEcg()) "ECG" else null,
+            if (t.prePpg()) "PPG 100Hz" else null,
         ).joinToString("、").ifEmpty { "无" }
         val during = t.coreSources().joinToString("、", transform = ::sensorLabel).ifEmpty { "无" }
+        // Post runs ECG -> PPG -> SpO2: SpO2 is last because it is the only post measurement
+        // that needs the watch moved above the wrist bone, and the session ends afterwards.
         val post = listOfNotNull(
             if (t.postEcg()) "ECG" else null,
-            if (t.postSpo2()) "血氧" else null,
             if (t.postPpg()) "PPG 100Hz" else null,
+            if (t.postSpo2()) "血氧" else null,
         ).joinToString("、").ifEmpty { "无" }
         return "活动前：$pre\n活动中：$during\n活动后：$post"
     }
 
+    private fun confirmDiscardForm() {
+        RwDialogs.confirm(
+            this,
+            "放弃这次填写？",
+            "返回后内容不会保存。",
+            confirmLabel = "放弃",
+            cancelLabel = "继续编辑",
+        ) { showActivityManagement() }
+    }
+
     private fun createForm(existing: ActivityStore.Template? = null) {
         cancelAutoSync("EDIT_TEMPLATE")
+        idle?.close(); idle = null
         mode = "EDIT_TEMPLATE"
         hideTimer()
         val colors = RwTheme.colors(this)
@@ -801,17 +1054,48 @@ class RecordingActivity : ComponentActivity() {
         val postEcg = check("ECG 30秒", existing?.postEcg() ?: true)
         val postSpo2 = check("血氧 SpO₂（最多30秒）", existing?.postSpo2() ?: false)
         val postPpg = check("PPG 100Hz 30秒", existing?.postPpg() ?: false)
+        val allChecks = listOf(
+            preEcg, preSpo2, prePpg, bia, mfBia, biaBoth,
+            postEcg, postSpo2, postPpg,
+        ) + choices.values
+        val selectAll = RwCheckBox(this).apply {
+            text = "全选"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(0, dp(4), 0, dp(8))
+            setOnCheckedChangeListener { _, checked ->
+                allChecks.forEach { if (it.isEnabled) it.isChecked = checked }
+            }
+        }
+        // The form-level "全选" sits above every field so it selects the whole form,
+        // not just the sensor list that happens to be under it.
+        controls.addView(selectAll)
         section("活动名称")
         controls.addView(name, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
         section("活动前")
-        controls.addView(preEcg); controls.addView(preSpo2); controls.addView(prePpg)
+        // Execution order: SpO2 first because it is the only pre measurement that needs the
+        // watch moved above the wrist bone. The user restores the normal position once, then
+        // BIA/MF-BIA, ECG and PPG run without any further watch adjustment, so the activity
+        // starts from the normal position.
+        controls.addView(preSpo2)
         controls.addView(bia); controls.addView(mfBia); controls.addView(biaBoth)
         controls.addView(profileBox)
+        controls.addView(preEcg)
+        controls.addView(prePpg)
+        label("顺序：血氧 → 体成分 → ECG → PPG。血氧要先把表上移到腕骨上方，测完戴回正常位置，之后不用再动表。", controls).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+        }
         section("活动中")
         choices.values.forEach { controls.addView(it) }
         section("活动后")
-        controls.addView(postEcg); controls.addView(postSpo2); controls.addView(postPpg)
-        button(if (existing == null) "保存活动" else "保存修改", primary = true) {
+        // Execution order: ECG -> PPG (normal position) -> SpO2 (watch above the wrist bone).
+        // SpO2 is last so the one strap change happens at the very end of the session.
+        controls.addView(postEcg); controls.addView(postPpg); controls.addView(postSpo2)
+        label("顺序：ECG → PPG → 血氧。血氧把手表上移到腕骨上方，测完直接结束，不用再戴回。", controls).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+        }
+        button("保存并返回", primary = true) {
             try {
                 val profile = if (bia.isChecked) com.rawwave.core.BiaProfile(
                     height.text.toString().trim().toFloatOrNull() ?: error("请填写身高（厘米）"),
@@ -830,63 +1114,163 @@ class RecordingActivity : ComponentActivity() {
                     preSpo2.isChecked, postSpo2.isChecked, profile,
                     bia.isChecked && mfBia.isChecked, bia.isChecked && biaBoth.isChecked,
                     prePpg.isChecked, postPpg.isChecked)
-                if (profile != null) check(savedProfile.edit().putFloat("height", profile.heightCm())
-                    .putFloat("weight", profile.weightKg()).putInt("age", profile.age()).putInt("gender", profile.gender()).commit()) {
-                    "活动已保存，但个人资料复用设置保存失败，请重试"
+                if (profile != null) {
+                    val remembered = savedProfile.edit().putFloat("height", profile.heightCm())
+                        .putFloat("weight", profile.weightKg()).putInt("age", profile.age())
+                        .putInt("gender", profile.gender()).commit()
+                    if (!remembered) try {
+                        app.journal?.event("BIA_PROFILE_REMEMBER_FAILED", mapOf("reason" to "commit_failed"))
+                    } catch (_: Exception) {}
                 }
                 showActivityManagement()
             } catch (e: Exception) {
-                status.visibility = View.VISIBLE
-                status.text = "保存失败：${e.message}"
+                val reason = e.message?.takeIf { it.isNotBlank() } ?: "请检查填写内容后重试。"
+                RwDialogs.message(this, "没有保存", reason, confirmLabel = "继续编辑")
             }
         }
         if (existing != null) button("删除活动") { deleteTemplate(existing) }
-        button("返回") { showActivityManagement() }
+        button("返回上一页") { confirmDiscardForm() }
     }
 
-    private fun showReportTools() {
-        RwDialogs.actions(
+    private fun showReportToolsPage() {
+        if (ActivityRecordingService.state.active) return
+        cancelAutoSync("REPORT_TOOLS")
+        ensureIdle()
+        mode = "REPORT_TOOLS"
+        pageHeader("问题报告工具")
+        button("记录问题现场", primary = true) { recordProblemScene() }
+        button("离线诊断详情") { DiagnosticViewer.show(this, app) }
+        button("导出问题报告到手表") { exportReportToWatch() }
+        button("返回上一页") { showMorePage() }
+    }
+
+    /** Save the same symptom checklist on the watch, so both devices contribute comparable evidence. */
+    private fun recordProblemScene() {
+        RwDialogs.checklist(
             this,
-            "问题报告工具",
-            "一键发送在上一级；这里只放现场记录和诊断",
-            listOf(
-                RwDialogs.Action("记录问题现场") { openReportAction("record") },
-                RwDialogs.Action("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) },
-                RwDialogs.Action("传感器注册测试（light_cct / HR A/B）") {
-                    idle?.close(); idle = null
-                    startActivity(Intent(this, SensorProbeActivity::class.java))
-                },
-                RwDialogs.Action("导出问题报告") { openReportAction("export") },
-                RwDialogs.Action("仅接收问题报告") {
-                    idle?.close(); idle = null
-                    startActivity(Intent(this, ProbeActivity::class.java)); finish()
-                },
-            ),
-            cancelLabel = "返回",
-        )
+            "记录问题现场",
+            "可多选；保存后会写进问题报告，不会改动活动原始数据",
+            ProblemCapture.labels,
+            BooleanArray(ProblemCapture.labels.size),
+            confirmLabel = "保存到问题报告",
+        ) { checked ->
+            val selected = ProblemCapture.keys.filterIndexed { index, _ -> checked[index] }
+            try {
+                val recorded = ProblemCapture.record(app, selected)
+                RwDialogs.message(
+                    this,
+                    "已记录问题现场",
+                    "ID ${recorded.captureId.take(8)}\n" +
+                        "症状：${selected.joinToString("、").ifEmpty { "未选择" }}\n\n" +
+                        "发送问题报告到手机或导出问题报告时会包含此记录。",
+                    confirmLabel = "知道了",
+                )
+            } catch (e: Exception) {
+                status.visibility = View.VISIBLE
+                status.text = "问题现场没有保存成功：${e.message}\n请拍照保留此页。"
+            }
+        }
     }
 
-    private fun openReportAction(action: String) {
+    private fun sendReportToPhone() {
         idle?.close(); idle = null
-        startActivity(Intent(this, ProbeActivity::class.java).putExtra("autoAction", action))
+        startActivity(Intent(this, ProbeActivity::class.java).putExtra("autoAction", "send"))
         finish()
     }
 
-    private fun showLocalHistory() {
-        val history = try {
-            ActivityRecordingService.store(this).history().joinToString("\n\n")
-        } catch (e: Exception) {
-            "读取活动失败：${e.message}"
-        }
-        RwDialogs.message(
-            this,
-            "本地记录",
-            history.ifEmpty { "还没有活动记录" },
-            confirmLabel = "知道了",
+    /**
+     * Full exit: stop the active capture (which seals data and releases the vendor sensor /
+     * LED through the existing background release) and stop any sync, then close the task.
+     */
+    private fun exitWatchCompletely() {
+        val captureActive = ActivityRecordingService.state.active
+        try {
+            app.journal?.event("WATCH_FULL_EXIT", mapOf(
+                "captureActive" to captureActive,
+                "syncRunning" to app.activitySyncStatus.running,
+            ))
+        } catch (_: Exception) {}
+        if (captureActive) command("CANCEL")
+        app.requestStopBackgroundSync("WATCH_FULL_EXIT")
+        cancelAutoSync("FULL_EXIT")
+        idle?.close(); idle = null
+        guide.animateContact = false
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        finishAndRemoveTask()
+    }
+
+    /**
+     * Export on the watch and come back here. ProbeActivity finishes itself after the result
+     * dialog when returnOnDone is set; onStart() restores this page instead of the home list.
+     */
+    private fun exportReportToWatch() {
+        idle?.close(); idle = null
+        startActivity(
+            Intent(this, ProbeActivity::class.java)
+                .putExtra("autoAction", "export")
+                .putExtra("returnOnDone", true),
         )
     }
+
+    private fun showLocalRecords() {
+        if (ActivityRecordingService.state.active) return
+        cancelAutoSync("LOCAL_RECORDS")
+        ensureIdle()
+        mode = "LOCAL_RECORDS"
+        pageHeader("本地记录")
+        val records = try {
+            ActivityRecordingService.store(this).historyRecords()
+        } catch (e: Exception) {
+            status.visibility = View.VISIBLE
+            status.text = "读取活动失败：${e.message}"
+            emptyList()
+        }
+        if (records.isEmpty()) {
+            label("还没有活动记录。", controls)
+        } else {
+            label("按活动开始时间倒序", controls).apply {
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+            }
+            records.forEach { record ->
+                val card = RwCard(this)
+                card.addView(RwBodyText(this).apply {
+                    text = record.activityName
+                    setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15f)
+                    typeface = RwTheme.boldTypeface()
+                    setTextColor(RwTheme.colors(this@RecordingActivity).onSurface)
+                })
+                card.addView(RwBodyText(this).apply {
+                    // The date and the seal state do not fit on one 122 dp line; a forced break
+                    // keeps "已封存" from splitting into "… · 已" + "封存" on every row.
+                    text = recordTimeText(record.createdUtcMs) +
+                        if (record.sealed) "\n已封存" else "\n未封存"
+                    setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setTextColor(RwTheme.colors(this@RecordingActivity).onSurfaceVariant)
+                    setPadding(0, dp(4), 0, 0)
+                })
+                controls.addView(card, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(8) })
+            }
+        }
+        button("返回上一页") { showMorePage() }
+    }
+
+    private fun recordTimeText(utcMs: Long): String {
+        val zone = java.time.ZoneId.systemDefault()
+        val time = java.time.Instant.ofEpochMilli(utcMs).atZone(zone)
+        val clock = time.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+        return if (time.toLocalDate() == java.time.LocalDate.now(zone)) {
+            "今天 $clock"
+        } else {
+            time.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+        }
+    }
+
     private fun renderSync(sync: ProbeApplication.ActivitySyncStatus) {
-        if (inActivityManagement()) return
+        if (inWatchPage()) return
         cancelAutoSync("SYNC_RUNNING")
         if (sync.running) holdIdleForSync() else ensureIdle()
         measurementHeader.visibility = View.VISIBLE
@@ -965,7 +1349,7 @@ class RecordingActivity : ComponentActivity() {
         }
     }
     private fun scheduleAutoSync(origin: String) {
-        if (inActivityManagement()) return
+        if (inWatchPage()) return
         if (syncCycleSeen) return
         if (!app.activitySyncAttemptGuard.allowOpenAutoSync()) {
             try { app.journal?.event("ACTIVITY_OPEN_AUTO_SYNC_SUPPRESSED", mapOf(
@@ -987,7 +1371,12 @@ class RecordingActivity : ComponentActivity() {
             app.journal?.event("ACTIVITY_AUTO_SYNC_CANCELLED", mapOf("reason" to reason))
         } catch (_: Exception) {}
     }
-    private fun inActivityManagement() = mode == "EDIT_TEMPLATE" || mode == "MANAGE_ACTIVITIES"
+    private fun inWatchPage() = mode in setOf(
+        "HOME_MORE", "MANAGE_ACTIVITIES", "EDIT_TEMPLATE", "DELETE_ACTIVITIES",
+        "REPORT_TOOLS", "LOCAL_RECORDS", "SYNC_STATUS",
+    )
+    private fun inActivityManagement() =
+        mode in setOf("EDIT_TEMPLATE", "MANAGE_ACTIVITIES", "DELETE_ACTIVITIES")
     private fun returnHome() { mode = ""; render(ActivityRecordingService.state) }
     private fun deleteTemplate(template: ActivityStore.Template) {
         RwDialogs.confirm(
@@ -1020,7 +1409,12 @@ class RecordingActivity : ComponentActivity() {
             val t = pending; pending = null
             val allGranted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
             if (t != null && allGranted) start(t)
-            else status.text = "未获得所需权限，本次没有开始。允许所需权限后可重新开始。"
+            else RwDialogs.message(
+                this,
+                "没有开始活动",
+                "未获得所需权限，本次没有开始。\n允许权限后可以重新点这个活动；如果不再弹出授权，请到系统设置里允许原波。",
+                confirmLabel = "知道了",
+            )
         }
     }
     private fun start(t: ActivityStore.Template, retry: Int = 0) {
@@ -1045,7 +1439,11 @@ class RecordingActivity : ComponentActivity() {
             status.text = "正在开始，请稍候…"
             controls.removeAllViews()
             startForegroundService(Intent(this, ActivityRecordingService::class.java).setAction("START").putExtra("template", t.id()))
-        } catch (e: Exception) { mode = ""; render(ActivityRecordingService.state); status.text = "无法开始：${e.message}" }
+        } catch (e: Exception) { mode = ""; render(ActivityRecordingService.state); RwDialogs.message(
+            this, "没有开始活动",
+            e.message?.takeIf { it.isNotBlank() } ?: "请稍后重试；现有数据不会受影响。",
+            confirmLabel = "知道了",
+        ) }
     }
     private fun permissionsFor(t: ActivityStore.Template): List<String> {
         val result = linkedSetOf<String>()
@@ -1123,6 +1521,9 @@ class RecordingActivity : ComponentActivity() {
     }
     private fun ensureIdle() {
         if (ActivityRecordingService.state.active) return
+        // Home may close itself after inactivity; a child page must not disappear while the
+        // user is reading it or editing a form. The explicit 完全退出 button remains available.
+        if (inWatchPage()) { idle?.close(); idle = null; return }
         if (app.activitySyncStatus.running) { holdIdleForSync(); return }
         val current = idle
         if (current == null || current.isClosed()) idleRuntime() else current.resumeIdle()
@@ -1168,30 +1569,31 @@ class RecordingActivity : ComponentActivity() {
         if (seconds <= 0) return ""
         return when {
             s.phase.startsWith("READY_SPO2") -> "准备血氧 · ${seconds} 秒后自动开始"
-            s.phase.startsWith("READY_PPG") -> "准备 PPG · ${seconds} 秒后自动开始"
             s.phase.startsWith("WAIT_BIA") -> "接触中断 · ${seconds} 秒后自动重试"
-            s.phase == "RESTORE_PRE" -> "恢复佩戴 · ${seconds} 秒后自动继续"
             mode == "ECG" && !contact -> "等待接触 · ${seconds} 秒后停止"
             else -> "剩余 ${seconds} 秒"
         }
     }
 
+    // Keep every guide instruction to two short lines: on the 480 px screen the countdown and
+    // the 84 dp animation leave room for exactly two lines before the round edge cuts text.
     private fun instructionsFor(s: ActivityRecordingService.Companion.State, mode: String, contact: Boolean): String =
         when (mode) {
             "ECG" -> if (contact)
-                "已检测到接触\n手臂放稳，保持接触\n不要滑动，直到倒计时结束"
+                "已检测到接触\n手臂放稳，不要说话"
             else
-                "食指轻触 Home 键，不要按下\n手臂放稳，另一只手不要碰表框\n保持接触，不要滑动"
+                "前臂放桌，指尖盖住上键\n手指不要碰表框，保持不动"
             "BIA" -> {
+                // Two modes add an item line above; keep the instruction to one line then, so the
+                // guide still fits inside the round screen (the finger hint is the canvas caption).
                 val item = if (s.biaModeCount > 1) "第 ${s.biaModeNumber}/${s.biaModeCount} 项：${s.biaMode.ifBlank { "体成分" }}\n" else ""
                 item + if (contact)
-                    "双指接触已确认\n两指不要相触，双手不要相碰\n保持不动，直到测量完成"
+                    if (s.biaModeCount > 1) "双指已接触，保持不动" else "双指接触已确认\n保持不动，不要说话"
                 else
-                    "手表上移贴紧，手臂抬起\n中指上键、无名指下键\n两指不相触，双手不相碰"
+                    if (s.biaModeCount > 1) "戴回正常位置，双臂抬到胸口" else "手表戴回正常位置\n双臂抬到胸口，两指触键"
             }
-            "SPO2" -> "手表上移贴紧，手肘放桌上\n手腕靠近心脏，保持静止\n不要说话或移动"
-            "PPG" -> "正常佩戴并贴紧\n手臂放稳，保持静止\n采集 30 秒后自动继续"
-            "RESTORE" -> "移回平时佩戴位置\n表带贴紧，保持不动\n倒计时结束后自动继续"
+            "SPO2" -> "手表上移到腕骨上方\n表带贴合，手肘放桌"
+            "PPG" -> "正常佩戴，手臂放稳\n无倒数，采集30秒后继续"
             else -> ""
         }
 
@@ -1211,6 +1613,22 @@ class RecordingActivity : ComponentActivity() {
         val view = if (primary) RwPrimaryButton(this) else RwSecondaryButton(this)
         view.text = text
         view.setOnClickListener { cancelAutoSync("BUTTON_${text.take(40)}"); action() }
+        controls.addView(
+            view,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(6) },
+        )
+    }
+    /** Action plus a second line of live state; the watch is too narrow for "名称 · 状态". */
+    private fun stackedButton(title: String, detail: String, action: () -> Unit) {
+        val view = RwStackedButton(this).apply {
+            text = title
+            detailText = detail
+            contentDescription = "$title，$detail"
+        }
+        view.setOnClickListener { cancelAutoSync("BUTTON_$title"); action() }
         controls.addView(
             view,
             LinearLayout.LayoutParams(
@@ -1267,7 +1685,6 @@ private class HomeKeyGuide(context: android.content.Context) : View(context) {
             "BIA" -> drawBia(canvas)
             "SPO2" -> drawSpo2(canvas)
             "PPG" -> drawPpg(canvas)
-            "RESTORE" -> drawRestore(canvas)
             else -> drawEcg(canvas)
         }
         if ((animateContact || contactDetected) && isShown) postInvalidateDelayed(90)
@@ -1305,7 +1722,7 @@ private class HomeKeyGuide(context: android.content.Context) : View(context) {
             paint.style = Paint.Style.FILL
         }
         contactBadge(canvas)
-        caption(canvas, if (contactDetected) "保持接触，手臂静止" else "手指轻触 Home 键（示意）",
+        caption(canvas, if (contactDetected) "保持接触，不要说话" else "指尖盖住上键，不要按",
             if (contactDetected) colors.success else colors.onSurface)
     }
 
@@ -1339,7 +1756,7 @@ private class HomeKeyGuide(context: android.content.Context) : View(context) {
             paint.style = Paint.Style.FILL
         }
         contactBadge(canvas)
-        caption(canvas, if (contactDetected) "双指接触已确认，保持不动" else "中指上键 · 无名指下键",
+        caption(canvas, if (contactDetected) "双指接触已确认，保持不动" else "中指上键 · 无名指下键，两指不相触",
             if (contactDetected) colors.success else colors.onSurfaceVariant)
     }
 
@@ -1383,22 +1800,6 @@ private class HomeKeyGuide(context: android.content.Context) : View(context) {
             canvas.drawCircle(w*.70f, y, h*.07f, paint)
         }
         paint.style = Paint.Style.FILL
-        caption(canvas, "正常佩戴，保持贴合")
-    }
-
-    private fun drawRestore(canvas: Canvas) {
-        val w = width.toFloat(); val h = height.toFloat()
-        paint.style = Paint.Style.FILL; paint.color = skin
-        canvas.drawRoundRect(w*.22f, h*.34f, w*.50f, h*.88f, 26f, 26f, paint)
-        paint.color = colors.primary
-        canvas.drawCircle(w*.36f, h*.58f, h*.13f, paint)
-        paint.color = colors.surface
-        canvas.drawCircle(w*.36f, h*.58f, h*.07f, paint)
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = 5f; paint.color = colors.success
-        canvas.drawLine(w*.72f, h*.50f, w*.56f, h*.58f, paint)
-        canvas.drawLine(w*.56f, h*.58f, w*.64f, h*.44f, paint)
-        canvas.drawLine(w*.56f, h*.58f, w*.68f, h*.68f, paint)
-        paint.style = Paint.Style.FILL
-        caption(canvas, "恢复到平时佩戴位置")
+        caption(canvas, "正常佩戴即可，不用调表带")
     }
 }

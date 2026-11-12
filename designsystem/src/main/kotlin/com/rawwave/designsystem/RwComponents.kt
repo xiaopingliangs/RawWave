@@ -123,6 +123,70 @@ class RwSecondaryButton @JvmOverloads constructor(
     private fun dp(v: Int): Int = RwTheme.dp(context, v)
 }
 
+/**
+ * Full-width action with a second line for live state.
+ *
+ * The watch is only 226 dp wide; a single label such as "同步状态 · 已全部同步" cannot fit and
+ * breaks after the last but one character. Two deliberate lines keep the action name and its
+ * state readable at any font scale instead of relying on automatic wrapping.
+ */
+class RwStackedButton @JvmOverloads constructor(
+    context: Context,
+    attrs: AttributeSet? = null,
+) : LinearLayout(context, attrs) {
+
+    private val title = TextView(context).apply {
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        typeface = RwTheme.boldTypeface()
+        gravity = Gravity.CENTER
+        setLines(1)
+    }
+    private val detail = TextView(context).apply {
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+        gravity = Gravity.CENTER
+        setLines(1)
+    }
+
+    var text: String
+        get() = title.text.toString()
+        set(value) { title.text = value }
+
+    var detailText: String
+        get() = detail.text.toString()
+        set(value) { detail.text = value }
+
+    init {
+        val c = RwTheme.colors(context)
+        orientation = VERTICAL
+        gravity = Gravity.CENTER
+        isClickable = true
+        isFocusable = true
+        minimumHeight = dp(RwTokens.BUTTON_HEIGHT)
+        setPadding(dp(RwTokens.SPACE_4), dp(RwTokens.SPACE_2), dp(RwTokens.SPACE_4), dp(RwTokens.SPACE_2))
+        title.setTextColor(c.onSecondaryGradient)
+        detail.setTextColor(c.onSecondaryGradient)
+        detail.alpha = 0.78f
+        background = rwRippleGradient(
+            context = context,
+            start = c.secondaryGradientStart,
+            end = c.secondaryGradientEnd,
+            radiusPx = dp(RwTokens.BUTTON_RADIUS),
+            strokeColor = c.outlineVariant,
+            strokePx = dp(1),
+        )
+        stateListAnimator = null
+        addView(title, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        addView(detail, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    }
+
+    override fun setEnabled(enabled: Boolean) {
+        super.setEnabled(enabled)
+        alpha = if (enabled) 1f else 0.42f
+    }
+
+    private fun dp(v: Int): Int = RwTheme.dp(context, v)
+}
+
 /** Full-width menu action with a chevron; used by every "更多" sheet. */
 class RwListItemButton @JvmOverloads constructor(
     context: Context,

@@ -4,11 +4,14 @@ import android.app.Activity
 import android.app.Dialog
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.text.InputFilter
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -123,29 +126,72 @@ object RwDialogs {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = rwDp(activity, 12) },
         )
-        sheet.addView(
-            RwPrimaryButton(activity).apply {
+        if (activity.resources.configuration.isScreenRound) {
+            // On a 480x480 watch two stacked 48 dp buttons plus header and body exceed the
+            // 0.88 screen-height budget, so the safe "cancel" choice was pushed off screen and
+            // only the destructive button stayed visible. One row keeps both reachable at full
+            // touch-target size.
+            val row = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
+            fun compact(view: TextView, action: () -> Unit) {
+                view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+                view.setPadding(
+                    rwDp(activity, 8),
+                    rwDp(activity, 6),
+                    rwDp(activity, 8),
+                    rwDp(activity, 6),
+                )
+                view.setOnClickListener { action() }
+            }
+            val cancel = RwSecondaryButton(activity).apply {
+                text = cancelLabel
+                compact(this) { dialog.dismiss() }
+            }
+            val confirm = RwPrimaryButton(activity).apply {
                 text = confirmLabel
-                setOnClickListener {
+                compact(this) {
                     dialog.dismiss()
                     onConfirm()
                 }
-            },
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = rwDp(activity, 18) },
-        )
-        sheet.addView(
-            RwSecondaryButton(activity).apply {
-                text = cancelLabel
-                setOnClickListener { dialog.dismiss() }
-            },
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = rwDp(activity, 8) },
-        )
+            }
+            row.addView(cancel, LinearLayout.LayoutParams(0, rwDp(activity, 48), 1f))
+            row.addView(
+                confirm,
+                LinearLayout.LayoutParams(0, rwDp(activity, 48), 1f).apply {
+                    leftMargin = rwDp(activity, 6)
+                },
+            )
+            sheet.addView(
+                row,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = rwDp(activity, 12) },
+            )
+        } else {
+            sheet.addView(
+                RwPrimaryButton(activity).apply {
+                    text = confirmLabel
+                    setOnClickListener {
+                        dialog.dismiss()
+                        onConfirm()
+                    }
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = rwDp(activity, 18) },
+            )
+            sheet.addView(
+                RwSecondaryButton(activity).apply {
+                    text = cancelLabel
+                    setOnClickListener { dialog.dismiss() }
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = rwDp(activity, 8) },
+            )
+        }
         show(activity, dialog, sheet)
         return dialog
     }
@@ -202,6 +248,120 @@ object RwDialogs {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = rwDp(activity, 8) },
         )
+        show(activity, dialog, sheet)
+        return dialog
+    }
+
+    /**
+     * Hours + minutes duration editor with real numeric fields.
+     *
+     * NumberPicker looked like blank space in the light sheet, so users could not see or type a
+     * value. Two small text fields make the current value visible and editable; the value is
+     * clamped on save (hours 0-23, minutes 0-59, 0:00 = never).
+     */
+    fun duration(
+        activity: Activity,
+        title: String,
+        subtitle: String?,
+        hours: Int,
+        minutes: Int,
+        confirmLabel: String = "保存",
+        cancelLabel: String = "取消",
+        onConfirm: (Int, Int) -> Unit,
+    ): Dialog {
+        val dialog = Dialog(activity)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val sheet = newSheet(activity)
+        addHeader(activity, sheet, title, subtitle)
+
+        val colors = RwTheme.colors(activity)
+        fun numberField(initial: Int, max: Int): EditText = EditText(activity).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf<InputFilter>(
+                InputFilter.LengthFilter(2),
+                InputFilter { source, start, end, dest, dstart, dend ->
+                    val candidate = dest.toString().substring(0, dstart) +
+                        source.toString().substring(start, end) +
+                        dest.toString().substring(dend)
+                    if (candidate.isEmpty()) null
+                    else if ((candidate.toIntOrNull() ?: (max + 1)) > max) "" else null
+                },
+            )
+            setText(String.format(java.util.Locale.ROOT, "%02d", initial.coerceIn(0, max)))
+            setSelectAllOnFocus(true)
+            setSingleLine(true)
+            gravity = Gravity.CENTER
+            setPadding(0, rwDp(activity, 6), 0, rwDp(activity, 6))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 28f)
+            setTextColor(colors.onSurface)
+            setHintTextColor(colors.onSurfaceVariant)
+            background = rwRounded(
+                colors.surfaceVariant,
+                rwDp(activity, 16),
+                colors.outlineVariant,
+                rwDp(activity, 1),
+            )
+        }
+        val hourField = numberField(hours.coerceIn(0, 23), 23)
+        val minuteField = numberField(minutes.coerceIn(0, 59), 59)
+        fun unit(text: String) = RwBodyText(activity).apply {
+            this.text = text
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
+            setPadding(rwDp(activity, 8), 0, rwDp(activity, 12), 0)
+        }
+        val fields = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        fields.addView(hourField, LinearLayout.LayoutParams(0, rwDp(activity, 64), 1f))
+        fields.addView(unit("小时"))
+        fields.addView(minuteField, LinearLayout.LayoutParams(0, rwDp(activity, 64), 1f))
+        fields.addView(unit("分钟"))
+        sheet.addView(
+            fields,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = rwDp(activity, 12) },
+        )
+        val zeroNote = RwBodyText(activity).apply {
+            text = "可直接输入数字；0 小时 0 分钟表示不自动退出。"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+        }
+        sheet.addView(
+            zeroNote,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = rwDp(activity, 6) },
+        )
+        sheet.addView(
+            RwPrimaryButton(activity).apply {
+                text = confirmLabel
+                setOnClickListener {
+                    val chosenHours = hourField.text.toString().toIntOrNull()?.coerceIn(0, 23) ?: 0
+                    val chosenMinutes = minuteField.text.toString().toIntOrNull()?.coerceIn(0, 59) ?: 0
+                    dialog.dismiss()
+                    onConfirm(chosenHours, chosenMinutes)
+                }
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = rwDp(activity, 14) },
+        )
+        sheet.addView(
+            RwSecondaryButton(activity).apply {
+                text = cancelLabel
+                setOnClickListener { dialog.dismiss() }
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = rwDp(activity, 8) },
+        )
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         show(activity, dialog, sheet)
         return dialog
     }

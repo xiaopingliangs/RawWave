@@ -43,6 +43,15 @@
             android:label="官方健康基线"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:theme="@android:style/Theme.DeviceDefault.Light" />
+        <activity android:name="com.rawwave.mobile.samsunghealth.DailyBoundaryActivity"
+            android:exported="false"
+            android:label="我的一天从几点开始"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:theme="@android:style/Theme.DeviceDefault.Light" />
+        <activity android:name="com.rawwave.shell.PhoneMoreActivity"
+            android:exported="false"
+            android:label="更多"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
         <activity android:name="com.rawwave.mobile.activity.ActivityExportActivity"
             android:exported="false"
             android:label="导出原始活动数据"

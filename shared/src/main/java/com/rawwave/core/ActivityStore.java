@@ -214,6 +214,40 @@ public final class ActivityStore {
         }
         return result;
     }
+
+    /**
+     * Small, consumer-readable history rows. Sorted newest first by the activity's own start
+     * timestamp, not by folder mtime, so copying or sealing an old session cannot reorder it.
+     * A session whose plan is unreadable is still listed: hiding it would make retained data
+     * look lost.
+     */
+    public List<HistoryRecord> historyRecords() {
+        List<HistoryRecord> result = new ArrayList<>();
+        File[] folders = new File(root,"sessions").listFiles(File::isDirectory);
+        if(folders == null) return result;
+        for(File f:folders) {
+            File plan = new File(f,"plan.json");
+            String name = "未知活动";
+            long createdUtcMs = f.lastModified();
+            if(plan.isFile()) {
+                try {
+                    JsonObject planJson = JsonParser.parseString(Files.readString(plan.toPath())).getAsJsonObject();
+                    if(planJson.has("template") && planJson.getAsJsonObject("template").has("name"))
+                        name = planJson.getAsJsonObject("template").get("name").getAsString();
+                    if(planJson.has("createdUtcMs") && !planJson.get("createdUtcMs").isJsonNull())
+                        createdUtcMs = planJson.get("createdUtcMs").getAsLong();
+                } catch (Exception ignored) {
+                    // Keep the folder visible with its best-effort name and mtime.
+                }
+            }
+            result.add(new HistoryRecord(name, createdUtcMs, new File(f,"seal.json").isFile()));
+        }
+        result.sort(Comparator.comparingLong(HistoryRecord::createdUtcMs).reversed());
+        return result;
+    }
+
+    /** Activity name and start time only; session ids and raw paths stay out of the consumer list. */
+    public record HistoryRecord(String activityName, long createdUtcMs, boolean sealed) {}
     /** Small diagnostic metadata snapshot. Not an export or re-verification of raw health data. */
     public static byte[] diagnosticSummary(File root) throws IOException {
         List<Map<String,Object>> result = new ArrayList<>();

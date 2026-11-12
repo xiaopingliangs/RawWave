@@ -10,7 +10,11 @@ class PhoneWakeService : WearableListenerService() {
     override fun onMessageReceived(event: MessageEvent) {
         super.onMessageReceived(event)
         val path = event.path
-        if (BuildConfig.DEVICE_ROLE != "phone" || event.data.size > 4096) return
+        if (BuildConfig.DEVICE_ROLE != "phone") return
+        // The last real message is the only honest "watch is around" signal; record it even
+        // for payloads too large for the diagnostic listener path below.
+        WatchContact.record(this, event.sourceNodeId, path)
+        if (event.data.size > 4096) return
         if (path == com.rawwave.core.DiagnosticSummary.PATH) {
             // Independent bounded receipt, before sync admission. Never preempt health transfer.
             try {

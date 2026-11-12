@@ -915,6 +915,23 @@ public class ActivityStoreTest {
     @Test public void tamperedBlockCannotSeal() throws Exception {var s=store().start(store().createTemplate("运动",false),1,2);s.append("CORE-1","HEART_RATE",List.of(Map.of("value",70)));Files.writeString(new File(s.folder,"00000001-CORE-1-HEART_RATE.json").toPath(),"bad");assertThrows(IOException.class,()->s.seal("DONE",3));assertFalse(new File(s.folder,"seal.json").exists());}
     @Test public void traversalRejected() throws Exception {var s=store().start(store().createTemplate("运动",false),1,2);assertThrows(IOException.class,()->s.append("../../x","ECG",List.of(Map.of("x",1))));}
     @Test public void repeatedMeasurementsHaveSeparateBlocks() throws Exception {var s=store().start(store().createTemplate("运动",true),1,2);s.append("PRE-1","ECG",List.of(Map.of("x",1)));s.append("PRE-2","ECG",List.of(Map.of("x",2)));assertEquals(2,s.counts().size());}
+    @Test public void historyRecordsSortByActivityStartAndHideSessionIds() throws Exception {
+        var morning=store().createTemplate("晨间",false);
+        var evening=store().createTemplate("晚间",false);
+        var first=store().start(morning,1_000L,1);
+        var second=store().start(evening,2_000L,2);
+        second.seal("USER_COMPLETED",3_000L);
+        var records=store().historyRecords();
+        assertEquals(2,records.size());
+        assertEquals("晚间",records.get(0).activityName());
+        assertEquals(2_000L,records.get(0).createdUtcMs());
+        assertTrue(records.get(0).sealed());
+        assertEquals("晨间",records.get(1).activityName());
+        assertEquals(1_000L,records.get(1).createdUtcMs());
+        assertFalse(records.get(1).sealed());
+        assertFalse(records.toString().contains(first.id));
+        assertFalse(records.toString().contains(second.id));
+    }
     @Test public void summaryIncludesCountsButDoesNotClaimRawExport() throws Exception {
         var s=store().start(store().createTemplate("步行",true),1,2);
         s.append("CORE-1","HEART_RATE",List.of(Map.of("HEART_RATE",73)));

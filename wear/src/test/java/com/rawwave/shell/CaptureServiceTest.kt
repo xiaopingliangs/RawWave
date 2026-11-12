@@ -46,8 +46,6 @@ class CaptureServiceTest {
         r.queue.advance(30000)
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
         assertEquals("POST-300",ActivityRecordingService.state.phase)
@@ -205,7 +203,6 @@ class CaptureServiceTest {
         val r=Rig(ppg=true,sources=listOf("PRESSURE"))
         r.sensors.emit("PPG_ON_DEMAND",ppgRows(1));r.queue.runReady()
         r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
         r.end();r.queue.advance(5000)
         assertEquals("POST-300",ActivityRecordingService.state.phase)
     }
@@ -217,22 +214,23 @@ class CaptureServiceTest {
         assertEquals("REVIEW_PPG_PRE",ActivityRecordingService.state.phase)
         assertTrue(ActivityRecordingService.state.text.contains("\u672a\u53d6\u5f97\u539f\u59cb\u8bb0\u5f55"))
         r.service.command("SKIP_PPG");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
     }
-    @Test fun biaRunsBeforeSpo2AndSpo2RemainsThePostLastMeasurement() {
+    @Test fun spo2RunsFirstForTheStrapPositionThenBiaAndSpo2RemainsThePostLastMeasurement() {
         val r=Rig(bia=true,spo2=true,sources=listOf("PRESSURE"))
-        // BIA only needs contact and starts before the SpO2 placement.
+        // SpO2 is the only pre measurement that needs the watch above the wrist bone, so it
+        // runs first and the user restores the normal position once afterwards.
+        assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
+        r.service.command("START_SPO2");r.queue.runReady()
+        r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 97)));r.queue.runReady()
+        r.sensors.ack("SPO2");r.queue.runReady()
+        // BIA follows on the restored normal position; no countdown for BIA.
         assertEquals("PRE-200",ActivityRecordingService.state.phase)
         r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("BIA");r.queue.runReady()
         assertEquals(1L,r.session.counts()["PRE-200/BIA"])
-        assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
-        r.service.command("START_SPO2");r.queue.runReady()
-        r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 97)));r.queue.runReady()
-        r.sensors.ack("SPO2");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
         // BIA/MF-BIA are pre-activity only; the post queue ends with SpO2.
         assertEquals("READY_SPO2_POST",ActivityRecordingService.state.phase)
@@ -240,9 +238,33 @@ class CaptureServiceTest {
         r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 99)));r.queue.runReady()
         r.sensors.ack("SPO2");r.queue.runReady()
         assertTrue(r.seal().exists())
-        assertEquals(listOf("BIA","SPO2","PRESSURE","SPO2"),r.sensors.starts)
+        assertEquals(listOf("SPO2","BIA","PRESSURE","SPO2"),r.sensors.starts)
         assertFalse(r.session.counts().containsKey("POST-200/BIA"))
     }
+    @Test fun preMeasurementsRunInStrapPositionOrderAndPpgNeedsNoPlacementPause() {
+        val r=Rig(ecg=true,spo2=true,bia=true,ppg=true,sources=listOf("PRESSURE"))
+        // SpO2 needs the watch above the wrist bone and runs first; everything after it uses
+        // the normal position, so the user adjusts the strap only once per pre phase.
+        assertEquals("READY_SPO2_PRE",ActivityRecordingService.state.phase)
+        r.service.command("START_SPO2");r.queue.runReady()
+        r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 97)));r.queue.runReady()
+        r.sensors.ack("SPO2");r.queue.runReady()
+        // BIA: normal position, two fingers, raised arms; no countdown.
+        assertEquals("PRE-200",ActivityRecordingService.state.phase)
+        r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
+        r.sensors.ack("BIA");r.queue.runReady()
+        // ECG needs a finger on the top button, still on the normal position.
+        assertEquals("PRE-1",ActivityRecordingService.state.phase)
+        r.preComplete();r.sensors.ack("ECG");r.queue.runReady()
+        // PPG has no placement/contact requirement and starts immediately, with no countdown.
+        assertEquals("PRE-300",ActivityRecordingService.state.phase)
+        assertEquals("PPG_ON_DEMAND",ActivityRecordingService.state.shortSensor)
+        r.sensors.emit("PPG_ON_DEMAND",ppgRows(10));r.queue.runReady()
+        r.queue.advance(30000);r.sensors.ack("PPG_ON_DEMAND");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
+        assertEquals(listOf("SPO2","BIA","ECG","PPG_ON_DEMAND","PRESSURE"),r.sensors.starts)
+    }
+
     @Test fun biaStatusOnlyCannotSucceedAndRetryKeepsEachAttempt() {
         val r=Rig(bia=true)
         r.sensors.emit("BIA",listOf(mapOf("STATUS" to 0,"PROGRESS" to 0f)));r.queue.runReady()
@@ -254,13 +276,12 @@ class CaptureServiceTest {
         r.sensors.ack("BIA");r.queue.runReady()
         assertEquals("WAIT_BIA_PRE",ActivityRecordingService.state.phase)
         assertEquals(1L,r.session.counts()["PRE-200/BIA"]);assertEquals(1L,r.session.counts()["PRE-201/BIA"])
-        r.service.command("SKIP_BIA");r.queue.runReady();assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        r.service.command("SKIP_BIA");r.queue.runReady();assertEquals("CORE-1",ActivityRecordingService.state.phase)
     }
     @Test fun biaIsNotStartedAfterCoreAndSessionFinishes() {
         val r=Rig(bia=true,sources=listOf("PRESSURE","GYROSCOPE"))
         r.service.command("SKIP_BIA");r.queue.runReady();r.sensors.ack("BIA");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.end();r.sensors.ack("PRESSURE");r.queue.runReady()
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("GYROSCOPE");r.queue.runReady()
@@ -288,9 +309,8 @@ class CaptureServiceTest {
         r.sensors.emit("MF_BIA",listOf(row));r.queue.runReady()
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         r.sensors.ack("MF_BIA");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
         assertEquals(2L,r.session.counts()["PRE-200/MF_BIA"])
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
         assertEquals(listOf("MF_BIA","MAGNETIC_FIELD"),r.sensors.starts)
     }
     @Test fun bothBiaModesRunTwiceInOnePhase() {
@@ -305,7 +325,7 @@ class CaptureServiceTest {
         }
         r.sensors.emit("MF_BIA",listOf(row));r.queue.runReady()
         r.sensors.ack("MF_BIA");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
         assertEquals(1L,r.session.counts()["PRE-200/BIA"])
         assertEquals(1L,r.session.counts()["PRE-201/MF_BIA"])
     }
@@ -321,7 +341,7 @@ class CaptureServiceTest {
         assertEquals(2,ActivityRecordingService.state.biaAttempt)
         r.sensors.emit("BIA",listOf(bodyRow()));r.queue.runReady()
         r.sensors.ack("BIA");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
         assertEquals(1L,r.session.counts()["PRE-200/BIA"]);assertEquals(1L,r.session.counts()["PRE-201/BIA"])
     }
     @Test fun touchDuringBiaRetryWaitDoesNotPostponeTheRetry() {
@@ -367,7 +387,7 @@ class CaptureServiceTest {
         r.service.command("START_SPO2");r.queue.runReady()
         r.sensors.emit("SPO2",listOf(mapOf("STATUS" to 2,"SPO2" to 97)));r.queue.runReady()
         r.sensors.ack("SPO2");r.queue.runReady()
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
         r.end()
         val late=r.sensors.drains.getValue("EDA")
         r.sensors.emit("EDA",listOf(mapOf("sdkTimestamp" to 10500L,"SKIN_CONDUCTANCE" to 3.5f,"STATUS" to 0)))
@@ -838,11 +858,10 @@ class CaptureServiceTest {
         r.queue.runReady();assertFalse(r.sensors.starts.contains("GYROSCOPE"))
         r.sensors.ack("SPO2");r.queue.runReady()
         assertEquals(1L,r.session.counts()["PRE-100/SPO2"])
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
-        assertEquals(listOf("SPO2"),r.sensors.starts)
-        r.queue.advance(60000)
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
+        // SpO2 (watch above the wrist bone) flows straight into ECG; the ECG screen carries the
+        // "restore the normal position" reminder, so there is no separate placement screen.
         assertEquals("PRE-1",ActivityRecordingService.state.phase)
+        assertTrue(r.sensors.starts.contains("ECG"))
         r.preComplete();r.sensors.ack("ECG");r.queue.runReady()
         r.sensors.emit("GYROSCOPE",listOf(mapOf("sensorTimestampNs" to 123456789L,"sdkTimestamp" to 123L,"GYROSCOPE_X" to 0.1,"GYROSCOPE_Y" to -0.2,"GYROSCOPE_Z" to 0.3)))
         r.queue.runReady();r.end();r.sensors.ack("GYROSCOPE");r.queue.runReady()
@@ -873,8 +892,6 @@ class CaptureServiceTest {
         r.queue.runReady();r.sensors.ack("SPO2");r.queue.runReady()
         assertEquals(1L,r.session.counts()["PRE-100/SPO2"])
         r.service.command("SKIP_SPO2");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
-        r.service.command("PLACEMENT_READY");r.queue.runReady()
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
     }
     @Test fun spo2LateSuccessCannotReviveExpiredMeasurement() {
@@ -1042,7 +1059,7 @@ class CaptureServiceTest {
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
         assertFalse(ActivityRecordingService.state.text.contains("成功 99%"))
         r.sensors.ack("SPO2");r.queue.runReady()
-        assertEquals("RESTORE_PRE",ActivityRecordingService.state.phase)
+        assertEquals("CORE-1",ActivityRecordingService.state.phase)
         assertTrue(ActivityRecordingService.state.text.contains("99%"))
         assertEquals(3L,r.session.counts()["PRE-100/SPO2"])
         assertFalse(ActivityRecordingService.state.text.contains("血氧：3"))

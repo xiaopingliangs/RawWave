@@ -6,6 +6,7 @@ import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.lifecycle.lifecycleScope
 import com.rawwave.core.ActivityDataExporter
 import com.rawwave.designsystem.RwBodyText
@@ -30,11 +31,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Raw activity export by real activity date.
+ * Raw activity export by activity start date.
  *
- * The transport package is not the product: one package may contain several activities. This
- * screen lists sessions, lets the user pick latest/today/range, and exports the chosen sessions
- * as one new verified ZIP. It never edits the inbox or the official Samsung Health flow.
+ * One package may contain several activities. The screen offers the four choices the user asked
+ * for - latest, latest three, today, or one chosen date - and exports exactly those sessions as
+ * one verified ZIP. It never edits the inbox or the Samsung Health flow.
  */
 class ActivityExportActivity : ComponentActivity() {
 
@@ -43,7 +44,6 @@ class ActivityExportActivity : ComponentActivity() {
     private val app get() = application as ProbeApplication
     private val zone: ZoneId get() = ZoneId.systemDefault()
     private lateinit var summaryView: TextView
-    private lateinit var rangeView: TextView
     private lateinit var statusView: TextView
     private lateinit var exportButton: TextView
     private lateinit var latestButton: TextView
@@ -74,6 +74,9 @@ class ActivityExportActivity : ComponentActivity() {
             window.decorView.systemUiVisibility or lightFlags
         }
         setContentView(buildUi())
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() { closePage() }
+        })
         loadSessions()
     }
 
@@ -95,23 +98,17 @@ class ActivityExportActivity : ComponentActivity() {
 
         root.addView(RwTopBar(this).apply {
             setTitle("导出原始活动数据")
-            setOnBackClickListener { finish() }
-        })
-        root.addView(RwBodyText(this).apply {
-            text = "按活动开始时间选择。导出的是原始 ZIP，不做健康评分，也不会改动手表里的记录。"
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setTextColor(colors.onSurfaceVariant)
-            setPadding(0, 0, 0, dp(4))
+            setOnBackClickListener { closePage() }
         })
 
         val quickCard = RwCard(this)
         quickCard.addView(RwSectionHeader(this).apply {
-            text = "快捷选择"
+            text = "选择活动"
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 18f)
             setPadding(0, 0, 0, dp(2))
         })
         val quickRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        latestButton = RwPrimaryButton(this).apply {
+        latestButton = RwSecondaryButton(this).apply {
             text = "最近一次"
             setOnClickListener { selectMode(Mode.LATEST) }
         }
@@ -133,37 +130,21 @@ class ActivityExportActivity : ComponentActivity() {
             0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f,
         ).apply { setMargins(dp(3), dp(8), 0, 0) })
         quickCard.addView(quickRow)
-        root.addView(quickCard, cardParams(16))
-
-        val rangeCard = RwCard(this)
-        rangeCard.addView(RwSectionHeader(this).apply {
-            text = "日期范围"
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 18f)
-            setPadding(0, 0, 0, dp(2))
-        })
-        rangeView = RwBodyText(this).apply {
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
-            setTextColor(colors.onSurface)
-            setPadding(0, dp(4), 0, dp(6))
-        }
-        rangeCard.addView(rangeView)
-        val dateRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         startButton = RwSecondaryButton(this).apply {
-            text = "开始日期"
-            setOnClickListener { pickDate(true) }
+            setOnClickListener { pickStartDate() }
         }
+        quickCard.addView(startButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(10) })
         endButton = RwSecondaryButton(this).apply {
-            text = "结束日期"
-            setOnClickListener { pickDate(false) }
+            setOnClickListener { pickEndDate() }
         }
-        dateRow.addView(startButton, LinearLayout.LayoutParams(
-            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f,
-        ).apply { setMargins(0, 0, dp(4), 0) })
-        dateRow.addView(endButton, LinearLayout.LayoutParams(
-            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f,
-        ).apply { setMargins(dp(4), 0, 0, 0) })
-        rangeCard.addView(dateRow)
-        root.addView(rangeCard, cardParams(12))
+        quickCard.addView(endButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(8) })
+        root.addView(quickCard, cardParams(16))
 
         val exportCard = RwCard(this)
         exportCard.addView(RwSectionHeader(this).apply {
@@ -196,12 +177,20 @@ class ActivityExportActivity : ComponentActivity() {
         exportCard.addView(statusView)
         root.addView(exportCard, cardParams(12))
 
+        // Explanations sit at the bottom, next to the way out, not above the buttons.
         root.addView(RwBodyText(this).apply {
-            text = "保存位置：Download/RawWave。同名文件不会覆盖；每次导出都会回读校验 SHA-256。"
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
+            text = "保存位置：Download/RawWave。导出的是原始活动包，只读，不会改动手表里的记录；同名文件不会覆盖。"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setTextColor(colors.onSurfaceVariant)
             setPadding(0, dp(16), 0, 0)
         })
+        root.addView(RwSecondaryButton(this).apply {
+            text = "返回"
+            setOnClickListener { closePage() }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(12) })
         return screen
     }
 
@@ -250,26 +239,28 @@ class ActivityExportActivity : ComponentActivity() {
     private fun refreshSelection() {
         if (!loaded) return
         val selected = selectedSessions()
-        rangeView.text = when (mode) {
-            Mode.LATEST -> "最近一次活动"
-            Mode.RECENT3 -> "最近三次活动"
-            Mode.TODAY -> "今天（${LocalDate.now().format(DAY_FORMAT)}）"
-            Mode.RANGE -> "${startDate.format(DAY_FORMAT)} → ${endDate.format(DAY_FORMAT)}"
-        }
+        val inRange = mode == Mode.RANGE
         latestButton.text = if (mode == Mode.LATEST) "● 最近一次" else "最近一次"
         recent3Button.text = if (mode == Mode.RECENT3) "● 最近三次" else "最近三次"
         todayButton.text = if (mode == Mode.TODAY) "● 今天" else "今天"
-        latestButton.alpha = if (mode == Mode.LATEST) 1f else 0.72f
-        recent3Button.alpha = if (mode == Mode.RECENT3) 1f else 0.72f
-        todayButton.alpha = if (mode == Mode.TODAY) 1f else 0.72f
-        startButton.alpha = if (mode == Mode.RANGE) 1f else 0.72f
-        endButton.alpha = if (mode == Mode.RANGE) 1f else 0.72f
+        startButton.text = (if (inRange) "● " else "") + "开始日期：${startDate.format(DAY_FORMAT)}"
+        endButton.text = (if (inRange) "● " else "") + "结束日期：${endDate.format(DAY_FORMAT)}"
         val bytes = selected.map { it.fileBytes() }.distinct().sum()
         summaryView.text = when {
             sessions.isEmpty() -> "没有已接收的活动。请先在手表结束活动并完成同步。"
-            selected.isEmpty() -> "这个日期范围内没有活动。"
-            mode == Mode.LATEST -> "最近一次：${selected.first().activityName()} · ${formatTime(selected.first().createdUtcMs())}\n共 1 次活动"
-            else -> "${selected.size} 次活动\n原始包约 ${bytes / 1024 / 1024} MB"
+            selected.isEmpty() -> when (mode) {
+                Mode.TODAY -> "今天还没有活动。"
+                Mode.RANGE -> "${startDate.format(DAY_FORMAT)} → ${endDate.format(DAY_FORMAT)} 没有活动。"
+                else -> "这个范围内没有活动。"
+            }
+            mode == Mode.LATEST -> {
+                val latest = selected.first()
+                "最近一次：${latest.activityName()} · ${formatTime(latest.createdUtcMs())}\n共 1 次活动 · ${sizeText(bytes)}"
+            }
+            mode == Mode.RECENT3 -> "最近三次活动\n共 ${selected.size} 次活动 · 原始包约 ${sizeText(bytes)}"
+            mode == Mode.TODAY -> "今天（${LocalDate.now().format(DAY_FORMAT)}）\n共 ${selected.size} 次活动 · 原始包约 ${sizeText(bytes)}"
+            mode == Mode.RANGE -> "${startDate.format(DAY_FORMAT)} → ${endDate.format(DAY_FORMAT)}\n共 ${selected.size} 次活动 · 原始包约 ${sizeText(bytes)}"
+            else -> "共 ${selected.size} 次活动 · 原始包约 ${sizeText(bytes)}"
         }
         exportButton.isEnabled = !working && selected.isNotEmpty()
     }
@@ -280,42 +271,78 @@ class ActivityExportActivity : ComponentActivity() {
             Mode.LATEST -> sessions.maxByOrNull { it.createdUtcMs() }?.let { listOf(it) }.orEmpty()
             Mode.RECENT3 -> sessions.sortedByDescending { it.createdUtcMs() }.take(3)
             Mode.TODAY -> sessions.filter(::isToday)
-            Mode.RANGE -> sessions.filter { inRange(it.createdUtcMs()) }
+            Mode.RANGE -> sessions.filter(::isInRange)
         }
     }
 
-    private fun isToday(item: ActivityDataExporter.SessionChoice): Boolean {
-        val date = Instant.ofEpochMilli(item.createdUtcMs()).atZone(zone).toLocalDate()
-        return date == LocalDate.now()
+    private fun isToday(item: ActivityDataExporter.SessionChoice): Boolean =
+        dateOf(item) == LocalDate.now()
+
+    private fun isInRange(item: ActivityDataExporter.SessionChoice): Boolean =
+        ActivityDateSelection.contains(dateOf(item), startDate, endDate)
+
+    private fun dateOf(item: ActivityDataExporter.SessionChoice): LocalDate =
+        Instant.ofEpochMilli(item.createdUtcMs()).atZone(zone).toLocalDate()
+
+    private fun closePage() {
+        if (working) {
+            RwDialogs.message(
+                this,
+                "正在导出",
+                "请等导出完成后再返回。现在离开会中断导出，手机里的原始活动包仍会保留。",
+                confirmLabel = "知道了",
+            )
+            return
+        }
+        finish()
     }
 
-    private fun inRange(createdUtcMs: Long): Boolean {
-        val date = Instant.ofEpochMilli(createdUtcMs).atZone(zone).toLocalDate()
-        return !date.isBefore(startDate) && !date.isAfter(endDate)
-    }
-
-    private fun pickDate(start: Boolean) {
-        val initial = if (start) startDate else endDate
-        DatePickerDialog(
+    private fun pickStartDate() {
+        if (working) return
+        val initial = startDate
+        val dialog = DatePickerDialog(
             this,
             pickerTheme(),
             { _, year, month, day ->
-                val picked = LocalDate.of(year, month + 1, day)
-                if (start) {
-                    startDate = picked
-                    if (endDate.isBefore(startDate)) endDate = startDate
-                } else {
-                    endDate = picked
-                    if (startDate.isAfter(endDate)) startDate = endDate
-                }
+                startDate = LocalDate.of(year, month + 1, day)
+                if (endDate.isBefore(startDate)) endDate = startDate
                 mode = Mode.RANGE
+                modeSelectedByUser = true
                 refreshSelection()
+                if (loaded) loadSessions(initial = false)
             },
             initial.year,
             initial.monthValue - 1,
             initial.dayOfMonth,
-        ).show()
+        )
+        dialog.datePicker.maxDate = endOfTodayMillis()
+        dialog.show()
     }
+
+    private fun pickEndDate() {
+        if (working) return
+        val initial = endDate
+        val dialog = DatePickerDialog(
+            this,
+            pickerTheme(),
+            { _, year, month, day ->
+                endDate = LocalDate.of(year, month + 1, day)
+                if (startDate.isAfter(endDate)) startDate = endDate
+                mode = Mode.RANGE
+                modeSelectedByUser = true
+                refreshSelection()
+                if (loaded) loadSessions(initial = false)
+            },
+            initial.year,
+            initial.monthValue - 1,
+            initial.dayOfMonth,
+        )
+        dialog.datePicker.maxDate = endOfTodayMillis()
+        dialog.show()
+    }
+
+    private fun endOfTodayMillis(): Long =
+        LocalDate.now(zone).plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli() - 1L
 
     private fun exportSelected() {
         if (working) return
@@ -333,7 +360,7 @@ class ActivityExportActivity : ComponentActivity() {
         app.activeSyncOwner = token
         working = true
         exportButton.isEnabled = false
-        statusView.text = "正在导出并回读校验 ${selected.size} 次活动…"
+        statusView.text = "正在导出并确认文件完整（${selected.size} 次活动）…"
         lifecycleScope.launch {
             try {
                 val results = withContext(Dispatchers.IO) {
@@ -342,9 +369,9 @@ class ActivityExportActivity : ComponentActivity() {
                         runOnUiThread {
                             if (!isFinishing && !isDestroyed) {
                                 statusView.text = if (total > 0 && copied >= total) {
-                                    // Copy is done; the read-back SHA-256 pass has no byte
+                                    // Copy is done; the read-back integrity check has no byte
                                     // progress. Say so instead of leaving a misleading 100%.
-                                    "导出已写入，正在回读校验 SHA-256…（${sizeText(total)}）"
+                                    "导出已写入，正在确认文件完整…（${sizeText(total)}）"
                                 } else {
                                     "正在导出… $percent% (${sizeText(copied)} / ${sizeText(total)})"
                                 }
@@ -361,17 +388,17 @@ class ActivityExportActivity : ComponentActivity() {
                         this@ActivityExportActivity,
                         "导出完成",
                         "已保存到：\nDownload/RawWave/${first.name()}\n\n" +
-                            "${first.bytes()} 字节 · ${first.sessions().size} 次活动\n" +
-                            "已回读校验 SHA-256：\n${first.sha256()}",
+                            "共 ${first.sessions().size} 次活动 · ${sizeText(first.bytes())}\n" +
+                            "已确认文件完整。",
                         confirmLabel = "知道了",
                     )
                 }
             } catch (failure: Exception) {
-                statusView.text = "导出失败：${failure.javaClass.simpleName}: ${failure.message}"
+                statusView.text = "导出失败。手机里的原始活动包仍然保留。"
                 RwDialogs.message(
                     this@ActivityExportActivity,
                     "导出失败",
-                    "没有生成可用的 ZIP。\n${failure.javaClass.simpleName}: ${failure.message}\n\n手机里的原始活动包仍然保留。",
+                    "没有生成可用的 ZIP，请重试。\n手机里的原始活动包仍然保留。",
                     confirmLabel = "知道了",
                 )
             } finally {
