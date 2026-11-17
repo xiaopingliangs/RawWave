@@ -20,7 +20,26 @@ RawWave 是一个开源的手表数据采集软件，主要面向三星 Galaxy W
 
 目前项目仍在开发中，具体支持哪些数据，取决于手表硬件和系统开放的功能。
 
-## 最新测试版（2026-11-12）
+## 最新测试版（2026-11-17）
+
+- `sync-discovery-20261117-r06` / `0.12.46-step` / versionCode 120
+- 这是测试版，不是稳定发布；0.12.46 已在 Galaxy Watch（SM-L350）+ Galaxy S9210 上验证息屏同步与采集收尾。
+- 安装包、SHA256 和完整说明见 [RELEASE_NOTES.md](RELEASE_NOTES.md)，也可以到 [Releases](https://github.com/xiaopingliangs/RawWave/releases) 下载。
+
+0.12.46 重点（包含 0.12.40–0.12.46）：
+
+- **修复采集结束 6–14 秒后 `sensors.sec` SIGSEGV**（`Ppg25HzSensor::parsePPGMultiData`）：PPG 25 Hz 会话不能和其他传感器 client 同批拆除。结束、取消、超时、服务销毁全部改为「先停其他来源 → 等 3 秒 → 单独 flush+unset PPG → 封存」，间隔从**最后一次其他 stop** 起算。11-16 起连续三次真机取消/结束（3.0 秒间隔）零崩溃，表背绿灯正常熄灭。
+- **修复长会话同步 ANR**：`pendingRawBytes()` 的逐文件字节扫描从主线程移到后台线程，先开 `SyncGuardService` 前台租约再扫描；1 小时会话不再卡死。
+- **修复息屏/后台同步失败**：手机节点发现改为最多等 45 秒、每 2 秒轮询（原来只查一次，`CONNECTED_NODE_COUNT_0` 直接失败）；握手 60 秒、初始窗口 150 秒、重试间隔 8 秒。
+- **封存提速**：`seal()` 改用写入时清单，2 小时会话从 31 分 16 秒降到 0.86 秒；元数据上限分层（seal 32 MiB / bundle 16 MiB / plan 8 MiB）。
+- **手表息屏与退出**：删除 `FLAG_KEEP_SCREEN_ON`，由系统息屏；采集仍由前台服务承担；同步成功后只退出一次（`singleTask` + `finishAffinity`），空闲自动同步不退出。
+- **真机证据**：11-17 08:09–09:09 的 1 小时采集（PPG 91,081 行）完整封存并同步到手机；修复后三星官方睡眠记录恢复（11/16→17），此前连续 4 晚缺失。
+
+**已知限制：** SpO2/MF-BIA 仍受佩戴/接触影响；后置 ECG 仍按正常位置（三星标准）；Samsung Health 导出是官方处理后数据，不是原始 PPG/ECG 波形；厂商传感器停止没有硬件回执；大档案仍按 5 分钟/次断点续传；手机被 force-stop 时节点不可见。
+
+---
+
+## 历史测试版（2026-11-12）
 
 - `measurement-order-20261112-r05` / `0.12.39-step` / versionCode 113
 - 这是测试版，不是稳定发布；0.12.39 已在 Galaxy Watch 上验证测量顺序和引导页，0.12.38 已验证圆屏排版。
@@ -123,7 +142,15 @@ You can use other apps, AI tools, or your own methods to explore the exported da
 
 RawWave is still in development. Available features depend on the watch hardware and system support.
 
-### Latest test build (2026-11-11)
+### Latest test build (2026-11-17)
+
+`sync-discovery-20261117-r06` / `0.12.46-step` / versionCode 120. Test build, not a stable release. Verified on a Galaxy Watch (SM-L350) and a Galaxy S9210, including sync with the phone screen off. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
+
+0.12.46 (includes 0.12.40–0.12.46) fixes the vendor sensor crash that was killing Samsung Health's overnight pipeline: the PPG 25 Hz client must never be released in the same batch as any other sensor client, so every stop path (normal end, cancel, timeout, service destroy) now stops all other sources first, waits three seconds measured from the last other stop, then flushes and unsets PPG alone before sealing. It also moves the activity byte scan off the main thread to stop long-session sync ANRs, waits up to 45 seconds for the phone node instead of failing on the first empty poll (so screen-off sync works), cuts two-hour seal time from 31 minutes to under a second with a write-time manifest, and removes `FLAG_KEEP_SCREEN_ON` so the watch screen sleeps normally.
+
+**Known limitations:** SpO2/MF-BIA remain sensitive to fit and contact; post-activity ECG still uses the normal position (Samsung's standard); Samsung Health export is processed store data, not raw PPG/ECG; the vendor sensor stop has no hardware acknowledgement; large archives still resume across 5-minute transfer windows; the phone node is invisible while the app is force-stopped.
+
+### Historical test build (2026-11-11)
 
 `export-refresh-20261111-r01` / `0.12.35-step` / versionCode 109. Test build, not a stable release. Device verification for 0.12.35 is `NOT_RUN`; the previous 0.12.34 r07 passed a smoke test on a Galaxy Watch. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for SHA256 and installation notes.
 

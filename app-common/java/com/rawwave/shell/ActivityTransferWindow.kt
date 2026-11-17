@@ -341,7 +341,18 @@ class ActivityTransferWindow(
         // size-based extension. Discovery/channel-open remains separately bounded.
         noteSizeKnown(expected)
         stage("ACTIVITY_DISCOVERY_STARTED","正在寻找已连接的手机…",mapOf("sessions" to prepared.sessions().size))
-        val nodes=await(transport.nodes())
+        // Node visibility is transient: the phone may be in Doze, reconnecting over
+        // Bluetooth, or just waking its Wearable listener. Watch the node list for a
+        // bounded window instead of failing the whole attempt on the first empty poll.
+        val discoveryDeadline=monotonicMs()+ActivityTransferBudget.DISCOVERY_MS
+        var nodes=await(transport.nodes())
+        while(nodes.isEmpty() && monotonicMs()<discoveryDeadline){
+            stage("ACTIVITY_DISCOVERY_WAITING","\u6b63\u5728\u7b49\u5f85\u624b\u673a\u8fde\u63a5\u2026",
+                mapOf("remainingMs" to (discoveryDeadline-monotonicMs()).coerceAtLeast(0L)))
+            try { Thread.sleep(2_000L) } catch (interrupted: InterruptedException) { Thread.currentThread().interrupt(); break }
+            checkLive()
+            nodes=await(transport.nodes())
+        }
         check(nodes.size == 1) { "CONNECTED_NODE_COUNT_${nodes.size}" }
         peer=nodes.single()
         attemptState.bindSender(TransferAttempt.Identity(peer,senderWindow,id,hash,expected),monotonicMs())

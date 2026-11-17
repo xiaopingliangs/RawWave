@@ -13,6 +13,16 @@ import java.util.zip.*;
 public final class ActivityArchive {
     /** Raw session payload cap. bundle.json is derived metadata and has its own 16 MiB limit. */
     public static final long MAX_UNCOMPRESSED_BYTES = 2L * 1024 * 1024 * 1024;
+    /**
+     * A long raw session legitimately has a large seal manifest: its per-block SHA-256 list
+     * grows with the number of blocks. At 1s blocks a 2h capture produced 76k+ entries and an
+     * 8,389,157-byte seal.json, which was 549 bytes over the old uniform 8 MiB cap and made
+     * every sync of an otherwise valid archive fail with ACTIVITY_METADATA_LIMIT. The entry is
+     * still metadata, streamed and bounded, never raw sensor payload.
+     */
+    static final long SEAL_METADATA_LIMIT = 32L * 1024 * 1024;
+    static final long BUNDLE_METADATA_LIMIT = 16L * 1024 * 1024;
+    static final long PLAN_METADATA_LIMIT = 8L * 1024 * 1024;
     private static final Gson JSON = new GsonBuilder().serializeNulls().create();
     private static final Pattern UUID = Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
     private static final Pattern BLOCK = Pattern.compile("[0-9]{8}-(?:PRE|CORE|POST)-[0-9]+-([A-Z0-9_]+)\\.json");
@@ -52,10 +62,12 @@ public final class ActivityArchive {
         String id = java.util.UUID.randomUUID().toString();
         File building = new File(outgoing, id + ".building");
         File target = new File(outgoing, id + ".zip");
-        create(building, id, Arrays.asList(folders));
+        // create() hashes every entry from the exact bytes it writes. Re-reading the whole
+        // new ZIP with verify() added a second full decompression pass for no new evidence;
+        // the phone still verifies every entry after transfer.
+        Verified created = create(building, id, Arrays.asList(folders));
         Files.move(building.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE);
-        Verified verified = verify(target);
-        return batch(target, verified);
+        return batch(target, created);
     }
 
     /** Raw bytes that a pending archive would read; used only to size the packaging budget. */
@@ -104,6 +116,11 @@ public final class ActivityArchive {
 
     /** Package-private seam so a regression test can prove the bundle manifest is not raw payload. */
     static Verified verify(File archive, long maxRawBytes) throws IOException {
+        return verify(archive, maxRawBytes, SEAL_METADATA_LIMIT);
+    }
+
+    /** Package-private seam for the seal-manifest cap; see {@link #SEAL_METADATA_LIMIT}. */
+    static Verified verify(File archive, long maxRawBytes, long sealMetadataLimit) throws IOException {
         if (!archive.isFile() || archive.length() <= 0 || archive.length() > ActivityTransferFiles.MAX_BYTES)
             throw new IOException("INVALID_ACTIVITY_ARCHIVE_SIZE");
         Map<String, Map<String,Object>> actual = new TreeMap<>();
@@ -128,9 +145,11 @@ public final class ActivityArchive {
                         rawTotal += count;
                         if (rawTotal > maxRawBytes) throw new IOException("ACTIVITY_ARCHIVE_EXPANSION_LIMIT");
                     }
-                    long metadataLimit = name.equals("bundle.json") ? 16L * 1024 * 1024 : 8L * 1024 * 1024;
+                    long metadataLimit = name.equals("bundle.json") ? BUNDLE_METADATA_LIMIT
+                        : name.endsWith("/seal.json") ? sealMetadataLimit
+                        : PLAN_METADATA_LIMIT;
                     if (captured != null && bytes > metadataLimit)
-                        throw new IOException("ACTIVITY_METADATA_LIMIT:" + name + ":" + bytes);
+                        throw new IOException("ACTIVITY_METADATA_LIMIT:" + name + ":" + bytes + ":LIMIT:" + metadataLimit);
                     digest.update(buffer, 0, count);
                     if (captured != null) captured.write(buffer, 0, count);
                 }
@@ -187,17 +206,19 @@ public final class ActivityArchive {
         return new Batch(file, verified.id(), hash, file.length(), verified.sessionIds());
     }
 
-    static void create(File output, String batchId, List<File> sessions) throws IOException {
+    static Verified create(File output, String batchId, List<File> sessions) throws IOException {
         if (output.exists()) throw new IOException("ACTIVITY_BATCH_ALREADY_EXISTS");
         Map<String,Object> files = new TreeMap<>();
         List<Map<String,Object>> sessionList = new ArrayList<>();
+        List<String> sessionIds = new ArrayList<>();
+        boolean allSealed = true;
         long total = 0;
         try (FileOutputStream stream = new FileOutputStream(output);
              ZipOutputStream zip = new ZipOutputStream(stream, StandardCharsets.UTF_8)) {
             for (File folder : sessions) {
                 List<File> sourceFiles = sessionFiles(folder);
                 boolean sealed = new File(folder, "seal.json").isFile();
-                if (sealed) verifySealedSource(folder, sourceFiles);
+                if (sealed) verifySealedSource(folder, sourceFiles); else allSealed = false;
                 if (sourceFiles.stream().noneMatch(file -> file.getName().equals("plan.json")))
                     throw new IOException("ACTIVITY_PLAN_MISSING:" + folder.getName());
                 for (File source : sourceFiles) {
@@ -217,6 +238,7 @@ public final class ActivityArchive {
                 }
                 sessionList.add(Map.of("sessionId", folder.getName(), "sealed", sealed,
                     "integrity", sealed ? "SEAL_INCLUDED_AND_ARCHIVE_REVERIFIED" : "UNSEALED_IMMUTABLE_BLOCK_SNAPSHOT_TAIL_UNKNOWN"));
+                sessionIds.add(folder.getName());
             }
             byte[] bundle = JSON.toJson(Map.of("schemaVersion", 1, "kind", "RAWWAVE_ACTIVITY_RAW_EXPORT",
                 "batchId", batchId, "createdUtcMs", System.currentTimeMillis(), "sessions", sessionList,
@@ -227,6 +249,7 @@ public final class ActivityArchive {
         } catch (IOException failure) {
             Files.deleteIfExists(output.toPath()); throw failure;
         }
+        return new Verified(batchId, List.copyOf(sessionIds), files.size(), total, allSealed);
     }
 
     private static void verifySealedSource(File folder, List<File> sourceFiles) throws IOException {

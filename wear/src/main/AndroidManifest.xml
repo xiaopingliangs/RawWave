@@ -34,6 +34,7 @@
         <activity android:name="com.rawwave.shell.ProbeActivity" android:exported="false"
             android:screenOrientation="nosensor" android:enableOnBackInvokedCallback="true" />
         <activity android:name="com.rawwave.shell.RecordingActivity" android:exported="true"
+            android:launchMode="singleTask"
             android:screenOrientation="nosensor" android:enableOnBackInvokedCallback="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>

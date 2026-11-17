@@ -50,6 +50,7 @@ class SamsungSensorAdapter internal constructor(
     override fun contractVersion() = SensorPort.CONTRACT_VERSION
     override fun implementationVersion() = "samsung-health-sensor-1.4.1/adapter-12"
     private fun cleanupEvidence(stage: String, sensor: String, detail: String = "") {
+        try { android.util.Log.i("RawWaveVendor", "$stage sensor=$sensor elapsed=${elapsed()} $detail") } catch (_: Exception) {}
         try { evidence("CAPTURE_VENDOR_CLEANUP", mapOf("ownerId" to ownerId,
             "stage" to stage, "sensor" to sensor, "detail" to detail,
             "elapsedMs" to elapsed(), "hardwareStoppedVerified" to false)) } catch (_: Exception) {}
@@ -326,7 +327,9 @@ class SamsungSensorAdapter internal constructor(
         closed = true
         hadTrackers = trackers.isNotEmpty()
         var failure: Exception? = null
-        deliveries.keys.toList().forEach { try { stop(it) } catch (e: Exception) { failure = e } }
+        deliveries.keys.toList().forEach {
+            try { stop(it) } catch (e: Exception) { failure = e }
+        }
         trackers.forEach { (sensor, tracker) ->
             cleanupEvidence("FINAL_UNSET_REQUEST", sensor, "tracker=${System.identityHashCode(tracker)}")
             try { tracker.unset(); cleanupEvidence("FINAL_UNSET_RETURNED", sensor) }

@@ -11,8 +11,11 @@ package com.rawwave.core;
 public final class ActivityRetryPolicy {
     /** One first attempt plus two automatic retries; transient phone-wake failures are common. */
     public static final int MAX_ATTEMPTS = 3;
-    /** Short pause so the receiver can close the failed channel before the new HELLO arrives. */
-    public static final long RETRY_DELAY_MS = 3_000L;
+    /**
+     * Pause before the next attempt. Long enough for the phone to leave a Doze gap and
+     * re-register its Wearable node, short enough to finish inside the sync lease.
+     */
+    public static final long RETRY_DELAY_MS = 8_000L;
 
     private ActivityRetryPolicy() {}
 

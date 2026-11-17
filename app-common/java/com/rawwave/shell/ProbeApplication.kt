@@ -72,6 +72,17 @@ class ProbeApplication : Application() {
      * transfer that is already gone. Called on every home start and before capture.
      */
     fun reconcileStaleSyncState() {
+        // A retained session can outlive the SyncGuardService that owned it. Clear it before
+        // checking the owner/status so a dead transfer cannot leave the home on "同步中".
+        activeWatchActivitySync?.let { session ->
+            if (session.isStalled()) {
+                try { journal?.event("ACTIVITY_SYNC_STALE_SESSION_CLEARED",
+                    mapOf("running" to activitySyncStatus.running,
+                        "trigger" to activitySyncStatus.trigger,
+                        "text" to activitySyncStatus.text.take(200))) } catch (_: Exception) {}
+                session.abortStale("WATCH_HOME_RECONCILE")
+            }
+        }
         val session = activeWatchActivitySync
         val leaseActive = try { SyncGuardService.hasActiveLease() } catch (_: Exception) { false }
         if (activeSyncOwner != null && session == null && !leaseActive) {

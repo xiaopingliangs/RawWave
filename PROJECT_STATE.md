@@ -1,14 +1,15 @@
 # 当前状态
 
-2026-11-12：最新测试版 `measurement-order-20261112-r05` / `0.12.39-step` / versionCode 113。
+2026-11-17：最新测试版 `sync-discovery-20261117-r06` / `0.12.46-step` / versionCode 120。
 
-- 这是测试版，不是稳定发布；0.12.39 已在 Galaxy Watch（SM-L350）验证测量顺序和引导页，0.12.38 同机验证圆屏排版。
-- 前后置测量顺序按三星官方姿势要求重排：活动前 血氧（上移到腕骨上方）→ 戴回正常位置 → BIA/MF-BIA → ECG → PPG；活动后 ECG → PPG → 血氧（最后一项，测完结束）。
-- 只有血氧强制要求改变手表位置，因此放在阶段边界；每个阶段只动一次表，活动从正常位置开始。
-- 血氧/ECG/BIA 引导文案按三星要求重写；480px 圆屏引导页不再裁切。
-- 同时包含 0.12.36–0.12.38：双端按钮/导航重构、手机简化/日期范围、圆屏排版修复。
-- 已验证：shared 396 + wear 89（1 skipped）+ mobile 29 = 514 tests，失败 0；双端 release/lintVital 通过；签名同证书。
-- 数据核验（0.12.39 r05，无前后置「乱跳」）：7,511 files / 126,798,568 B，全部 SHA-256 与大小一致，SEALED_VERIFIED；PPG 25.02 Hz、HR 1/s、SDK ACC 25.02 Hz、平台 ACC 99.92 Hz、陀螺仪 99.95 Hz，连续流无缺口。
-- 已知限制：SpO2/MF-BIA 仍受佩戴/接触影响；后置 ECG 仍按正常位置；Samsung Health 导出是官方处理后数据，不是原始 PPG/ECG 波形；厂商传感器停止没有硬件回执。
+- 这是测试版，不是稳定发布；0.12.46 已在 Galaxy Watch（SM-L350）+ Galaxy S9210 验证。
+- 核心修复：PPG 25 Hz client 不能与其他传感器 client 同批拆除。结束、取消、80 秒超时、服务销毁统一走「先停其他来源 → 等 3 秒（从最后一次其他 stop 起算）→ 单独 flush+unset PPG → 封存」。修复后 `sensors.sec` 零崩溃，三星健康夜间睡眠记录恢复（11/16→17）。
+- 同步：长会话的 `pendingRawBytes()` 字节扫描移到后台线程并先开前台租约（修 ANR）；手机节点发现最多等 45 秒、每 2 秒轮询（修息屏/Doze 下的 `CONNECTED_NODE_COUNT_0`）。
+- 封存：改用写入时清单 + 元数据分层上限（seal 32 MiB / bundle 16 MiB / plan 8 MiB）；2 小时会话封存从 31 分 16 秒降到 0.86 秒。
+- 息屏：删除 `FLAG_KEEP_SCREEN_ON`，由系统息屏；同步成功后只退出一次，空闲自动补同步不退出。
+- 测试：shared 397 + wear 96（1 skipped）+ mobile 29 = **522**，失败 0；双端 release + lintRelease PASS；同证书。
+- 真机：1 小时采集 08:09–09:09（PPG 91,081 行）封存并同步到手机（180 次活动，原始约 1108.6 MB）；过夜耗电 0.001 mAh、无服务/传感器/wakelock 残留；手机 App 未运行 + 屏幕 Doze 时息屏同步成功。
+- 待验证：11/17→18 不重启手表的正常睡眠（三星官方睡眠记录 + 过夜耗电）。
+- 已知限制：SpO2/MF-BIA 受佩戴/接触影响；后置 ECG 按正常位置；Samsung Health 导出是官方处理后数据；厂商传感器停止无硬件回执；大档案仍 5 分钟/次断点续传；手机 force-stop 时节点不可见。
 
 安装包和 SHA256 见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。项目不是医疗器械，不提供诊断或治疗建议。

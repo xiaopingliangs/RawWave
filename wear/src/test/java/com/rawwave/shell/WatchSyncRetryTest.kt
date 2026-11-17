@@ -18,6 +18,7 @@ class WatchSyncRetryTest {
         val owner=WatchActivitySyncSession(app,ActivitySyncPolicy.USER_MANUAL)
         app.activeWatchActivitySync=owner
         owner.post={ it() }
+        owner.background={ it() }
         owner.postDelayed={ _, action -> action() }
         owner.leaseFactory={ _, _, ready, _ -> ready(); null }
         owner.transferFactory={ callbacks, _ ->
@@ -39,6 +40,7 @@ class WatchSyncRetryTest {
         assertNull(app.activeWatchActivitySync)
         assertFalse(app.activitySyncStatus.running)
         assertTrue(app.activitySyncStatus.success)
+        assertTrue(app.pendingActivitySyncExit.get())
     }
 
     @Test fun thirdFailureStopsAfterTwoRetries() {
@@ -46,6 +48,7 @@ class WatchSyncRetryTest {
         val owner=WatchActivitySyncSession(app,ActivitySyncPolicy.USER_MANUAL)
         app.activeWatchActivitySync=owner
         owner.post={ it() }
+        owner.background={ it() }
         owner.postDelayed={ _, action -> action() }
         owner.leaseFactory={ _, _, ready, _ -> ready(); null }
         owner.transferFactory={ callbacks, _ ->
@@ -59,6 +62,48 @@ class WatchSyncRetryTest {
         assertFalse(app.activitySyncStatus.running)
         assertFalse(app.activitySyncStatus.success)
         assertTrue(app.activitySyncStatus.text.contains("injected failure"))
+        assertFalse(app.pendingActivitySyncExit.get())
+    }
+
+    @Test fun backgroundBacklogSuccessDoesNotRequestExit() {
+        val app=ProbeApplication();val starts=AtomicInteger()
+        val owner=WatchActivitySyncSession(app,ActivitySyncPolicy.OPEN_IDLE_AUTO)
+        app.activeWatchActivitySync=owner
+        owner.post={ it() }
+        owner.background={ it() }
+        owner.postDelayed={ _, action -> action() }
+        owner.leaseFactory={ _, _, ready, _ -> ready(); null }
+        owner.transferFactory={ callbacks, _ ->
+            starts.incrementAndGet()
+            FakeHandle { callbacks.finished(true,"injected success") }
+        }
+        owner.start()
+        assertEquals(1,starts.get())
+        assertFalse(app.activitySyncStatus.running)
+        assertTrue(app.activitySyncStatus.success)
+        assertFalse(app.pendingActivitySyncExit.get())
+    }
+
+    @Test fun deadSessionWithoutLeaseIsClearedByReconcile() {
+        val app=ProbeApplication()
+        val owner=WatchActivitySyncSession(app,ActivitySyncPolicy.CAPTURE_FINISHED)
+        var now=1_000L
+        owner.clock={ now }
+        owner.post={ it() }
+        owner.background={ it() }
+        owner.leaseFactory={ _, _, _, _ -> null }
+        owner.transferFactory={ _, _ -> FakeHandle { } }
+        app.activeWatchActivitySync=owner
+        owner.start()
+        assertTrue(app.activitySyncStatus.running)
+        now += 46_000L
+        assertTrue(owner.isStalled())
+        app.reconcileStaleSyncState()
+        assertNull(app.activeWatchActivitySync)
+        assertNull(app.activeSyncOwner)
+        assertFalse(app.activitySyncStatus.running)
+        assertFalse(app.activitySyncStatus.success)
+        assertTrue(app.activitySyncStatus.text.contains("上次同步已结束"))
     }
 
     @Test fun hardWindowExpiryPausesInsteadOfRetrying() {
@@ -66,6 +111,7 @@ class WatchSyncRetryTest {
         val owner=WatchActivitySyncSession(app,ActivitySyncPolicy.USER_MANUAL)
         app.activeWatchActivitySync=owner
         owner.post={ it() }
+        owner.background={ it() }
         owner.postDelayed={ _, action -> action() }
         owner.leaseFactory={ _, _, ready, _ -> ready(); null }
         owner.transferFactory={ callbacks, _ ->
@@ -87,6 +133,7 @@ class WatchSyncRetryTest {
         val owner=WatchActivitySyncSession(app,ActivitySyncPolicy.USER_MANUAL)
         app.activeWatchActivitySync=owner
         owner.post={ it() }
+        owner.background={ it() }
         var delayed:(() -> Unit)?=null
         owner.postDelayed={ _, action -> delayed=action }
         owner.leaseFactory={ _, _, ready, _ -> ready(); null }

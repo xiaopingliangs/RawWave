@@ -8,8 +8,8 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 113
-        versionName = "0.12.39-step"
+        versionCode = 120
+        versionName = "0.12.46-step"
         buildConfigField("String", "DEVICE_ROLE", "\"watch\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))
@@ -44,6 +44,7 @@ dependencies {
     implementation(project(":shared"))
     implementation(project(":designsystem"))
     implementation("androidx.activity:activity:1.9.3")
+    implementation("androidx.wear:wear-ongoing:1.1.0")
     implementation("com.google.android.gms:play-services-wearable:19.0.0")
 }
 

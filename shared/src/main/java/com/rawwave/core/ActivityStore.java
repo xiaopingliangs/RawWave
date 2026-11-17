@@ -356,16 +356,27 @@ public final class ActivityStore {
         public synchronized Map<String,Long> counts(){return Map.copyOf(rows);}
         public synchronized void seal(String reason,long utcMs) throws IOException {
             if(sealed) return;
+            // Every block hash was computed from the bytes read back immediately after that
+            // block was written. Re-reading and re-hashing the whole session here made a
+            // two-hour capture (3.59M rows, ~1.86 GB, ~76k blocks) sit in "正在保存" for
+            // 31 minutes after CAPTURE_SESSION_END. Seal now proves that every declared file
+            // is still present at its recorded length; the append-time SHA-256 stays in the
+            // manifest, and ActivityArchive re-hashes every byte when it builds the ZIP and
+            // when the phone verifies it. A same-length external edit is therefore caught at
+            // archive build/transfer, not by this bounded seal step.
             Map<String,Object> manifest=new TreeMap<>(files);
             byte[] plan=Files.readAllBytes(new File(folder,"plan.json").toPath());
             manifest.put("plan.json",Map.of("bytes",plan.length,"sha256",DiagnosticArchive.hash(plan)));
             for(var e:manifest.entrySet()) {
                 Map<?,?> expected=(Map<?,?>)e.getValue();
-                byte[] actual=Files.readAllBytes(new File(folder,e.getKey()).toPath());
-                if(actual.length!=((Number)expected.get("bytes")).longValue() || !DiagnosticArchive.hash(actual).equals(expected.get("sha256"))) throw new IOException("SEAL_READBACK_MISMATCH");
+                File block=new File(folder,e.getKey());
+                if(!block.isFile() || block.length()!=((Number)expected.get("bytes")).longValue())
+                    throw new IOException("SEAL_READBACK_MISMATCH");
             }
             write(new File(folder,"seal.json"),Map.of("schema",1,"sessionId",id,"reason",reason,"endedUtcMs",utcMs,
-                "fileIntegrity","SEALED_VERIFIED","coverage","See per-source events; file integrity is not sensor success", "counts",rows,"files",manifest));
+                "fileIntegrity","SEALED_APPEND_VERIFIED",
+                "verification","Block SHA-256 recorded on append readback; seal checks presence and byte length; archive build and receiver re-verify every byte",
+                "coverage","See per-source events; file integrity is not sensor success", "counts",rows,"files",manifest));
             sealed=true;
             ActivityTransportWriter writer=transport;
             if(writer!=null) {

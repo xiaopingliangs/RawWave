@@ -67,19 +67,45 @@ class RecordingActivity : ComponentActivity() {
             "pendingCount" to pendingCount, "foreground" to resumed)) } catch (_: Exception) {}
         if (start) { syncCycleSeen = true; startPendingSync(ActivitySyncPolicy.OPEN_IDLE_AUTO) }
     }
+    /**
+     * The sync session is app-owned, but its service can disappear without a callback. A periodic
+     * reconcile is the only thing that recovers the visible "同步中" page in that case; the
+     * watchdog does not wake the device and stops as soon as the status is no longer running.
+     */
+    private val syncWatchdog = object : Runnable {
+        override fun run() {
+            if (!app.activitySyncStatus.running) {
+                autoExitAfterSync("WATCHDOG")
+                return
+            }
+            app.reconcileStaleSyncState()
+            if (!app.activitySyncStatus.running) {
+                if (autoExitAfterSync("WATCHDOG_RECONCILE")) return
+                if (!resumed) return
+                if (mode == "SYNC_STATUS") showSyncStatus()
+                else if (!inWatchPage()) render(ActivityRecordingService.state)
+                return
+            }
+            main.postDelayed(this, SYNC_WATCHDOG_MS)
+        }
+    }
     private val syncListener: (ProbeApplication.ActivitySyncStatus) -> Unit = syncListener@{ sync ->
+        if (sync.running) armSyncWatchdog() else cancelSyncWatchdog()
+        // A capture-finished/manual sync owns a one-shot exit. Consume it before the generic
+        // page branches: the old SYNC_STATUS branch dropped the signal, which left the watch
+        // on the sync page even though the phone had already committed the data.
+        if (!sync.running && sync.success && autoExitAfterSync("SYNC_LISTENER")) return@syncListener
         if (inWatchPage() && !ActivityRecordingService.state.active) {
-            if (!sync.running) releaseIdleAfterSync()
-            if (mode == "SYNC_STATUS") showSyncStatus()
+            if (!sync.running) {
+                releaseIdleAfterSync()
+                if (mode == "SYNC_STATUS") showSyncStatus()
+            }
             return@syncListener
         }
         syncCycleSeen = true
         if (!resumed) {
             // The screen may be off while the bounded sync finishes. Do not touch views here;
-            // only consume the one-shot completion signal and close the task.
-            if (!sync.running && sync.success && consumeSyncExit()) {
-                main.post { if (!isFinishing) finishAndRemoveTask() }
-            }
+            // the one-shot exit was handled above.
             return@syncListener
         }
         if (ActivitySyncPolicy.isNonBlockingHomeSync(sync.trigger)) {
@@ -101,10 +127,6 @@ class RecordingActivity : ComponentActivity() {
             if (!ActivityRecordingService.state.active) {
                 status.text = "正在后台同步：${sync.text}\n可以先开始新的活动。"
             }
-        } else if (sync.success && ActivitySyncPolicy.exitAfterSuccessfulSync(sync.trigger)) {
-            consumeSyncExit()
-            idle?.close(); idle = null
-            main.post { if (!isFinishing) finishAndRemoveTask() }
         } else {
             releaseIdleAfterSync()
             mode = ""
@@ -113,8 +135,21 @@ class RecordingActivity : ComponentActivity() {
                 "本轮同步未完成，数据仍保留。你可以开始活动；无操作满80秒后停止所有工作。"
         }
     }
-    private fun consumeSyncExit(): Boolean =
-        (application as ProbeApplication).pendingActivitySyncExit.getAndSet(false)
+    /**
+     * Close the watch task only after a successful capture-finished/manual sync. The one-shot
+     * is consumed regardless of the page currently shown, so a child page cannot swallow the
+     * exit and leave the watch sitting on "同步中" after the phone has committed the data.
+     */
+    private fun autoExitAfterSync(origin: String): Boolean {
+        if (ActivityRecordingService.state.active || app.activitySyncStatus.running) return false
+        if (!app.pendingActivitySyncExit.compareAndSet(true, false)) return false
+        try { app.journal?.event("ACTIVITY_SYNC_AUTO_EXIT", mapOf(
+            "origin" to origin, "mode" to mode, "resumed" to resumed,
+            "trigger" to app.activitySyncStatus.trigger,
+            "success" to app.activitySyncStatus.success)) } catch (_: Exception) {}
+        closeWatchTask()
+        return true
+    }
     private val listener: (ActivityRecordingService.Companion.State) -> Unit = { render(it) }
     private val successListener: (String, String) -> Unit = { kind, text ->
         if (resumed && ::successBanner.isInitialized) {
@@ -134,8 +169,7 @@ class RecordingActivity : ComponentActivity() {
         cancelAutoSync(reason)
         idle?.close(); idle = null
         guide.animateContact = false
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        finishAndRemoveTask()
+        closeWatchTask()
     }
     /** The UI countdown is never allowed to stop a bounded transfer that already owns the app. */
     private fun onIdleDeadline(reason: String, evidence: Map<String, Any>) {
@@ -248,7 +282,7 @@ class RecordingActivity : ComponentActivity() {
         // the bounded sync, and the success must still close the task instead of waiting for a
         // later manual launch.
         app.activitySyncObserver = syncListener
-        if (consumeSyncExit()) { finishAndRemoveTask(); return }
+        if (autoExitAfterSync("ON_CREATE")) return
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 when (mode) {
@@ -267,18 +301,19 @@ class RecordingActivity : ComponentActivity() {
                     confirmStopCapture(); return
                 }
                 // Leaving the screen during sync is not a request to stop the transfer.
-                if (app.activitySyncStatus.running) moveTaskToBack(true) else finishAndRemoveTask()
+                if (app.activitySyncStatus.running) moveTaskToBack(true) else closeWatchTask()
             }
         })
     }
     override fun onStart() {
         super.onStart(); resumed = true
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ActivityRecordingService.observer = listener
         ActivityRecordingService.successObserver = successListener
         // A child screen (problem-report export, diagnostics) may have replaced the app-level
         // observer and cleared it on exit. Re-register before restoring the page.
         app.activitySyncObserver = syncListener
-        if (consumeSyncExit()) { finishAndRemoveTask(); return }
+        if (autoExitAfterSync("ON_START")) return
         // A fresh Activity is the user's recovery path: never keep a RELEASING screen that
         // outlived its hold, and never keep a sync page whose session/lease is already gone.
         (application as ProbeApplication).reconcileStaleSyncState()
@@ -298,10 +333,32 @@ class RecordingActivity : ComponentActivity() {
         } else if (app.activitySyncStatus.running && !ActivitySyncPolicy.isNonBlockingHomeSync(app.activitySyncStatus.trigger))
             renderSync(app.activitySyncStatus)
         else render(ActivityRecordingService.state)
+        if (app.activitySyncStatus.running) armSyncWatchdog() else cancelSyncWatchdog()
         scheduleAutoSync("ON_START")
+    }
+    /**
+     * singleTask keeps the launcher from stacking a second RecordingActivity. Tapping the icon
+     * again should bring the existing task home instead of leaving the user on a subpage.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (ActivityRecordingService.state.active) return
+        app.reconcileStaleSyncState()
+        if (inWatchPage()) returnHome()
+        else if (!app.activitySyncStatus.running) { mode = ""; render(ActivityRecordingService.state) }
+        if (app.activitySyncStatus.running) armSyncWatchdog()
+        scheduleAutoSync("ON_NEW_INTENT")
+    }
+    override fun onPause() {
+        // The display timeout belongs to the system; clear a flag left by an older build or a
+        // previous measurement path as soon as this screen leaves the foreground.
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        super.onPause()
     }
     override fun onStop() {
         resumed = false
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (ActivityRecordingService.observer === listener) ActivityRecordingService.observer = null
         if (ActivityRecordingService.successObserver === successListener) ActivityRecordingService.successObserver = null
         cancelAutoSync("ON_STOP")
@@ -317,6 +374,7 @@ class RecordingActivity : ComponentActivity() {
         if (app.activitySyncObserver === syncListener) app.activitySyncObserver = null
         stopDialog?.dismiss(); stopDialog = null
         main.removeCallbacks(hideSuccess)
+        cancelSyncWatchdog()
         cancelAutoSync("ON_DESTROY"); idle?.close(); super.onDestroy()
     }
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -393,8 +451,11 @@ class RecordingActivity : ComponentActivity() {
         if (countdown.isNotEmpty()) stepCountdown.text = countdown
         stepInstruction.visibility = if (shortPhase) View.VISIBLE else View.GONE
         if (shortPhase) stepInstruction.text = instructionsFor(s, guideMode, contactDetected)
-        if (measuringEcg || (s.active && (s.shortSensor == "SPO2" || s.shortSensor == "BIA" || s.shortSensor == "PPG_ON_DEMAND"))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Never override the watch's screen timeout. Capture and short measurements run in the
+        // foreground service and already support screen-off; holding the display awake through
+        // a 30-second ECG/BIA/SpO2 phase (or an open-ended contact wait) drained the battery and
+        // was reported as "屏幕在测量中/测量后不熄灭".
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val showTimer = s.active && s.phase == "CORE-1"
         timerLabel.visibility = if (showTimer) View.VISIBLE else View.GONE
         activityTimer.visibility = if (showTimer) View.VISIBLE else View.GONE
@@ -688,6 +749,7 @@ class RecordingActivity : ComponentActivity() {
         mode = "SYNC_STATUS"
         pageHeader("同步状态")
         val sync = app.activitySyncStatus
+        if (sync.running) armSyncWatchdog()
         val pending = pendingSyncCount()
         val latestUnsealed = try {
             ActivityRecordingService.store(this).history().firstOrNull()?.contains("未封存/") == true
@@ -1178,6 +1240,34 @@ class RecordingActivity : ComponentActivity() {
         finish()
     }
 
+    private fun armSyncWatchdog() {
+        main.removeCallbacks(syncWatchdog)
+        main.postDelayed(syncWatchdog, SYNC_WATCHDOG_MS)
+    }
+
+    private fun cancelSyncWatchdog() {
+        main.removeCallbacks(syncWatchdog)
+    }
+
+    /**
+     * Close every activity in this task, not just the visible instance. The watch launcher can
+     * create another RecordingActivity when the launch mode is standard; finishAffinity() makes
+     * "完全退出" a single action even on builds/tasks that already stacked instances.
+     */
+    private fun closeWatchTask() {
+        try { app.journal?.event("ACTIVITY_TASK_CLOSE", mapOf(
+            "mode" to mode, "resumed" to resumed,
+            "captureActive" to ActivityRecordingService.state.active,
+            "syncRunning" to app.activitySyncStatus.running,
+            "syncTrigger" to app.activitySyncStatus.trigger,
+            "pendingExit" to app.pendingActivitySyncExit.get())) } catch (_: Exception) {}
+        cancelSyncWatchdog()
+        idle?.close(); idle = null
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        try { finishAffinity() } catch (_: Exception) {}
+        finishAndRemoveTask()
+    }
+
     /**
      * Full exit: stop the active capture (which seals data and releases the vendor sensor /
      * LED through the existing background release) and stop any sync, then close the task.
@@ -1195,8 +1285,7 @@ class RecordingActivity : ComponentActivity() {
         cancelAutoSync("FULL_EXIT")
         idle?.close(); idle = null
         guide.animateContact = false
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        finishAndRemoveTask()
+        closeWatchTask()
     }
 
     /**
@@ -1271,6 +1360,7 @@ class RecordingActivity : ComponentActivity() {
 
     private fun renderSync(sync: ProbeApplication.ActivitySyncStatus) {
         if (inWatchPage()) return
+        if (sync.running) armSyncWatchdog()
         cancelAutoSync("SYNC_RUNNING")
         if (sync.running) holdIdleForSync() else ensureIdle()
         measurementHeader.visibility = View.VISIBLE
@@ -1435,6 +1525,8 @@ class RecordingActivity : ComponentActivity() {
                 check(false) { "请先结束诊断传输，再开始采集" }
             }
             check(filesDir.usableSpace > 50_000_000L) { "存储不足50MB，不能安全开始记录" }
+            // A new capture supersedes any pending exit signal from an earlier sync.
+            app.pendingActivitySyncExit.set(false)
             idle?.close(); idle = null
             status.text = "正在开始，请稍候…"
             controls.removeAllViews()
@@ -1664,6 +1756,10 @@ class RecordingActivity : ComponentActivity() {
         } catch (_: Exception) { false }
     }
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
+
+    private companion object {
+        const val SYNC_WATCHDOG_MS = 5_000L
+    }
 }
 
 /** Code-drawn measurement guidance: schematic watch, contact state and concise captions. */

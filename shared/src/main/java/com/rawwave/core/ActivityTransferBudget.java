@@ -17,8 +17,11 @@ package com.rawwave.core;
 public final class ActivityTransferBudget {
     private ActivityTransferBudget() {}
 
-    /** One short attempt window before the archive size is known. */
-    public static final long INITIAL_MS = 80_000L;
+    /**
+     * Initial attempt window. It must cover the phone-node discovery wait plus handshake,
+     * send and commit for a small archive; packaging has its own separate budget.
+     */
+    public static final long INITIAL_MS = 150_000L;
     /** Conservative packaging throughput: raw bytes per second on the watch (17 min observed). */
     public static final long PACKAGING_MIN_RATE_BYTES_PER_SECOND = 256L * 1024L;
     /** A packaging attempt may legitimately take minutes on a long activity. */
@@ -27,8 +30,10 @@ public final class ActivityTransferBudget {
     public static final long PACKAGING_MAX_MS = 25L * 60_000L;
     /** Extra protection beyond the packaging estimate for slow storage and final verification. */
     public static final long PACKAGING_MARGIN_MS = 120_000L;
-    /** Discovery, HELLO retries and opening the file channel after the size is known. */
-    public static final long HANDSHAKE_MS = 30_000L;
+    /** HELLO retries and channel open after the phone node is found. */
+    public static final long HANDSHAKE_MS = 60_000L;
+    /** How long a watch keeps looking for the phone node before failing the attempt. */
+    public static final long DISCOVERY_MS = 45_000L;
     /** Base phone commit allowance for small archives. */
     public static final long COMMIT_BASE_MS = 30_000L;
     /** Conservative deep-verification throughput over the compressed archive bytes. */

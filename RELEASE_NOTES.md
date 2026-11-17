@@ -1,3 +1,77 @@
+## 2026-11-17 测试版：0.12.46 厂商传感器收尾崩溃修复 / 息屏同步 / 封存提速 / 长会话同步 ANR
+
+- 运行编号：`sync-discovery-20261117-r06`
+- 版本：`0.12.46-step` / versionCode 120
+- 类型：测试版，不是稳定发布
+- 真机：Galaxy Watch（SM-L350）+ Galaxy S9210，均通过
+
+### 本版重点（包含 0.12.40–0.12.46）
+
+**1. 修复采集结束后 `sensors.sec` SIGSEGV（0.12.42–0.12.44）**
+
+2026-11-12 起，每次 PPG 采集结束 6–14 秒后，三星传感器服务在 `Ppg25HzSensor::parsePPGMultiData()` 崩溃；HAL 重启后三星健康传感器管线卡死，整夜没有睡眠数据（官方睡眠记录 11/12→13、13→14、14→15、15→16 连续缺失）。
+
+8 组真机对照结论：不是 flush、不是 unset 太早，而是 **PPG 25 Hz 会话不能和其他传感器 client 同批拆除**。哪怕 PPG 排在最后、哪怕只 unset 一次，只要其他 client 当时还活着就会崩。
+
+现在的收尾顺序（正常结束、取消、80 秒超时、服务销毁全部一致）：
+
+1. 停掉其他所有来源（保留 PPG）；
+2. 等待 `ppgReleaseGapMs` = 3 秒，**从最后一次其他 stop 起算**；
+3. 单独 flush + unset PPG；
+4. 封存。
+
+如果只有 PPG 在跑、或刚刚没有停过其他 client，则不等。旧实现从批次开始计时，而每次 drain 都有 4 个磁力计类传感器必然超时 5 秒（`DRAIN_TIMEOUT_TAIL_UNKNOWN`），导致 PPG 实际只隔了 0.4 秒就释放——这正是 11-16 10:55 那次取消崩溃的原因。
+
+**2. 修复长会话同步 ANR（0.12.45）**
+
+1 小时会话点“立即同步”或发送问题报告时，主线程在 `ActivityArchive.pendingRawBytes()` 里对上千个 block 文件做 `File.listFiles`/`isFile`，实测 10 秒以上，触发系统 ANR（5 次 dumpsys 栈完全一致，主线程 `state=D`）。修复：字节扫描移到后台线程，且扫描前先开 `SyncGuardService` 前台租约（初始 185 秒），扫描后按真实字节数延长；主线程只更新状态。
+
+**3. 修复息屏/后台同步失败（0.12.46）**
+
+09:10 自动同步停在 `ACTIVITY_DISCOVERY_STARTED / CONNECTED_NODE_COUNT_0`：节点查询只做一次，手机充电、屏幕黑、蓝牙低功耗时节点列表瞬时为空，3 秒 × 3 次的重试覆盖不了（8 分钟后手机又能收到手表消息）。修复：节点发现最多等 45 秒、每 2 秒轮询；`HANDSHAKE_MS=60s`、`INITIAL_MS=150s`、`RETRY_DELAY_MS=8s`。数据仍保留，5 分钟单次上限与断点续传不变。
+
+**4. 封存提速与元数据分层（0.12.41）**
+
+2 小时采集结束后曾卡在“正在保存”31 分 16 秒（`seal()` 把约 7.6 万个 block 全部读回复算 SHA-256）。改为使用写入时清单（存在 + 长度 + 条数）并标记 `SEALED_APPEND_VERIFIED`，全量逐字节校验留在归档构建、传输和接收端；实测 52,556 行 / 434 blocks 的会话封存耗时 **0.86 秒**。元数据上限分层：`SEAL=32 MiB` / `BUNDLE=16 MiB` / `PLAN=8 MiB`，修复 8,389,157 B 的 `seal.json` 被 8 MiB 上限拒绝的问题；`openLease()` 复用活动租约，避免重试时 `ForegroundServiceStartNotAllowedException`。
+
+**5. 手表息屏与一次退出（0.12.40）**
+
+删除所有 `FLAG_KEEP_SCREEN_ON`，由系统 `screen_off_timeout` 息屏，采集仍由前台服务承担；同步成功后只退出一次（`singleTask` + `finishAffinity` + `finishAndRemoveTask`）；`OPEN_IDLE_AUTO` 自动补同步不退出；新增 45 秒 stale-sync watchdog。
+
+### 验证
+
+- shared 397 + wear 96（1 skipped）+ mobile 29 = **522 tests**，失败 0、错误 0；双端 release + lintRelease PASS；同证书。
+- 停止顺序真机（118，SM-L350）：取消 11:35（3.010 s）、正常结束 11:41（3.005 s）、取消 11:45（3.006 s），三次 `logcat -b crash` 全空，`sensors.sec` pid 25552 未变，表背绿灯熄灭。
+- 1 小时采集（11-17 08:09:23 → 09:09:55）：PPG 91,081 行，3.0 秒间隔，crash 缓冲为空，`sensors.sec` pid 1344 未变，封存完成，绿灯熄灭。
+- 1 小时会话同步：手机收到 180 次活动（原 179），最近「乱跳 · 2026-11-17 08:09」，原始约 1108.6 MB，提交时逐文件 SHA-256 校验。
+- 过夜（11/16→17，未重启手表）：`sensors.sec` 零崩溃，三星健康恢复睡眠记录（00:45–06:58），血氧/皮温同步恢复；RawWave 过夜耗电 0.001 mAh，无服务/传感器/wakelock 残留。
+- 息屏同步（11-17 11:03，120）：手机 App 未运行、屏幕 Doze、USB 充电，手表息屏点“立即同步”，手机进程被按需拉起，传输成功，手机端 181 次活动。
+- 三星官方数据核查（同日导出 8.5 MB JSON）：白天心率每天 840–1440 分钟覆盖，缺失的是夜间连续测量会话，不是整条传感器管线。
+
+### 已知限制
+
+- SpO2 成功率、MF-BIA 仍受佩戴/接触条件影响，原始状态码和失败进度全部保留。
+- 后置 ECG 仍按正常位置完成（三星标准；接触不佳时才建议稍向肘部）。
+- Samsung Health 导出是官方 Data SDK 读出的处理后数据，不是原始 PPG/ECG 波形。
+- 厂商传感器停止没有硬件回执；应用层确认 unset/断开，但不能证明硬件一定停止。
+- 大档案仍受 5 分钟/次传输上限，跨多次打开续传；手机被 force-stop 时节点不可见。
+- 今晚（11/17→18）不重启手表的正常睡眠验证尚未出结果。
+
+### 安装
+
+手机：`Phone_RawWave_0.12.46-step_sync-discovery-20261117-r06.apk`
+SHA256：`289BCCB845C60BE3A9A0ACE769FFD59F03AFBFD4B0B575373A00C8EDB7A8BD84`
+
+手表：`Watch_RawWave_0.12.46-step_sync-discovery-20261117-r06.apk`
+SHA256：`FC2967455029AA924145E4E1144214A46C7FCEDBB46D770B17C684CF3C319646`
+
+双端 ZIP：`Both_RawWave_0.12.46-step_sync-discovery-20261117-r06.zip`
+SHA256：`930C2FAD6DE47DFBBA991CDFA74D478452829F2051096C9CC7966018ADB3CA7B`
+
+两端成对覆盖安装，保留原有数据，不需要先卸载。使用本地测试证书，不是公开发行包。
+
+---
+
 ## 2026-11-12 测试版：0.12.39 前后置测量顺序按姿势重排 / 圆屏排版修复
 
 - 运行编号：`measurement-order-20261112-r05`

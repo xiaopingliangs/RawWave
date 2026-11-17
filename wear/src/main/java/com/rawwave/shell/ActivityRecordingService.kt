@@ -10,6 +10,8 @@ import android.os.*
 import android.system.Os
 import android.system.OsConstants
 import android.view.Display
+import androidx.core.app.NotificationCompat
+import androidx.wear.ongoing.OngoingActivity
 import com.rawwave.core.ActivityStore
 import com.rawwave.core.ActivitySyncPolicy
 import com.rawwave.core.DeviceState
@@ -38,6 +40,10 @@ class ActivityRecordingService : Service() {
         private const val VENDOR_RELEASE_KILL_DELAY_MS = 1_500L
         /** Rest between BIA/MF-BIA attempts; the electrode/skin state needs to settle. */
         private const val BIA_CONTACT_RETRY_MS = 5_000L
+        /** Maximum age of buffered sensor rows before they become one immutable block. */
+        private const val BLOCK_FLUSH_INTERVAL_MS = 5_000L
+        /** Row ceiling so high-rate streams still bound one block's size and write latency. */
+        private const val BLOCK_FLUSH_MAX_ROWS = 1_000
         data class State(val active: Boolean = false, val phase: String = "",
             val text: String = "", val remaining: Int = 0, val contact: Boolean = false,
             val skipAllowed: Boolean = false, val failedAttempts: Int = 0, val shortSensor: String = "ECG",
@@ -76,8 +82,21 @@ class ActivityRecordingService : Service() {
     private var session: ActivityStore.Session? = null
     private var persistence: com.rawwave.core.CapturePersistence? = null
     internal var useDiskOwner = false
-    /** Production default: drain PPG before the SDK HR client so the vendor stop can apply. */
-    internal var drainPpgFirstForLed = true
+    /**
+     * 2026-11-16 device evidence: the vendor `PPG` tracker must be the last client on the
+     * connector. Unsetting it while any other sensor client is still active SIGSEGVs
+     * `sensors.sec` in `Ppg25HzSensor::parsePPGMultiData` 6-14 s later and takes Samsung
+     * Health's sensor pipeline down with it. Stop every other source first, then release PPG
+     * alone after this gap. The LED still stops (verified on SM-L350).
+     */
+    internal var ppgReleaseGapMs = 3_000L
+    /** True from the first terminal drain until the PPG-only phase is about to finish. */
+    private var finishDraining = false
+    private var finishPhase = 0
+    private var finishReason = "USER_INTERRUPTED"
+    private var finishIdleExit = false
+    /** Last time a non-PPG source was unset; the vendor needs a settle gap from this. */
+    private var lastOtherStopMs = 0L
     private fun appendRows(phase: String, sensor: String, rows: List<Map<String, Any?>>) {
         persistence?.append(phase, sensor, rows) ?: session?.append(phase, sensor, rows)
     }
@@ -170,6 +189,14 @@ class ActivityRecordingService : Service() {
     private val silent = mutableSetOf<String>()
     private var lastDeviceStateMs = 0L
     private val buffers = mutableMapOf<String, MutableList<Map<String, Any?>>>()
+    /**
+     * Coalesce per-second callbacks into larger immutable blocks. At 1s flushes a two-hour
+     * capture produced ~76k files and a >8 MiB seal.json, making every later verification
+     * walk tens of thousands of entries. A bounded 5 s / 1000-row block keeps durability
+     * close to the old behaviour while cutting file count by roughly 5x. Phase changes and
+     * drains force a flush, so rows are never relabelled into the next phase.
+     */
+    private val lastFlushMs = mutableMapOf<String, Long>()
     private val qualityTrackers = mutableMapOf<String, StreamQualityTracker>()
     private val tick = object : Runnable {
         override fun run() = guarded {
@@ -279,16 +306,39 @@ class ActivityRecordingService : Service() {
             try {
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.createNotificationChannel(NotificationChannel("capture", "活动采集", NotificationManager.IMPORTANCE_LOW))
-                val pending = PendingIntent.getActivity(this, 0, Intent(this, RecordingActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                val pending = PendingIntent.getActivity(this, 0,
+                    Intent(this, RecordingActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
                 val stop = PendingIntent.getService(this, 1,
                     Intent(this, ActivityRecordingService::class.java).setAction("CANCEL"),
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-                val notification = Notification.Builder(this, "capture").setSmallIcon(R.drawable.ic_rawwave)
+                val notification = NotificationCompat.Builder(this, "capture")
+                    .setSmallIcon(R.drawable.ic_rawwave)
                     .setContentTitle("原波正在记录活动")
                     .setContentText("返回原波正常结束；也可停止采集并保存（不做活动后短测）")
                     .setContentIntent(pending).setOngoing(true)
-                    .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止采集（保存）", stop).build()
-                startForeground(410, notification,
+                    .setCategory(NotificationCompat.CATEGORY_WORKOUT)
+                    .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                    .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止采集（保存）", stop)
+                // Wear OS returns to the watch face after its ambient timeout unless the
+                // foreground task is registered as an Ongoing Activity. Registering capture
+                // makes a wrist raise/press return to the live activity screen instead of the
+                // watch face, without holding the display awake.
+                try {
+                    val ongoing = OngoingActivity.Builder(applicationContext, 410, notification)
+                        .setAnimatedIcon(R.drawable.ic_rawwave)
+                        .setStaticIcon(R.drawable.ic_rawwave)
+                        .setTouchIntent(pending)
+                        .setCategory(NotificationCompat.CATEGORY_WORKOUT)
+                        .build()
+                    ongoing.apply(applicationContext)
+                    (application as ProbeApplication).journal?.event("CAPTURE_ONGOING_ACTIVITY_POSTED",
+                        mapOf("notificationId" to 410, "category" to NotificationCompat.CATEGORY_WORKOUT))
+                } catch (error: Exception) {
+                    // Capture must still start if an OEM rejects the ongoing-activity metadata.
+                    try { (application as ProbeApplication).journal?.fault("CAPTURE_ONGOING_ACTIVITY_FAILED", error) } catch (_: Exception) {}
+                }
+                startForeground(410, notification.build(),
                     if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH else 0)
                 lock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RawWave:Capture").apply {
                     setReferenceCounted(false); acquire(60_000)
@@ -300,7 +350,7 @@ class ActivityRecordingService : Service() {
                 if (Build.VERSION.SDK_INT >= 34 && template.coreSources().contains(SensorCatalog.GPS) &&
                     checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
                     // Location foreground type is added only for a selected, granted GPS source.
-                    startForeground(410, notification,
+                    startForeground(410, notification.build(),
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
                 }
                 writer.post { guarded {
@@ -395,17 +445,21 @@ class ActivityRecordingService : Service() {
                             }
                         }
                         // 2026-11-05 evidence: the vendor 25 Hz stop is applied when PPG is
-                        // unset while the SDK HEART_RATE client is still active. Drain PPG
-                        // first, then the remaining sources; do not drain both together.
-                        val ppgFirstForLed = drainPpgFirstForLed && !postEcg &&
-                            coreSources.contains(SensorCatalog.PPG) &&
-                            coreSources.contains(SensorCatalog.HEART_RATE)
-                        if (ppgFirstForLed) {
-                            event("LED_RELEASE_DRAIN_PPG_FIRST",
-                                "keep=HEART_RATE; reason=PPG_25HZ_STOP_NOT_VERIFIABLE")
-                            drainSources(keep = setOf(SensorCatalog.HEART_RATE), allowPartialPost = true,
-                                only = setOf(SensorCatalog.PPG)) {
-                                drainSources(allowPartialPost = postEcg || postSpo2 || postPpg) { postFlow() }
+                        // unset while the SDK HEART_RATE client is still active. 2026-11-16
+                        // evidence: that exact order crashes the vendor parser. Release PPG
+                        // last: stop every other source, wait, then unset PPG alone.
+                        val ppgLastForVendor = !postEcg && coreSources.contains(SensorCatalog.PPG)
+                        if (ppgLastForVendor) {
+                            event("LED_RELEASE_DRAIN_PPG_LAST",
+                                "keep=PPG; gapMs=$ppgReleaseGapMs; reason=VENDOR_PPG_STOP_REQUIRES_LAST_CLIENT")
+                            drainSources(keep = setOf(SensorCatalog.PPG),
+                                allowPartialPost = postEcg || postSpo2 || postPpg) {
+                                writer.postDelayed({
+                                    guarded {
+                                        drainSources(only = setOf(SensorCatalog.PPG),
+                                            allowPartialPost = postEcg || postSpo2 || postPpg) { postFlow() }
+                                    }
+                                }, ppgReleaseGapMs)
                             }
                         } else {
                             drainSources(keep = if (holdPpg) setOf("PPG") else emptySet(),
@@ -914,7 +968,7 @@ class ActivityRecordingService : Service() {
                         EcgContinuityGate.Status.CONTINUING -> Unit
                     }
                 }
-                if ((buffers[sensor]?.size ?: 0) >= 1000) flush()
+                if ((buffers[sensor]?.size ?: 0) >= BLOCK_FLUSH_MAX_ROWS) flush()
             }
         }, { error ->
             if (draining != null && phase == origin && captureRuns.current(run)) {
@@ -1050,6 +1104,7 @@ class ActivityRecordingService : Service() {
             if (!running.remove(sensor)) return@forEach
             captureRuns.endSensor(sensor)
             try { adapter?.stop(sensor) } catch (e: Exception) { failure = e }
+            if (sensor != SensorCatalog.PPG) lastOtherStopMs = clock()
             // A diagnostic write failure must not skip stopping the remaining sensors.
             try { event("SENSOR_STOP_REQUEST", sensor); emitQuality(origin, sensor) }
             catch (e: Exception) { failure = e }
@@ -1062,13 +1117,13 @@ class ActivityRecordingService : Service() {
      * drains, so its final unset is a real first unset after the vendor HRM re-open.
      */
     private fun drainSources(keep: Set<String> = emptySet(), allowPartialPost: Boolean = false,
-                             only: Set<String>? = null, next: () -> Unit) {
+                             only: Set<String>? = null, budgetMs: Long = 5_000, next: () -> Unit) {
         if (draining != null || stopping) return
         val sources = running.toList().filterNot { it in keep }.filter { only == null || it in only }
         val drain = CaptureDrain(sources)
         draining = drain
         writer.removeCallbacks(tick)
-        val expires = clock() + 5_000
+        val expires = clock() + budgetMs
         val timeout = Runnable {
             if (draining === drain) guarded {
                 drain.timeout()
@@ -1078,9 +1133,9 @@ class ActivityRecordingService : Service() {
             }
         }
         // Separate bounded cleanup budget, not a restarted 80-second user wait.
-        writer.postDelayed(timeout, 5_000)
+        writer.postDelayed(timeout, budgetMs)
         renewCaptureLock()
-        event("DRAIN_REQUESTED", "phase=$phase; sources=$sources; keep=$keep; cleanupBudgetMs=5000")
+        event("DRAIN_REQUESTED", "phase=$phase; sources=$sources; keep=$keep; cleanupBudgetMs=$budgetMs")
         publish()
         for (sensor in sources) {
             try {
@@ -1089,6 +1144,7 @@ class ActivityRecordingService : Service() {
                           timeout.run()
                       } else if (draining === drain && drain.complete(sensor, status, detail)) {
                         captureRuns.endSensor(sensor); running.remove(sensor)
+                        if (sensor != SensorCatalog.PPG) lastOtherStopMs = clock()
                         event("SOURCE_DRAIN_COMPLETED", "$sensor; status=$status; detail=$detail")
                         emitQuality(phase, sensor)
                         completeDrain(drain, sources, next, allowPartialPost)
@@ -1107,7 +1163,7 @@ class ActivityRecordingService : Service() {
             // Data callbacks preceding each completion have already run on this writer.
             stopSources(sources)
             persistence?.barrier()
-            flush()
+            flush(force = true)
             persistence?.barrier()
             event("DRAIN_ROWS_PERSISTED", "phase=$phase; counts=${persistedCounts()}; sourceFailures=${drain.failures()}; SDK atomic stop not guaranteed")
         }, { failure ->
@@ -1115,7 +1171,10 @@ class ActivityRecordingService : Service() {
         val terminal = pendingFinish
         pendingFinish = null
         when {
-            fatalPending.get() != null -> finishNow(fatalPending.get()!!, terminal?.second ?: false)
+            fatalPending.get() != null -> finishNow(fatalPending.get()!!, terminal?.second ?: finishIdleExit)
+            // A destroyed service still owes the vendor the settle gap; the release hold
+            // keeps the process alive long enough to finish the two-phase stop.
+            destroyed && finishDraining -> next()
             destroyed -> finishNow("SERVICE_DESTROYED_INTERRUPTION", terminal?.second ?: false)
               failure != null && allowPartialPost && terminal == null &&
                   failure.startsWith("DRAIN_INCOMPLETE:") && !failure.contains("DRAIN_SAVE_FAILED:") &&
@@ -1124,8 +1183,12 @@ class ActivityRecordingService : Service() {
                   event("CORE_TAIL_UNCONFIRMED_POST_CONTINUES", "$failure; accepted rows persisted; sources stopped; post measurements follow")
                   next()
               }
-            failure != null -> finishNow(failure, terminal?.second ?: false)
-            terminal != null -> finishNow(terminal.first, terminal.second)
+            failure != null -> {
+                if (!finishDraining) drainForFinish(failure, terminal?.second ?: finishIdleExit)
+                else if (finishPhase >= 2) finishNow(failure, terminal?.second ?: finishIdleExit)
+                else { finishReason = "$finishReason;$failure"; releasePpgAfterGap() }
+            }
+            terminal != null -> if (finishDraining) next() else drainForFinish(terminal.first, terminal.second)
             else -> next()
         }
         })
@@ -1148,8 +1211,17 @@ class ActivityRecordingService : Service() {
             event("STREAM_QUALITY", "$origin/$sensor:${it.summary()}; computed metadata only; raw rows unchanged")
         }
     }
-    private fun flush() {
-        buffers.forEach { (sensor, rows) -> if (rows.isNotEmpty()) { appendRows(streamPhase(), sensor, rows); rows.clear() } }
+    private fun flush(force: Boolean = false) {
+        val now = clock()
+        buffers.forEach { (sensor, rows) ->
+            if (rows.isEmpty()) return@forEach
+            val due = force || rows.size >= BLOCK_FLUSH_MAX_ROWS ||
+                now - (lastFlushMs[sensor] ?: 0L) >= BLOCK_FLUSH_INTERVAL_MS
+            if (!due) return@forEach
+            appendRows(streamPhase(), sensor, rows)
+            rows.clear()
+            lastFlushMs[sensor] = now
+        }
     }
     private fun streamPhase() = when (phase) {
         "CONNECTING", "WAIT_BIA_PRE", "READY_SPO2_PRE", "READY_PPG_PRE" -> "PRE-1"
@@ -1165,6 +1237,9 @@ class ActivityRecordingService : Service() {
         row["kind"] = kind; row["detail"] = detail
         row["utcMs"] = System.currentTimeMillis(); row["elapsedMs"] = clock()
         row.putAll(extra)
+        // Stop-sequence trace: stage names and timings only, never sample values. mirrored
+        // to logcat so a vendor HAL crash can be correlated without exporting the journal.
+        try { android.util.Log.i("RawWaveStop", "$kind elapsed=${row["elapsedMs"]} $detail") } catch (_: Exception) {}
         appendRows(streamPhase(), "EVENT", listOf(row))
         (application as? ProbeApplication)?.journal?.let { journal ->
             val fields = LinkedHashMap<String, Any?>()
@@ -1350,16 +1425,80 @@ class ActivityRecordingService : Service() {
 
     private fun finish(reason: String, idleExit: Boolean = false) {
         if (stopping) return
-        if (pendingFinish == null) pendingFinish = reason to idleExit
         if (phase != "DRAINING") try { sampleDeviceState() } catch (_: Exception) {}
-        if (draining == null) try { drainSources { } } catch (e: Exception) {
+        if (finishDraining) {
+            // Keep the newest reason but never shortcut the two-phase release: the sensor
+            // teardown that is already running will finish the session.
+            finishReason = reason; finishIdleExit = idleExit
+            return
+        }
+        if (draining != null) {
+            // A phase transition is already draining. Remember the final reason; the
+            // running drain consumes it and finishes the session.
+            if (pendingFinish == null) pendingFinish = reason to idleExit
+            return
+        }
+        try { drainForFinish(reason, idleExit) } catch (e: Exception) {
             fatalPending.compareAndSet(null,"DRAIN_SETUP_FAILED:${e.message}")
             // Once draining is set, its timeout is armed before lock/diagnostic work.
             if (draining == null) finishNow(fatalPending.get()!!,idleExit)
         }
     }
+    /**
+     * Terminal drain used by cancel, timeouts and service teardown. The vendor 25 Hz parser
+     * crashes whenever PPG is unset in the same batch as another client, so cancellation must
+     * follow the same two-phase release as a normal END: every other source first, a settle
+     * gap, then PPG alone. [finishNow] runs only after both phases hand off.
+     */
+    private fun drainForFinish(reason: String, idleExit: Boolean) {
+        finishDraining = true
+        finishPhase = 1
+        finishReason = reason; finishIdleExit = idleExit
+        val live = running.toList()
+        val ppg = SensorCatalog.PPG
+        if (ppg !in live) {
+            finishPhase = 0
+            drainSources {
+                finishDraining = false
+                finishNow(finishReason, finishIdleExit)
+            }
+            return
+        }
+        val otherClients = live.filterNot { it == ppg }
+        if (otherClients.isEmpty()) { releasePpgAfterGap(); return }
+        event("STOP_DRAIN_PPG_LAST",
+            "reason=$reason; keep=PPG; gapMs=$ppgReleaseGapMs; clients=$otherClients")
+        drainSources(keep = setOf(ppg)) { releasePpgAfterGap() }
+    }
+    /**
+     * The gap is about vendor settle time after ANY other client was unset, not only about
+     * clients that are still registered. A failed/timed-out batch has just unset its
+     * sources, so PPG must still wait the remainder of the gap.
+     */
+    private fun releasePpgAfterGap() {
+        if (SensorCatalog.PPG !in running) {
+            finishPhase = 0
+            finishDraining = false
+            finishNow(finishReason, finishIdleExit)
+            return
+        }
+        val remaining = if (lastOtherStopMs == 0L) 0L
+            else (ppgReleaseGapMs - (clock() - lastOtherStopMs)).coerceAtLeast(0L)
+        if (remaining > 0L) writer.postDelayed({ guarded { releasePpgOnly() } }, remaining)
+        else releasePpgOnly()
+    }
+    private fun releasePpgOnly() {
+        finishPhase = 2
+        drainSources(only = setOf(SensorCatalog.PPG)) {
+            finishPhase = 0
+            finishDraining = false
+            finishNow(finishReason, finishIdleExit)
+        }
+    }
     private fun finishNow(reason: String, idleExit: Boolean = false) {
         if (stopping) return
+        finishDraining = false
+        finishPhase = 0
         stopping = true; shortBudgetStartMs = 0L; writer.removeCallbacks(tick)
         if (reason.startsWith("SHORT_") || reason.contains("CONTACT_TIMEOUT") || reason.contains("PLACEMENT_IDLE_TIMEOUT_80S")) {
             val stage = when(shortSensor) {
@@ -1395,7 +1534,7 @@ class ActivityRecordingService : Service() {
             // Sensors are stopped: empty the admitted disk backlog before submitting
             // the final in-memory buffers, including after a backlog-limit failure.
             persistence?.barrier()
-            flush()
+            flush(force = true)
             persistence?.barrier()
             val diskEvidence = persistence?.evidence()
             if (diskEvidence?.get("journalFailure")?.toString()?.isNotEmpty() == true)

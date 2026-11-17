@@ -366,6 +366,47 @@ public class ActivityArchiveTest {
         assertEquals(0,Objects.requireNonNull(outgoing.listFiles((dir,name)->name.endsWith(".zip"))).length);
     }
 
+    @Test public void sealManifestOverOldEightMiBLimitIsAcceptedAsMetadata() throws Exception {
+        File root=temp.newFolder("activities"), outgoing=temp.newFolder("outgoing");
+        ActivityStore.Session source=session(root,true);
+        var seal=com.google.gson.JsonParser.parseString(
+            Files.readString(new File(source.folder,"seal.json").toPath())).getAsJsonObject();
+        // The real 2026-11-15 session produced an 8,389,157-byte seal.json. Padding with a
+        // single extra metadata field reproduces the size without creating 76k block files.
+        seal.addProperty("padding","x".repeat(9*1024*1024));
+        byte[] paddedSeal=seal.toString().getBytes(StandardCharsets.UTF_8);
+        assertTrue(paddedSeal.length>8*1024*1024);
+        String batchId=UUID.randomUUID().toString();
+        File archive=new File(outgoing,batchId+".zip");
+        Map<String,byte[]> entries=new TreeMap<>();
+        for(File file:Objects.requireNonNull(source.folder.listFiles())) {
+            entries.put("sessions/"+source.id+"/"+file.getName(),
+                file.getName().equals("seal.json")?paddedSeal:Files.readAllBytes(file.toPath()));
+        }
+        Map<String,Object> files=new TreeMap<>();
+        try(ZipOutputStream zip=new ZipOutputStream(new FileOutputStream(archive),StandardCharsets.UTF_8)) {
+            for(var entry:entries.entrySet()) {
+                zip.putNextEntry(new ZipEntry(entry.getKey())); zip.write(entry.getValue()); zip.closeEntry();
+                files.put(entry.getKey(),Map.of("bytes",entry.getValue().length,
+                    "sha256",DiagnosticArchive.hash(entry.getValue())));
+            }
+            Map<String,Object> bundle=new LinkedHashMap<>();
+            bundle.put("schemaVersion",1); bundle.put("kind","RAWWAVE_ACTIVITY_RAW_EXPORT");
+            bundle.put("batchId",batchId); bundle.put("createdUtcMs",1L);
+            bundle.put("sessions",List.of(Map.of("sessionId",source.id,"sealed",true,
+                "integrity","SEAL_INCLUDED_AND_ARCHIVE_REVERIFIED")));
+            bundle.put("files",files);
+            zip.putNextEntry(new ZipEntry("bundle.json"));
+            zip.write(new com.google.gson.Gson().toJson(bundle).getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        }
+        var verified=ActivityArchive.verify(archive);
+        assertEquals(List.of(source.id),verified.sessionIds()); assertTrue(verified.allSealed());
+        IOException failure=assertThrows(IOException.class,
+            ()->ActivityArchive.verify(archive,ActivityArchive.MAX_UNCOMPRESSED_BYTES,4L*1024*1024));
+        assertTrue(failure.getMessage().startsWith("ACTIVITY_METADATA_LIMIT:"));
+    }
+
     private static byte[] entry(File archive,String wanted) throws Exception {
         byte[] value=entryOrNull(archive,wanted); assertNotNull(value); return value;
     }

@@ -114,16 +114,76 @@ class CaptureServiceTest {
         assertFalse(r.session.counts().containsKey("POST-1/ECG"))
         assertEquals(1,r.sensors.closes)
     }
-    @Test fun noPostEcgDrainsPpgBeforeHeartRateForLedRelease() {
-        val r=Rig(sources=listOf("HEART_RATE","PPG"),ppgFirstForLed=true)
+    @Test fun noPostEcgReleasesEveryOtherSensorBeforePpgAndOnlyThenPpgAlone() {
+        val r=Rig(sources=listOf("HEART_RATE","PPG"),ppgGapMs=3000)
         r.end()
+        assertTrue(r.sensors.drains.containsKey("HEART_RATE"))
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.queue.advance(2999)
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.queue.advance(1)
         assertTrue(r.sensors.drains.containsKey("PPG"))
         assertFalse(r.sensors.drains.containsKey("HEART_RATE"))
         r.sensors.ack("PPG");r.queue.runReady()
-        assertTrue(r.sensors.drains.containsKey("HEART_RATE"))
-        r.sensors.ack("HEART_RATE");r.queue.runReady()
         assertTrue(r.seal().exists())
         assertEquals(1,r.sensors.closes)
+    }
+    @Test fun cancelReleasesOtherSensorsBeforePpgAndWaitsForSettleGap() {
+        val r=Rig(sources=listOf("HEART_RATE","PPG"),ppgGapMs=3000)
+        r.service.command("CANCEL");r.queue.runReady()
+        assertTrue(r.sensors.drains.containsKey("HEART_RATE"))
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.sensors.ack("HEART_RATE");r.queue.runReady()
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.queue.advance(2999)
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.queue.advance(1)
+        assertTrue(r.sensors.drains.containsKey("PPG"))
+        assertFalse(r.sensors.drains.containsKey("HEART_RATE"))
+        r.sensors.ack("PPG");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertTrue(r.seal().readText().contains("USER_INTERRUPTED"))
+        assertEquals(1,r.sensors.closes)
+        assertFalse(ActivityRecordingService.state.active)
+    }
+    @Test fun cancelWithPpgOnlyReleasesImmediatelyWithoutGap() {
+        val r=Rig(sources=listOf("PPG"),ppgGapMs=5000)
+        r.service.command("CANCEL");r.queue.runReady()
+        assertTrue(r.sensors.drains.containsKey("PPG"))
+        r.sensors.ack("PPG");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertTrue(r.seal().readText().contains("USER_INTERRUPTED"))
+        assertEquals(1,r.sensors.closes)
+    }
+    @Test fun cancelAfterDrainTimeoutStillWaitsSettleGapBeforePpg() {
+        val r=Rig(sources=listOf("HEART_RATE","PPG"),ppgGapMs=3000)
+        r.service.command("CANCEL");r.queue.runReady()
+        assertTrue(r.sensors.drains.containsKey("HEART_RATE"))
+        r.queue.advance(5000)
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.queue.advance(2999)
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.queue.advance(1)
+        assertTrue(r.sensors.drains.containsKey("PPG"))
+        r.sensors.ack("PPG");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertTrue(r.seal().readText().contains("USER_INTERRUPTED"))
+    }
+    @Test fun destroyDuringCancelSettleStillReleasesPpgAlone() {
+        val r=Rig(sources=listOf("HEART_RATE","PPG"),ppgGapMs=3000)
+        r.service.command("CANCEL");r.queue.runReady()
+        assertTrue(r.sensors.drains.containsKey("HEART_RATE"))
+        r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.service.onDestroy();r.queue.runReady()
+        assertFalse(r.sensors.drains.containsKey("PPG"))
+        r.queue.advance(3000)
+        assertTrue(r.sensors.drains.containsKey("PPG"))
+        r.sensors.ack("PPG");r.queue.runReady()
+        assertTrue(r.seal().exists())
+        assertTrue(r.seal().readText().contains("SERVICE_DESTROYED"))
+        assertFalse(ActivityRecordingService.state.active)
     }
     @Test fun stepDetectorRowsAreSavedAndSparseCallbacksDoNotTriggerSilence() {
         val r=Rig(sources=listOf("STEP_DETECTOR"))
@@ -449,7 +509,7 @@ class CaptureServiceTest {
     }
     private inner class Rig(ecg:Boolean=false,autoRun:Boolean=true,diskOwner:Boolean=false,spo2:Boolean=false,bia:Boolean=false,mf:Boolean=false,ppg:Boolean=false,both:Boolean=false,sources:List<String> = listOf("HEART_RATE","PPG"),
         preEcg:Boolean=ecg,postEcg:Boolean=ecg,preSpo2:Boolean=spo2,postSpo2:Boolean=spo2,prePpg:Boolean=ppg,postPpg:Boolean=ppg,
-        ppgFirstForLed:Boolean=false) {
+        ppgGapMs:Long=0) {
         val queue=Queue();val service=ActivityRecordingService();val sensors=Sensors(service)
         @Volatile var failDisk=false
         @Volatile var diskHook: (() -> Unit)? = null
@@ -459,11 +519,23 @@ class CaptureServiceTest {
         val session=store.start(template,1000,1)
         init {
             service.writer=queue;service.clock={queue.now};service.useDiskOwner=diskOwner
-            service.drainPpgFirstForLed=ppgFirstForLed
+            service.ppgReleaseGapMs=ppgGapMs
             service.beginSession(session,template,sensors)
             if(autoRun)queue.runReady()
         }
         fun end(){service.command("END");queue.runReady()}
+        /** Acks every pending drain in order; PPG is released last by production design. */
+        fun ackAll(){
+            repeat(16){
+                if(sensors.drains.isNotEmpty()){
+                    sensors.drains.keys.toList().forEach{sensors.ack(it)}
+                    queue.runReady()
+                } else if(ActivityRecordingService.state.active){
+                    // Let a configured settle gap elapse so the next drain phase can start.
+                    queue.advance(1000)
+                } else return
+            }
+        }
         fun seal()=File(session.folder,"seal.json")
         fun preComplete() {
             repeat(1500) {seq->
@@ -495,7 +567,7 @@ class CaptureServiceTest {
                 assertTrue(ActivityRecordingService.state.active)
             }
         } finally {release.countDown();r.diskHook=null}
-        r.end();sources.forEach {r.sensors.ack(it)};r.queue.runReady()
+        r.end();r.ackAll()
         assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
         sources.forEach {assertEquals(if(it=="PPG")501L else 500L,r.session.counts()["CORE-1/$it"])}
         val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
@@ -617,7 +689,7 @@ class CaptureServiceTest {
         r.service.autoSyncAfterCapture = true
         r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to -1)));r.queue.runReady()
         r.end();r.service.onTaskRemoved(null);r.queue.runReady()
-        r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.ackAll()
         assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
         assertEquals(1L,r.session.counts()["CORE-1/PPG"])
         assertFalse(r.service.shouldStartFinishSync(true))
@@ -627,7 +699,7 @@ class CaptureServiceTest {
         r.service.autoSyncAfterCapture = true
         r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to -1)))
         r.queue.runReady()
-        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.end();r.ackAll()
         assertTrue(r.seal().exists());assertTrue(r.service.shouldStartFinishSync(true))
         assertFalse(r.service.shouldStartFinishSync(false))
         // Also covers task removal after the owner queued the main-thread handoff.
@@ -637,7 +709,7 @@ class CaptureServiceTest {
     @Test fun noCoreDataCannotStartFinishSync() {
         val r=Rig(diskOwner=true)
         r.service.autoSyncAfterCapture = true
-        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.end();r.ackAll()
         assertTrue(r.seal().exists())
         assertFalse(r.service.shouldStartFinishSync(true))
     }
@@ -649,7 +721,7 @@ class CaptureServiceTest {
         assertFalse(r.seal().exists())
         r.queue.advance(1_000)
         assertEquals("DRAINING",ActivityRecordingService.state.phase)
-        r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.ackAll()
         assertTrue(r.seal().exists())
         assertTrue(r.service.terminalReason.contains("CORE_NO_DATA_TIMEOUT_80S"))
         assertFalse(r.service.shouldStartFinishSync(true))
@@ -664,7 +736,7 @@ class CaptureServiceTest {
         r.queue.advance(60_000)
         assertTrue(ActivityRecordingService.state.active)
         assertFalse(r.seal().exists())
-        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.end();r.ackAll()
         assertTrue(r.seal().exists())
         assertTrue(r.service.shouldStartFinishSync(true))
     }
@@ -672,7 +744,7 @@ class CaptureServiceTest {
         val r=Rig(diskOwner=true)
         repeat(1000) { n -> r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to n.toLong(),"PPG_GREEN" to -n))) }
         // END is queued behind all samples, with no owner execution during admission.
-        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.end();r.ackAll()
         assertTrue(r.seal().exists());assertEquals(1000L,r.session.counts()["CORE-1/PPG"])
         assertEquals(1,r.sensors.closes)
         val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
@@ -689,7 +761,7 @@ class CaptureServiceTest {
             r.queue.runReady();r.queue.advance(1000)
             assertTrue(ActivityRecordingService.state.active)
         }
-        r.end();sources.forEach {r.sensors.ack(it)};r.queue.runReady()
+        r.end();r.ackAll()
         assertTrue(r.seal().exists());assertEquals(1,r.sensors.closes)
         sources.forEach {assertEquals(2500L,r.session.counts()["CORE-1/$it"])}
         val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
@@ -699,14 +771,14 @@ class CaptureServiceTest {
         val r=Rig(diskOwner=true)
         r.sensors.emit("PPG",listOf(mapOf("sdkTimestamp" to 1L,"PPG_GREEN" to 12)))
         r.queue.runReady();r.failDisk=true
-        r.end();r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.end();r.ackAll()
         assertFalse(r.seal().exists());assertEquals(1,r.sensors.closes)
         assertFalse(ActivityRecordingService.state.active)
     }
     @Test fun removingTaskStopsAsyncCaptureAndNeverStartsPostMeasurement() {
         val r=Rig(diskOwner=true)
         r.service.onTaskRemoved(null);r.queue.runReady()
-        r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.ackAll()
         assertEquals(1,r.sensors.closes);assertTrue(r.seal().exists())
         assertFalse(ActivityRecordingService.state.active)
         assertTrue(r.seal().readText().contains("USER_INTERRUPTED"))
@@ -734,8 +806,10 @@ class CaptureServiceTest {
     }
     @Test fun timeoutClosesSensorsAndLateAckCannotReviveCapture() {
         val r=Rig();r.end();r.queue.advance(5000)
+        // The failed batch stops HR first; PPG is then released after its own settle gap.
+        r.queue.advance(8000)
         assertTrue(r.seal().readText().contains("DRAIN_INCOMPLETE"));assertEquals(1,r.sensors.closes)
-        r.sensors.ack("PPG");r.sensors.ack("HEART_RATE");r.queue.runReady()
+        r.ackAll()
         assertEquals(1,r.sensors.closes);assertFalse(ActivityRecordingService.state.active)
     }
     @Test fun forcedSkipPreEcgStartsCoreAndKeepsPostEcg() {
@@ -939,8 +1013,7 @@ class CaptureServiceTest {
         r.queue.advance(15000)
         assertEquals("CORE-1",ActivityRecordingService.state.phase)
         assertTrue(r.sensors.starts.contains("HEART_RATE"))
-        r.service.command("CANCEL");r.queue.runReady()
-        r.sensors.ack("HEART_RATE");r.sensors.ack("PPG");r.queue.runReady()
+        r.service.command("CANCEL");r.queue.runReady();r.ackAll()
         assertTrue(r.seal().exists())
         val batch=ActivityArchive.preparePending(r.session.folder.parentFile!!.parentFile!!,temp.newFolder())
         assertTrue(ActivityArchive.verify(batch.file()).allSealed())
