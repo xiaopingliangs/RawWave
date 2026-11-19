@@ -68,7 +68,15 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
         publish(true,false,"正在准备活动原始数据…")
         // Open the foreground lease first: the scan walks the session's block files and must
         // not run on the main thread, while the process still has to stay alive for it.
-        openLease(ActivityTransferBudget.prepareLeaseMs(0L))
+        // A background FGS start can be rejected by the platform; that must finish the session
+        // with a readable message, not crash the watch UI process.
+        try {
+            openLease(ActivityTransferBudget.prepareLeaseMs(0L))
+        } catch (error: Exception) {
+            try { app.journal?.fault("ACTIVITY_WATCH_SYNC_START_FAILED", error) } catch (_: Exception) {}
+            finish(false, retryStartFailureText(error))
+            return
+        }
         background {
             val bytes = try { pendingRawBytes() } catch (_: Exception) { 0L }
             post { beginTransfer(bytes) }
@@ -240,6 +248,9 @@ class WatchActivitySyncSession(private val app: ProbeApplication, private val tr
             publish(false,completed,text)
         }
         if(app.activeWatchActivitySync === this) app.activeWatchActivitySync=null
+        // The just-acknowledged sessions are now safe to evict if the watch is over its local
+        // budget. Unacknowledged/unsealed sessions are never touched by the runner.
+        if (completed) ActivityRetentionRunner.schedule(app, "AFTER_SYNC", force = true)
         try { app.journal?.event("ACTIVITY_WATCH_SYNC_FINISHED",mapOf("success" to completed,"text" to text.take(500),"trigger" to trigger,"owner" to owner,"ownedStatus" to ownsStatus,"attempts" to attempts,"maxAttempts" to ActivityRetryPolicy.MAX_ATTEMPTS)); if(ownsStatus && app.activeSyncOwner == null) app.journal?.mark("CLEANUP_REQUESTED") } catch (_: Exception) {}
     }
 

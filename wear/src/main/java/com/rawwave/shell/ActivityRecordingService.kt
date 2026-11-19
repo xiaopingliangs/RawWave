@@ -28,14 +28,20 @@ import com.rawwave.core.CaptureRuns
 import com.rawwave.core.CaptureDrain
 import com.rawwave.core.CaptureQueue
 import com.rawwave.core.CoreDataBudget
+import com.rawwave.core.CooperationPolicy
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Single-writer capture owner. Never automatically restarts sensors after process death. */
 class ActivityRecordingService : Service() {
     companion object {
-        private const val SHORT_BUDGET_MS = 80_000L
-        private const val NO_HAND_AUTOSTART_MS = 15_000L
+        private const val ECG_ATTEMPT_MS = 45_000L
+        /** One BIA/MF-BIA attempt; the SDK is left alone after this and the stage clock decides. */
+        private const val BIA_ATTEMPT_MS = 60_000L
+        private const val SPO2_ATTEMPT_MS = 30_000L
+        private const val PPG_ATTEMPT_MS = 30_000L
+        /** Keep the final "measurement successful" page readable before the task closes. */
+        private const val SPO2_DONE_HOLD_MS = 4_000L
         /** Let the stopped-service notification render before the process removes itself. */
         private const val VENDOR_RELEASE_KILL_DELAY_MS = 1_500L
         /** Rest between BIA/MF-BIA attempts; the electrode/skin state needs to settle. */
@@ -50,7 +56,19 @@ class ActivityRecordingService : Service() {
             val biaMode: String = "", val biaHasNext: Boolean = false, val biaContact: Boolean = false,
             val biaRetrying: Boolean = false, val biaAttempt: Int = 0, val biaProgress: Int = -1,
             val biaHint: String = "", val coreElapsedSeconds: Long = 0L,
-            val phaseRemainingSeconds: Int = 0, val biaModeNumber: Int = 0, val biaModeCount: Int = 0)
+            val phaseRemainingSeconds: Int = 0, val biaModeNumber: Int = 0, val biaModeCount: Int = 0,
+            /** null = the platform has not reported; false = explicitly off the wrist. */
+            val worn: Boolean? = null,
+            /** True after the user proved cooperation once in this stage. */
+            val engaged: Boolean = false,
+            /** Seconds until exit (not engaged) or automatic next item (engaged). */
+            val cooperationRemainingSeconds: Int = 0,
+            /** Real measurement progress 0-100; -1 when the stage has no meaningful percent. */
+            val progressPercent: Int = -1,
+            /** Consumer-readable detail for the percent: elapsed window, rows, or failure point. */
+            val progressDetail: String = "",
+            /** True when BIA finished successfully and is waiting for continue/retry. */
+            val biaSucceeded: Boolean = false)
         @Volatile var state = State(); private set
         /**
          * Absolute end of the vendor release hold. A fresh Activity uses it to clear a
@@ -67,6 +85,8 @@ class ActivityRecordingService : Service() {
         }
         var observer: ((State) -> Unit)? = null // main thread; removed on Activity stop
         var successObserver: ((String, String) -> Unit)? = null // main thread; short measurement success
+        /** A cooperating stage ended without a value and moved on by itself. */
+        var autoAdvanceObserver: ((String, String) -> Unit)? = null // main thread
         var idleExitObserver: (() -> Unit)? = null // main thread; retained only until Activity destroy
         fun store(context: Context) = ActivityStore(File(context.filesDir, "activities")) { dir ->
             val fd = Os.open(dir.path, OsConstants.O_RDONLY, 0)
@@ -117,8 +137,20 @@ class ActivityRecordingService : Service() {
     private var biaModes: List<String> = emptyList()
     private var biaModeIndex = 0
     private var biaContactDetected = false
-    private var biaContactStartMs = 0L
-    private var shortBudgetStartMs = 0L
+    /** Cooperation clock: one stage at a time, never shared between measurements. */
+    internal var presence: PresenceSource = PresenceSource.None
+    private var worn: Boolean? = null
+    private var lastPresenceMs = 0L
+    private var coopStage = ""
+    private var coopPre = true
+    private var coopEngaged = false
+    private var coopNoPresenceDeadlineMs = 0L
+    private var coopResultDeadlineMs = 0L
+    private var spo2StartedMs = 0L
+    private var ppgStartedMs = 0L
+    private var lastProgressPercent = -1
+    private var lastProgressDetail = ""
+    private var biaResultSuccess = false
     private var biaRetrying = false
     private var biaAttempt = 0
     private var biaProgress = -1
@@ -206,16 +238,19 @@ class ActivityRecordingService : Service() {
             persistence?.check()
             flush()
             if (lastDeviceStateMs == 0L || clock() - lastDeviceStateMs >= 60_000L) sampleDeviceState()
-            // Review pages have their own 80-second deadline set at review entry. The
-            // measurement budget must not leak into the review and cut it short.
-            if (shortBudgetStartMs > 0L && shortSensor.isNotEmpty() && phase != "CORE-1" &&
-                !phase.startsWith("REVIEW_") &&
-                !(shortSensor == "BIA" && biaContactDetected) &&
-                !(shortSensor == "ECG" && ecgGate.measuring() && (phase.startsWith("PRE") || phase.startsWith("POST"))) &&
-                clock() >= shortBudgetStartMs + SHORT_BUDGET_MS) {
-                event("SHORT_MEASUREMENT_TIMEOUT_80S", "sensor=$shortSensor; phase=$phase; elapsedMs=${clock()-shortBudgetStartMs}")
-                finish("SHORT_MEASUREMENT_TIMEOUT_80S", true)
+            // Final SpO2 succeeded: keep the result page up for a few seconds, then seal.
+            if (phase == "SPO2_DONE") {
+                if (clock() >= deadline) finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+                else { publish(); writer.postDelayed(this, 1000) }
                 return@guarded
+            }
+            // Cooperation owns the two questions the old 80-second budget mixed together:
+            // "is anyone here?" (exit) and "is this stage ever going to produce a value?" (next).
+            // It runs before every measurement deadline so a cooperating user is never cut off.
+            when (cooperationNext()) {
+                CooperationPolicy.Next.EXIT -> { noPresenceExit(); return@guarded }
+                CooperationPolicy.Next.ADVANCE -> { autoAdvanceStage(); return@guarded }
+                else -> Unit
             }
             // STEP_COUNT and STEP_DETECTOR are on-change: quiet while stationary is expected and is not a data alarm.
             running.filter { it != "SPO2" && it != "BIA" && it != "MF_BIA" && it != "PPG_ON_DEMAND" && it != "STEP_COUNT" && it != "STEP_DETECTOR" && it != "OFFBODY" }.forEach { sensor ->
@@ -233,16 +268,8 @@ class ActivityRecordingService : Service() {
             }
             if (deadline > 0 && clock() >= deadline) {
                 event("CAPTURE_DEADLINE_OBSERVED", "phase=$phase; deadlineMs=$deadline; observedMs=${clock()}; lateMs=${clock()-deadline}; wakeLockHeld=${lock?.isHeld == true}; uptimeMs=${SystemClock.uptimeMillis()}")
-                if (phase.startsWith("READY_SPO2_")) { beginSpo2(spo2Pre); return@guarded }
-                if (phase.startsWith("READY_PPG_")) { beginPpg(ppgPre); return@guarded }
-                if (phase.startsWith("WAIT_BIA_")) {
-                    if (clock() >= biaContactStartMs + SHORT_BUDGET_MS) {
-                        event("BIA_CONTACT_TIMEOUT_80S", "mode=$bodySource; pre=$biaPre")
-                        finish("SHORT_MEASUREMENT_TIMEOUT_80S", true)
-                    } else beginBia()
-                    return@guarded
-                }
-                if (placementWaiting()) { finish("PLACEMENT_IDLE_TIMEOUT_80S", true); return@guarded }
+                if (phase.startsWith("READY_PPG_")) { preparePpg(ppgPre); return@guarded }
+                if (phase.startsWith("WAIT_BIA_")) { beginBia(); return@guarded }
                 if (phase == "CORE-1") {
                     // No non-empty row from any core source arrived inside the initial window.
                     // This is a power/lifecycle timeout, not a clinical validity judgment.
@@ -253,28 +280,26 @@ class ActivityRecordingService : Service() {
                     deadline = 0
                     publish(); writer.postDelayed(this, 1000); return@guarded
                 }
-                if (shortSensor == "BIA") {
-                    if(phase.startsWith("REVIEW_")) finish("BIA_REVIEW_IDLE_TIMEOUT_80S",true)
-                    else endBia(false,"MEASUREMENT_TIMEOUT_60S")
+                if (shortSensor == "BIA" && (phase.startsWith("PRE") || phase.startsWith("POST"))) {
+                    endBia(false,"MEASUREMENT_TIMEOUT_60S")
                     return@guarded
                 }
-                if (shortSensor == "SPO2") {
-                    if (phase.startsWith("REVIEW_")) finish("SPO2_REVIEW_IDLE_TIMEOUT_80S", true)
-                    else endSpo2(false, "MEASUREMENT_TIMEOUT_30S")
+                if (shortSensor == "SPO2" && (phase.startsWith("PRE") || phase.startsWith("POST"))) {
+                    endSpo2(false, "MEASUREMENT_TIMEOUT_30S")
                     return@guarded
                 }
-                if (shortSensor == "PPG_ON_DEMAND") {
-                    if (phase.startsWith("REVIEW_")) finish("PPG_REVIEW_IDLE_TIMEOUT_80S", true)
-                    else endPpg(ppgRows > 0, if (ppgRows > 0) "MEASUREMENT_WINDOW_COMPLETE_30S" else "NO_DATA_30S")
+                if (shortSensor == "PPG_ON_DEMAND" && (phase.startsWith("PRE") || phase.startsWith("POST"))) {
+                    endPpg(ppgRows > 0, if (ppgRows > 0) "MEASUREMENT_WINDOW_COMPLETE_30S" else "NO_DATA_30S")
                     return@guarded
                 }
                 val next = CapturePhasePolicy.expired(phase, ecgGate.measuring())
                 if (next == CapturePhasePolicy.Next.CONNECT_TIMEOUT) { finish("SDK_CONNECT_TIMEOUT"); return@guarded }
-                if (next == CapturePhasePolicy.Next.IDLE_STOP && phase.startsWith("REVIEW_")) { finish("ECG_IDLE_TIMEOUT_80S", true); return@guarded }
+                // Review pages are bounded by the cooperation clock above, not by this deadline.
+                if (next == CapturePhasePolicy.Next.IDLE_STOP && phase.startsWith("REVIEW_")) return@guarded
                 if (phase.startsWith("PRE") || phase.startsWith("POST")) {
                     if (next == CapturePhasePolicy.Next.IDLE_STOP) {
-                        event("ECG_CONTACT_WAIT_TIMEOUT", "No valid ECG segment; stopping without another review or sync budget")
-                        finish("ECG_IDLE_TIMEOUT_80S", true); return@guarded
+                        event("ECG_CONTACT_WAIT_TIMEOUT", "No valid ECG segment; the cooperation clock decides exit or next")
+                        noPresenceExit(); return@guarded
                     }
                     ecgFailed = true
                     ecgFailureReason = "ECG_CONTINUITY_TIMEOUT"
@@ -291,6 +316,7 @@ class ActivityRecordingService : Service() {
     override fun onBind(intent: Intent?) = null
     override fun onCreate() {
         super.onCreate(); useDiskOwner = true; thread.start()
+        presence = OffBodyPresence(this)
         val handler = Handler(thread.looper)
         writer = object : CaptureQueue {
             override fun post(action: Runnable) = handler.post(action)
@@ -391,6 +417,10 @@ class ActivityRecordingService : Service() {
         sessionStartedMs = clock()
         coreStartedMs = 0L
         coreEndedMs = 0L
+        // Wear state is evidence for the cooperation clock only; it is never stored as health
+        // data and it is not inferred from PPG/SpO2 callbacks. Missing hardware leaves it unknown.
+        presence.stop()
+        presence.start { onBody -> writer.post { guarded { onWornState(onBody) } } }
         event("CAPTURE_START", "build=${BuildConfig.BUILD_RUN}; template=${template.id()}",
             mapOf("activityName" to template.name(), "activityTemplateId" to template.id()))
         lastDeviceStateMs = 0L
@@ -413,10 +443,113 @@ class ActivityRecordingService : Service() {
             // session ends right after that one position change.
             // If continuous CORE PPG is enabled, skip only the pre short PPG to avoid the known
             // vendor 25 Hz client/LED leak; the post short PPG still runs after CORE stops.
-            if (preSpo2) prepareSpo2(true) else if (bia) startBia(true) else if (preEcg) beginEcg("PRE-1") else if (prePpg && !skipPrePpgForVendorLed) beginPpg(true) else beginCore()
+            if (preSpo2) prepareSpo2(true) else if (bia) startBia(true) else if (preEcg) beginEcg("PRE-1") else if (prePpg && !skipPrePpgForVendorLed) preparePpg(true) else beginCore()
         }, { finish(it) })
         writer.post(tick)
     }
+    /**
+     * Start the cooperation clock for one short-measurement stage. Review pages stay inside the
+     * same stage: re-entering a review must not hand out a fresh result window.
+     */
+    private fun beginCooperation(stage: String, pre: Boolean) {
+        coopStage = stage
+        coopPre = pre
+        coopEngaged = false
+        coopResultDeadlineMs = 0L
+        val window = CooperationPolicy.noPresenceWindowMs(worn)
+        coopNoPresenceDeadlineMs = clock() + window
+        // SpO2/PPG/BIA: a worn watch proves the user is present; finger contact is still
+        // needed for the measurement. ECG still needs the electrode contact itself.
+        // Being worn also prevents the shorter off-body window for every stage.
+        if (CooperationPolicy.waitsForWear(stage) && worn == true) engage("WORN_AT_STAGE_START")
+        event("COOPERATION_STAGE_START",
+            "stage=$stage; pre=$pre; worn=$worn; noPresenceWindowMs=$window; resultWindowMs=${CooperationPolicy.resultWindowMs(stage)}")
+    }
+
+    /** Latch the first real evidence of cooperation and arm the per-stage result cap. */
+    private fun engage(source: String) {
+        if (coopStage.isEmpty()) return
+        lastPresenceMs = clock()
+        if (coopEngaged) return
+        coopEngaged = true
+        coopResultDeadlineMs = clock() + CooperationPolicy.resultWindowMs(coopStage)
+        event("COOPERATION_ENGAGED",
+            "stage=$coopStage; source=$source; resultWindowMs=${CooperationPolicy.resultWindowMs(coopStage)}")
+    }
+
+    private fun cooperationNext(): CooperationPolicy.Next {
+        if (coopStage.isEmpty() || phase == "CORE-1" || phase == "CONNECTING") return CooperationPolicy.Next.WAIT
+        return CooperationPolicy.decide(coopEngaged, coopNoPresenceDeadlineMs, coopResultDeadlineMs, clock())
+    }
+
+    /** Nobody proved presence inside the window: this is the only path that may exit the app. */
+    private fun noPresenceExit() {
+        val stage = coopStage.ifEmpty { shortSensor }
+        event("COOPERATION_NO_PRESENCE_TIMEOUT",
+            "stage=$stage; phase=$phase; worn=$worn; engaged=$coopEngaged; presenceMs=${if (lastPresenceMs == 0L) -1 else clock() - lastPresenceMs}")
+        coopStage = ""
+        val pre = if (phase.isEmpty() || phase == "CONNECTING") coopPre else phase.contains("PRE")
+        if (pre) finish("NO_PRESENCE_TIMEOUT", true)
+        // The activity itself is already recorded; seal, sync and go home instead of killing it.
+        else finish("USER_COMPLETED_NO_POST_DATA")
+    }
+
+    /**
+     * The user cooperated but the stage did not produce a valid value inside its cap. Record
+     * that fact and move on automatically; never end the session for this.
+     */
+    private fun autoAdvanceStage() {
+        val stage = coopStage
+        event("COOPERATION_AUTO_ADVANCE",
+            "stage=$stage; phase=$phase; ecgRawRows=$ecgTotalRows; biaAttempt=$biaAttempt; ppgRows=$ppgRows")
+        coopStage = ""
+        coopEngaged = false
+        coopResultDeadlineMs = 0L
+        val label = when (stage) {
+            "BIA" -> "体成分"
+            "SPO2" -> "血氧"
+            "PPG" -> "PPG"
+            else -> "ECG"
+        }
+        val successResult = stage == "BIA" && biaResultSuccess
+        publishAutoAdvance(label, if (successResult) "已完成，自动继续下一项" else "没有取得有效结果，已自动继续下一项")
+        when (stage) {
+            "BIA" -> when {
+                successResult -> { biaResultSuccess = false; afterBia() }
+                shortSensor == "BIA" && phase != "CORE-1" -> skipBia(auto = true)
+                else -> afterBiaPhase()
+            }
+            "SPO2" -> skipSpo2(auto = true)
+            "PPG" -> skipPpg(auto = true)
+            "ECG" -> autoSkipEcg()
+        }
+    }
+
+    private fun onWornState(onBody: Boolean) {
+        worn = onBody
+        event("OFF_BODY_STATE_OBSERVED", "onBody=$onBody; stage=$coopStage; engaged=$coopEngaged")
+        if (onBody) {
+            lastPresenceMs = clock()
+            if (CooperationPolicy.waitsForWear(coopStage)) engage("WORN")
+            if (!stopping && phase != "DRAINING") publish()
+            return
+        }
+        if (!coopEngaged && coopStage.isNotEmpty()) {
+            val shorter = clock() + CooperationPolicy.OFF_BODY_MS
+            if (shorter < coopNoPresenceDeadlineMs) {
+                coopNoPresenceDeadlineMs = shorter
+                event("NO_PRESENCE_WINDOW_SHORTENED", "stage=$coopStage; offBodyMs=${CooperationPolicy.OFF_BODY_MS}")
+            }
+        }
+        if (!stopping && phase != "DRAINING") publish()
+    }
+
+    /** Real collection-window progress: elapsed seconds against the stage's own window. */
+    private fun windowPercent(startMs: Long, windowMs: Long): Int {
+        if (startMs <= 0L || windowMs <= 0L) return -1
+        return (((clock() - startMs).coerceIn(0L, windowMs)) * 100L / windowMs).toInt()
+    }
+
     internal fun command(action: String?) {
         writer.post { guarded {
                 if (stopping) return@guarded
@@ -426,29 +559,32 @@ class ActivityRecordingService : Service() {
                     return@guarded
                 }
                 if ((shortSensor == "SPO2" || shortSensor == "BIA" || shortSensor == "PPG_ON_DEMAND") && phase.startsWith("REVIEW_") && clock() >= deadline) {
-                    finish("${shortSensor}_REVIEW_IDLE_TIMEOUT_80S", true); return@guarded
+                    when (cooperationNext()) {
+                        CooperationPolicy.Next.ADVANCE -> autoAdvanceStage()
+                        CooperationPolicy.Next.EXIT -> noPresenceExit()
+                        else -> Unit
+                    }
+                    return@guarded
                 }
                 when (action) {
                     "END" -> if (phase == "CORE-1") {
                         if (coreEndedMs == 0L) coreEndedMs = clock()
                         event("USER_ENDED_CORE", "Post measurements follow the template, not a new choice")
-                        // Keep the continuous PPG tracker alive through post ECG. Samsung's
-                        // post-ECG HRM start re-enables the shared 25 Hz stream; stopping PPG
-                        // before ECG makes our later final unset a second, ineffective unset.
-                        // Holding PPG makes it the last 25 Hz client and gives the vendor stop
-                        // request one real chance after ECG has ended.
-                        val holdPpg = postEcg && coreSources.contains("PPG")
-                        val postFlow: () -> Unit = {
-                            when(CapturePhasePolicy.coreEnded(postEcg)) {
-                                CapturePhasePolicy.Next.POST_ECG -> beginEcg("POST-1")
-                                else -> beginPostShorts()
-                            }
-                        }
+                        // Post order is PPG -> ECG -> SpO2. PPG needs no placement change and
+                        // runs first; only the final SpO2 moves the strap. Post PPG shares the
+                        // vendor 25 Hz client with continuous PPG, so CORE PPG must be released
+                        // before it starts (the vendor parser crashes when two clients are
+                        // unset together).
+                        val postFlow: () -> Unit = { beginPostShorts() }
                         // 2026-11-05 evidence: the vendor 25 Hz stop is applied when PPG is
                         // unset while the SDK HEART_RATE client is still active. 2026-11-16
                         // evidence: that exact order crashes the vendor parser. Release PPG
                         // last: stop every other source, wait, then unset PPG alone.
-                        val ppgLastForVendor = !postEcg && coreSources.contains(SensorCatalog.PPG)
+                        val corePpg = coreSources.contains(SensorCatalog.PPG)
+                        // No post short PPG: keep the old hold through post ECG so PPG remains
+                        // the last 25 Hz client unset after the vendor HRM re-open.
+                        val holdPpg = !postPpg && postEcg && corePpg
+                        val ppgLastForVendor = corePpg && !holdPpg
                         if (ppgLastForVendor) {
                             event("LED_RELEASE_DRAIN_PPG_LAST",
                                 "keep=PPG; gapMs=$ppgReleaseGapMs; reason=VENDOR_PPG_STOP_REQUIRES_LAST_CLIENT")
@@ -468,40 +604,31 @@ class ActivityRecordingService : Service() {
                     }
                     "CANCEL" -> finish("USER_INTERRUPTED")
                     "TOUCH" -> {
-                        // A user who is still trying or reaching for skip is not idle. Reset
-                        // the short-phase deadline so the 80-second safety cannot close the
-                        // page in the middle of their interaction.
-                        if (shortBudgetStartMs > 0L && phase != "CORE-1") {
-                            shortBudgetStartMs = clock()
-                            if (shortSensor == "BIA") biaContactStartMs = clock()
-                            // Extend only decision/idle windows. A BIA retry wait already
-                            // has a 5-second deadline; touching to reach skip must not
-                            // postpone the automatic retry by another 80 seconds.
-                            if (phase.startsWith("REVIEW_"))
-                                deadline = maxOf(deadline, clock() + SHORT_BUDGET_MS)
-                            else if (shortSensor == "ECG" && !ecgGate.measuring())
-                                deadline = maxOf(deadline, clock() + SHORT_BUDGET_MS)
+                        // A touch proves a person is interacting, but it is not electrode
+                        // contact. It renews only the "nobody is here" window; the result cap
+                        // stays a real cap so a stage cannot be kept alive by tapping.
+                        if (coopStage.isNotEmpty() && phase != "CORE-1") {
+                            lastPresenceMs = clock()
+                            if (!coopEngaged && worn != false)
+                                coopNoPresenceDeadlineMs = maxOf(coopNoPresenceDeadlineMs, clock() + CooperationPolicy.TOUCH_GRACE_MS)
                         }
                     }
                       "RETRY_BIA" -> if(phase.startsWith("REVIEW_BIA_")) retryBia()
+                      "CONTINUE_BIA" -> if(phase.startsWith("REVIEW_BIA_") && biaResultSuccess) {
+                          biaResultSuccess=false
+                          afterBia()
+                      }
                       "SKIP_BIA" -> if(shortSensor == "BIA" && phase != "CORE-1") skipBia()
                       "START_SPO2" -> if (phase.startsWith("READY_SPO2_")) beginSpo2(spo2Pre)
-                      "START_PPG" -> if (phase.startsWith("READY_PPG_")) beginPpg(ppgPre)
+                      "START_PPG" -> if (phase.startsWith("READY_PPG_")) preparePpg(ppgPre)
                       // A retry is a measurement restart, not a new placement decision.
                       // SpO2/PPG have no contact gate, so start immediately.
                       "RETRY_SPO2" -> if (phase.startsWith("REVIEW_SPO2")) beginSpo2(spo2Pre)
-                      "SKIP_SPO2" -> if (phase.startsWith("REVIEW_SPO2")) {
-                          shortFailure = true; spo2Results[spo2Phase] = "未取得有效结果，已跳过"
-                          event("USER_SKIPPED_SPO2", "pre=$spo2Pre")
-                          afterSpo2()
-                      }
+                      "SKIP_SPO2" -> if (phase.startsWith("REVIEW_SPO2") || phase.startsWith("READY_SPO2") ||
+                          ((phase.startsWith("PRE") || phase.startsWith("POST")) && shortSensor == "SPO2")) skipSpo2(auto = false)
                       "RETRY_PPG" -> if (phase.startsWith("REVIEW_PPG_")) beginPpg(ppgPre)
-                      "SKIP_PPG" -> if (phase.startsWith("REVIEW_PPG_") || phase.startsWith("READY_PPG_")) {
-                          shortFailure = true
-                          if (phase.startsWith("REVIEW_")) ppgResults[ppgPhase] = "未采集，已跳过"
-                          event("USER_SKIPPED_PPG", "pre=$ppgPre")
-                          afterPpg()
-                      }
+                      "SKIP_PPG" -> if (phase.startsWith("REVIEW_PPG_") || phase.startsWith("READY_PPG_") ||
+                          ((phase.startsWith("PRE") || phase.startsWith("POST")) && shortSensor == "PPG_ON_DEMAND")) skipPpg(auto = false)
                     "RETRY_ECG" -> if (shortSensor == "ECG" && phase.startsWith("REVIEW_")) {
                         event("USER_RETRY_ECG", ecgPhase)
                         beginEcg(if (phase == "REVIEW_PRE") "PRE-${++preAttempt}" else "POST-${++postAttempt}")
@@ -546,20 +673,33 @@ class ActivityRecordingService : Service() {
     private fun beginEcg(next: String) {
         shortSensor = "ECG"
         phase = next; ecgPhase = next; ecgFailed = false; ecgFailureReason = ""
-        notice = "前臂自然放在桌上，用另一只手的指尖完全盖住上键，轻放、不要按压，手指不要碰表框。\n" +
+        // ECG has its own 30-second continuous countdown; no percent is shown for it.
+        lastProgressPercent = -1; lastProgressDetail = ""
+        spo2StartedMs = 0L; ppgStartedMs = 0L
+        val pre = next.startsWith("PRE")
+        // Post ECG runs after post PPG, so the strap is already in the normal position.
+        // Only the pre ECG (after the raised pre SpO2) needs the position instruction.
+        notice = (if (pre) "手表先调整到距离腕关节大概两指的位置（就是平常佩戴位置）。\n"
+            else "手表保持现在的位置，不用移动表带。\n") +
+            "前臂自然放在桌上，用另一只手的食指尖完全盖住右上方按钮，轻放、不要按压，手指不要碰表框。\n" +
             "手表要贴紧腕部；如果一直接触不好，可把手表稍微向肘部移一点再试。\n" +
             "保持不动、不要说话；检测到稳定接触后立即开始30秒连续记录。\n" +
-            "80秒没有接触才会退出。"
+            "${CooperationPolicy.NO_PRESENCE_MS / 1000}秒没有接触才会退出；接触后可以一直重试，不会退出。"
         contact = false; ecgTotalRows = 0
         lastContactMs = 0; ecgGate = EcgContinuityGate(); ecgUpdate = null
-        // The no-contact safety starts with this ECG phase, not with the session. Pre-BIA/
+        // The no-contact window starts with this ECG phase, not with the session. Pre-BIA/
         // SpO2/PPG work must not consume the ECG contact window before ECG even begins.
-        shortBudgetStartMs = clock()
-        deadline = clock() + EcgWaitBudget.IDLE_MS
+        if (coopStage != "ECG" || coopPre != pre) beginCooperation("ECG", pre)
+        deadline = coopNoPresenceDeadlineMs
         event("PHASE_START", next); startSource("ECG"); restartTick()
     }
     private fun beginCore() {
-        shortSensor = ""; shortBudgetStartMs = 0L
+        shortSensor = ""
+        coopStage = ""; coopEngaged = false
+        coopNoPresenceDeadlineMs = 0L; coopResultDeadlineMs = 0L
+        spo2StartedMs = 0L; ppgStartedMs = 0L
+        lastProgressPercent = -1; lastProgressDetail = ""
+        biaResultSuccess = false
         if (coreStartedMs == 0L) coreStartedMs = clock()
         coreEndedMs = 0L
         phase = "CORE-1"; notice = ""; coreDataObserved = false
@@ -576,8 +716,13 @@ class ActivityRecordingService : Service() {
     private fun beginPostShorts() {
         // Body composition is intentionally pre-activity only. Post-exercise BIA/MF-BIA
         // is dominated by acute fluid shifts and is not comparable to the pre measurement.
-        // PPG starts immediately after post ECG; only the final SpO2 needs a placement pause.
-        if(postPpg) beginPpg(false) else if(postSpo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        // Post order: PPG (normal position, starts right away) -> ECG -> SpO2 (strap moved up).
+        when {
+            postPpg -> preparePpg(false)
+            postEcg -> beginEcg("POST-1")
+            postSpo2 -> prepareSpo2(false)
+            else -> finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        }
     }
     private fun startBia(pre: Boolean) {
         biaModeIndex=0
@@ -588,10 +733,9 @@ class ActivityRecordingService : Service() {
         if(biaModeIndex !in biaModes.indices) biaModeIndex=0
         bodySource=biaModes[biaModeIndex]
         biaPre=pre
-        biaContactStartMs=clock()
-        shortBudgetStartMs=biaContactStartMs
         biaContactDetected=false
         biaRetrying=false; biaAttempt=0; biaProgress=-1; biaHint=""
+        beginCooperation("BIA", pre)
         beginBia()
     }
     private fun biaModeLabel()=when(bodySource){"MF_BIA"->"多频阻抗";"BIA"->"体成分";else->"体成分"}
@@ -600,19 +744,21 @@ class ActivityRecordingService : Service() {
         phase=if(biaPre) "PRE-${++preBiaAttempt}" else "POST-${++postBiaAttempt}"
         biaPhase=phase;biaSummary="";biaContactDetected=false
         biaRetrying=false;biaHint="";biaProgress=-1;biaAttempt++
+        lastProgressPercent=-1;lastProgressDetail=""
+        biaResultSuccess=false
         biaResults[phase]="正在等待双指接触，尚无完整有效结果";biaModeByPhase[phase]=bodySource
-        deadline=clock()+60_000
-        notice="准备：${biaModeLabel()}。${if (biaPre) "如果刚测过血氧，请先把手表戴回腕骨下方的正常位置。" else ""}表带贴合即可。\n" +
+        deadline=clock()+BIA_ATTEMPT_MS
+        notice="准备：${biaModeLabel()}。${if (biaPre) "如果刚测过血氧，请先把手表戴回离手掌约2指的正常位置。" else ""}表带贴合即可。\n" +
             "中指、无名指分别轻触上键、下键，手指不要碰表框；双臂抬到胸口高度，腋下张开，双手不要相碰；保持不动、不要说话。\n" +
             "最好在早晨进食前、如厕后测；运动或洗澡后不要立即测。\n" +
             "装有心脏起搏器/除颤器、怀孕或月经期不要测；测前摘掉金属饰品。\n" +
             "皮肤太干可少量润肤，手湿/出汗先擦干；每次用同样的两指。\n" +
-            "检测到双指接触后自动开始；接触错误会自动重试；最多80秒。"
+            "检测到双指接触后自动开始；接触错误会自动重试。"
         event("BIA_CONTACT_WAIT_STARTED","source=$bodySource; pre=$biaPre; mode=$bodySource; deadlineMs=$deadline; profileInPlan=true")
         startSource(bodySource);restartTick()
     }
     private fun retryBia() {
-        biaContactStartMs=clock(); shortBudgetStartMs=clock(); biaContactDetected=false
+        biaContactDetected=false
         biaRetrying=false; biaHint=""; biaProgress=-1; biaAttempt=0
         beginBia()
     }
@@ -637,41 +783,54 @@ class ActivityRecordingService : Service() {
             event("BIA_MEASUREMENT_SAVED","success=$success; reason=$reason; pre=$biaPre; mode=$bodySource; attempt=$biaAttempt; progress=$biaProgress")
             if(success) {
                 biaRetrying=false; biaHint=""
+                biaResultSuccess=false
                 publishSuccess("${biaModeLabel()} ${biaModeIndex + 1}/${biaModes.size.coerceAtLeast(1)}", biaSummary)
+                event("BIA_RESULT_AUTO_CONTINUE",
+                    "pre=$biaPre; mode=$bodySource; phase=$phase; summaryLength=${biaSummary.length}")
+                // A successful result advances immediately. Re-contact already auto-retries a
+                // failed attempt, so there is no continue/retry result page for BIA.
                 afterBia()
-            } else if(isBiaRetryable(reason) && clock() < biaContactStartMs + SHORT_BUDGET_MS) {
+            } else if(isBiaRetryable(reason) && clock() < (if (coopEngaged) coopResultDeadlineMs else coopNoPresenceDeadlineMs)) {
+                biaResultSuccess=false
                 biaContactDetected=false
                 biaRetrying=true
                 biaHint=biaRetryHint(reason)
                 phase=if(biaPre) "WAIT_BIA_PRE" else "WAIT_BIA_POST"
-                deadline=minOf(biaContactStartMs + SHORT_BUDGET_MS, clock() + BIA_CONTACT_RETRY_MS)
+                deadline=minOf(if (coopEngaged) coopResultDeadlineMs else coopNoPresenceDeadlineMs, clock() + BIA_CONTACT_RETRY_MS)
                 val reached=if(biaProgress>0) "已到 $biaProgress%" else "未检测到稳定接触"
                 val extra=if(!biaPre && bodySource=="MF_BIA" && biaAttempt>=2 && biaProgress>=80)
                     "\n活动后 MF-BIA 多次在最后一步信号不足；可继续保持接触重试，或点“跳过体成分，继续”。" else ""
-                notice="测量中断：$reached（$biaHint）。请保持双指接触，${BIA_CONTACT_RETRY_MS/1000}秒后自动重试（第 ${biaAttempt+1} 次，最多80秒）。$extra"
+                notice="测量中断：$reached（$biaHint）。请保持双指接触，${BIA_CONTACT_RETRY_MS/1000}秒后自动重试（第 ${biaAttempt+1} 次）；长时间没有结果会自动继续下一项。$extra"
                 event("BIA_CONTACT_RETRY_WAIT","reason=$reason; attempt=$biaPhase; nextAttempt=${biaAttempt+1}; progress=$biaProgress; mode=$bodySource")
                 holdDecisionWindow();restartTick()
-            } else if(isBiaRetryable(reason)) {
-                biaRetrying=false
-                finish("SHORT_MEASUREMENT_TIMEOUT_80S", true)
             } else {
                 biaRetrying=false
+                biaResultSuccess=false
                 phase=if(biaPre) "REVIEW_BIA_PRE" else "REVIEW_BIA_POST"
                 val guide=when(reason) {
                     "SDK_STATUS_18" -> "请在活动管理中检查个人资料"
                     else -> "请检查姿势和接触，也可跳过继续活动"
                 }
-                notice="体成分未完成：$guide（$reason）。已有记录已保存；80秒不操作则停止。"
-                deadline=clock()+80_000;holdDecisionWindow();restartTick()
+                notice="体成分未完成：$guide（$reason）。已有记录已保存；" +
+                    if (coopEngaged) "长时间没有结果会自动继续下一项，也可现在跳过。" else "请把双指放到两个按钮上。"
+                deadline=if (coopEngaged) coopResultDeadlineMs else coopNoPresenceDeadlineMs
+                holdDecisionWindow();restartTick()
             }
         }
     }
-    private fun skipBia() {
+    private fun skipBia(auto: Boolean = false) {
         if(draining!=null || stopping) return
+        if (biaResultSuccess) {
+            // Accepting a successful result is the same as "continue", not a skip.
+            event("BIA_RESULT_ACCEPTED", "pre=$biaPre; mode=$bodySource; phase=$phase; auto=$auto")
+            biaResultSuccess=false
+            afterBia()
+            return
+        }
         shortFailure=true; biaContactDetected=false; biaRetrying=false
-        event("USER_SKIPPED_BIA","pre=$biaPre; mode=$bodySource; phase=$phase")
+        event(if (auto) "AUTO_ADVANCED_BIA" else "USER_SKIPPED_BIA","pre=$biaPre; mode=$bodySource; phase=$phase; auto=$auto")
         drainSources {
-            biaResults[biaPhase]="未取得有效结果，已跳过"
+            biaResults[biaPhase]=if (auto) "超时未取得有效结果，已自动继续" else "未取得有效结果，已跳过"
             if(biaModeIndex + 1 < biaModes.size) {
                 biaModeIndex++
                 startBiaMode(biaPre)
@@ -690,7 +849,7 @@ class ActivityRecordingService : Service() {
         if (biaPre) {
             when {
                 preEcg -> beginEcg("PRE-1")
-                prePpg && !skipPrePpgForVendorLed -> beginPpg(true)
+                prePpg && !skipPrePpgForVendorLed -> preparePpg(true)
                 else -> beginCore()
             }
         } else if (postSpo2) prepareSpo2(false)
@@ -699,15 +858,21 @@ class ActivityRecordingService : Service() {
     private fun prepareSpo2(pre: Boolean) {
         shortSensor = "SPO2"; spo2Pre = pre
         phase = if(pre) "READY_SPO2_PRE" else "READY_SPO2_POST"
-        shortBudgetStartMs = clock()
-        val restore = if (pre) "测完请把手表戴回腕骨下方的正常位置。" else "这是最后一项，测完直接结束，不用再戴回。"
-        notice = "血氧需要把表戴在腕骨上方：把手表沿前臂上移约1–2指宽，表带贴合但不要勒紧。\n" +
-            "手肘放在桌上，手腕靠近心脏，手掌放松；最好先安静休息5分钟。\n" +
+        spo2StartedMs = 0L
+        lastProgressPercent = -1
+        lastProgressDetail = ""
+        if (coopStage != "SPO2" || coopPre != pre) beginCooperation("SPO2", pre)
+        val restore = if (pre) "测完把手表移回离手掌约2指的正常位置。"
+            else "这是最后一项：成功后显示结果，约4秒后自动退出。"
+        notice = "血氧需要把手表沿前臂上移到离手掌约5指的位置，表带贴合但不要勒紧。\n" +
+            "手肘放在桌上，手表与心脏保持相似高度，手掌放松；最好先安静休息5分钟。\n" +
             "测量时保持静止、不要说话；手冷时先搓暖手腕。\n" +
             "$restore\n" +
-            "${NO_HAND_AUTOSTART_MS / 1000}秒后自动开始；也可提前点开始。80秒内没有有效结果会保存并退出。"
-        deadline = clock() + NO_HAND_AUTOSTART_MS
-        event("SPO2_PLACEMENT_PREPARATION", "pre=$pre; autostartMs=$NO_HAND_AUTOSTART_MS; sensorsNotStarted=true")
+            "点下方“开始测量”按钮开始；没有佩戴或接触时会先倒计时，然后退出。"
+        // SpO2 is user-started from the fixed on-screen footer button. No automatic start
+        // and no phase deadline: the cooperation clock owns exit/advance.
+        deadline = 0L
+        event("SPO2_PLACEMENT_PREPARATION", "pre=$pre; autostartMs=0; sensorsNotStarted=true; offBody=${worn == false}")
         holdDecisionWindow(); restartTick()
     }
     private fun beginSpo2(pre: Boolean) {
@@ -715,8 +880,11 @@ class ActivityRecordingService : Service() {
         phase = if(pre) "PRE-${++preSpo2Attempt}" else "POST-${++postSpo2Attempt}"
         spo2Phase = phase
         spo2Value = null
+        spo2StartedMs = clock()
+        lastProgressPercent = 0
+        lastProgressDetail = ""
         spo2Results[phase] = "测量中，尚无有效结果"
-        deadline = clock() + 30_000
+        deadline = clock() + SPO2_ATTEMPT_MS
         notice = "血氧测量中，请保持静止。获得有效结果即结束，最多等待30秒；没有连续回调也可能是正常计算。"
         event("SPO2_MEASUREMENT_STARTED", "pre=$pre; deadlineMs=$deadline")
         startSource("SPO2"); restartTick()
@@ -726,7 +894,11 @@ class ActivityRecordingService : Service() {
         drainSources {
             spo2Results[spo2Phase] = if(success) "成功 ${spo2Value}%" else "未成功，未取得有效结果"
             event("SPO2_MEASUREMENT_SAVED", "success=$success; reason=$reason; pre=$spo2Pre; value=$spo2Value")
-            if(success) { publishSuccess("血氧", spo2Value?.let { "$it%" } ?: "已成功"); afterSpo2() } else {
+            if(success) {
+                spo2StartedMs = 0L
+                publishSuccess("血氧", spo2Value?.let { "$it%" } ?: "已成功")
+                if (spo2Pre) afterSpo2() else holdSpo2Completion()
+            } else {
                 phase = if(spo2Pre) "REVIEW_SPO2_PRE" else "REVIEW_SPO2_POST"
                 val explanation = when(reason) {
                     "SDK_STATUS_-4" -> "检测到移动，请重新调整并保持静止"
@@ -734,10 +906,25 @@ class ActivityRecordingService : Service() {
                     "SDK_STATUS_-6", "MEASUREMENT_TIMEOUT_30S" -> "30秒内未取得有效结果"
                     else -> "测量未完成"
                 }
-                notice = "血氧未成功：$explanation（$reason）。请确认手表背面贴紧皮肤、表带不过松；手冷时先搓暖手腕。已有数据已保存；点重测会立即开始，或跳过继续；80秒不操作则退出。"
-                deadline=clock()+80_000; holdDecisionWindow(); restartTick()
+                lastProgressPercent = windowPercent(spo2StartedMs, SPO2_ATTEMPT_MS)
+                spo2StartedMs = 0L
+                lastProgressDetail = if (lastProgressPercent >= 0)
+                    "中断 · $explanation" else explanation
+                notice = "血氧未成功：$explanation（$reason）。请确认手表背面贴紧皮肤、表带不过松；手冷时先搓暖手腕。已有数据已保存；" +
+                    if (coopEngaged) "长时间没有结果会自动继续，也可现在跳过。" else "请确认手表戴在手腕上。"
+                deadline = if (coopEngaged) coopResultDeadlineMs else coopNoPresenceDeadlineMs
+                holdDecisionWindow(); restartTick()
             }
         }
+    }
+    private fun skipSpo2(auto: Boolean) {
+        if (draining != null || stopping) return
+        shortFailure = true
+        if (phase.startsWith("REVIEW_") || phase == spo2Phase) {
+            spo2Results[spo2Phase] = if (auto) "超时未取得有效结果，已自动继续" else "未取得有效结果，已跳过"
+        }
+        event(if (auto) "AUTO_ADVANCED_SPO2" else "USER_SKIPPED_SPO2", "pre=$spo2Pre; phase=$phase; auto=$auto")
+        if (running.contains("SPO2")) drainSources { afterSpo2() } else afterSpo2()
     }
     private fun afterSpo2() {
         if (spo2Pre) {
@@ -746,21 +933,43 @@ class ActivityRecordingService : Service() {
                 // restores the normal position; the BIA screen repeats that reminder.
                 bia -> startBia(true)
                 preEcg -> beginEcg("PRE-1")
-                prePpg && !skipPrePpgForVendorLed -> beginPpg(true)
+                prePpg && !skipPrePpgForVendorLed -> preparePpg(true)
                 else -> beginCore()
             }
         } else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
+    /**
+     * The final measurement keeps a readable success page for a few seconds before the task
+     * closes. Sensors are already drained here, so this phase only publishes display state.
+     */
+    private fun holdSpo2Completion() {
+        coopStage = ""; coopEngaged = false
+        coopResultDeadlineMs = 0L; coopNoPresenceDeadlineMs = 0L
+        shortSensor = "SPO2"
+        phase = "SPO2_DONE"
+        lastProgressPercent = -1
+        lastProgressDetail = ""
+        notice = "血氧测量成功，即将退出。"
+        deadline = clock() + SPO2_DONE_HOLD_MS
+        event("SPO2_SUCCESS_HOLD", "holdMs=$SPO2_DONE_HOLD_MS; value=$spo2Value; pre=$spo2Pre")
+        publish()
+        holdDecisionWindow(); restartTick()
+    }
     /** PPG has no placement gate; start immediately instead of showing a 15 s wait screen. */
-    private fun preparePpg(pre: Boolean) = beginPpg(pre)
+    private fun preparePpg(pre: Boolean) {
+        if (coopStage != "PPG" || coopPre != pre) beginCooperation("PPG", pre)
+        beginPpg(pre)
+    }
     private fun beginPpg(pre: Boolean) {
         shortSensor = "PPG_ON_DEMAND"; ppgPre = pre
         phase = if(pre) "PRE-${++prePpgAttempt}" else "POST-${++postPpgAttempt}"
-        shortBudgetStartMs = clock()
         ppgPhase = phase
         ppgRows = 0
+        ppgStartedMs = clock()
+        lastProgressPercent = 0
+        lastProgressDetail = ""
         ppgResults[phase] = "测量中，尚无原始记录"
-        deadline = clock() + 30_000
+        deadline = clock() + PPG_ATTEMPT_MS
         notice = "PPG：手表正常佩戴即可，不需要调整表带或改变姿势。\n" +
             "手臂放松，保持静止；检测到正常佩戴后立即开始，无倒数，最多采集30秒。\n" +
             "原始绿/红外/红记录会原样保存。"
@@ -772,17 +981,35 @@ class ActivityRecordingService : Service() {
         drainSources {
             ppgResults[ppgPhase] = if(success) "已采集 $ppgRows 条原始记录" else "未采集到原始记录"
             event("PPG_MEASUREMENT_SAVED", "success=$success; reason=$reason; pre=$ppgPre; rawRows=$ppgRows")
-            if(success) { publishSuccess("PPG", "已采集 $ppgRows 条原始记录"); afterPpg() } else {
+            if(success) { ppgStartedMs = 0L; publishSuccess("PPG", "已采集 $ppgRows 条原始记录"); afterPpg() } else {
                 phase = if(ppgPre) "REVIEW_PPG_PRE" else "REVIEW_PPG_POST"
-                notice = "PPG 未取得原始记录（$reason）。请确认手表背面贴紧皮肤、表带不过松，手臂保持静止。已有数据已保存；点重测会立即开始，或跳过继续；80秒不操作则退出。"
-                deadline = clock() + 80_000; holdDecisionWindow(); restartTick()
+                lastProgressPercent = windowPercent(ppgStartedMs, PPG_ATTEMPT_MS)
+                ppgStartedMs = 0L
+                lastProgressDetail = if (lastProgressPercent >= 0)
+                    "中断 · 未收到原始记录（$reason）" else "未收到原始记录（$reason）"
+                notice = "PPG 未取得原始记录（$reason）。请确认手表背面贴紧皮肤、表带不过松，手臂保持静止。已有数据已保存；" +
+                    if (coopEngaged) "长时间没有结果会自动继续，也可现在跳过。" else "请确认手表戴在手腕上。"
+                deadline = if (coopEngaged) coopResultDeadlineMs else coopNoPresenceDeadlineMs
+                holdDecisionWindow(); restartTick()
             }
         }
     }
+    private fun skipPpg(auto: Boolean) {
+        if (draining != null || stopping) return
+        shortFailure = true
+        if (phase.startsWith("REVIEW_") || phase == ppgPhase) {
+            ppgResults[ppgPhase] = if (auto) "超时未采集到原始记录，已自动继续" else "未采集，已跳过"
+        }
+        event(if (auto) "AUTO_ADVANCED_PPG" else "USER_SKIPPED_PPG", "pre=$ppgPre; phase=$phase; auto=$auto")
+        if (running.contains("PPG_ON_DEMAND")) drainSources { afterPpg() } else afterPpg()
+    }
     private fun afterPpg() {
         if (ppgPre) beginCore()
-        else if (postSpo2) prepareSpo2(false)
-        else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        else when {
+            postEcg -> beginEcg("POST-1")
+            postSpo2 -> prepareSpo2(false)
+            else -> finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
+        }
     }
     /** Any non-empty raw row from a core source disarms the no-data watchdog. Not a clinical validity judgment. */
     private fun noteCoreData(origin: String, sensor: String, rows: List<Map<String, Any?>>) {
@@ -870,13 +1097,17 @@ class ActivityRecordingService : Service() {
                 qualityTrackers[qualityKey]?.observe(rows)
                 buffers.getOrPut(sensor) { mutableListOf() }.addAll(rows)
                 if (sensor == bodySource && rows.isNotEmpty() && draining == null) {
+                    // If the platform cannot report wear, the BIA SDK producing rows is the only
+                    // presence evidence. Repeated contact errors must not become a no-presence exit.
+                    if (worn == null && !coopEngaged) engage("BIA_CALLBACK_NO_WEAR_STATE")
                     if(clock() >= deadline) { endBia(false,"MEASUREMENT_TIMEOUT_60S"); return@start }
                     val progress=(rows.lastOrNull()?.get("PROGRESS") as? Number)?.toDouble()
                     val percent=progress?.let { if(bodySource=="BIA") it*100 else it }
                     val result = rows.firstOrNull { if(bodySource=="MF_BIA") com.rawwave.core.BiaResult.multiFrequencyComplete(it) else com.rawwave.core.BiaResult.complete(it) }
                     val failure = rows.firstOrNull { ((it["STATUS"] as? Number)?.toInt() ?: 0).let { status -> status > 0 && !(bodySource=="MF_BIA" && status==23) } }
                     if(percent!=null && percent.isFinite() && percent in 0.0..100.0 && (failure==null || percent>0.0))
-                        biaProgress=percent.toInt().coerceIn(0,100)
+                        biaProgress=Math.round(percent).toInt().coerceIn(0,100)
+                    if (percent != null && percent > 0.0) engage("BIA_PROGRESS")
                     if(result != null) {
                         biaSummary=if(bodySource=="MF_BIA") "四频阻抗及相位已取得" else "体脂率 ${result["BODY_FAT_RATIO"]}%，骨骼肌 ${result["SKELETAL_MUSCLE_MASS"]} kg"
                         biaResults[biaPhase]="已取得结果，正在保存"
@@ -889,6 +1120,7 @@ class ActivityRecordingService : Service() {
                             if(contactStatus!=null) {
                                 biaContactDetected=true
                                 biaRetrying=false; biaHint=""
+                                engage("BIA_CONTACT")
                                 notice="已检测到接触，测量中；保持双指轻触两键，双手不要相碰。"
                                 event("BIA_CONTACT_DETECTED","mode=$bodySource; status=$contactStatus")
                             }
@@ -899,6 +1131,7 @@ class ActivityRecordingService : Service() {
                     }
                 }
                 if (sensor == "SPO2" && rows.isNotEmpty() && draining == null) {
+                    if (worn != false) engage("SPO2_CALLBACK")
                     if(clock() >= deadline) { endSpo2(false,"MEASUREMENT_TIMEOUT_30S"); return@start }
                     val completed = rows.firstOrNull { (it["STATUS"] as? Number)?.toInt() == 2 &&
                         (it["SPO2"] as? Number)?.toDouble()?.let { v -> v.isFinite() && v > 0.0 && v <= 100.0 } == true }
@@ -916,6 +1149,7 @@ class ActivityRecordingService : Service() {
                     }
                 }
                 if (sensor == "PPG_ON_DEMAND" && rows.isNotEmpty() && draining == null) {
+                    if (worn != false) engage("PPG_ON_DEMAND_ROWS")
                     ppgRows += rows.size
                     ppgResults[ppgPhase] = "已接收 $ppgRows 条原始记录"
                     if (clock() >= deadline) {
@@ -928,32 +1162,32 @@ class ActivityRecordingService : Service() {
                 if (sensor == "ECG" && rows.isNotEmpty() && draining == null) {
                     // A late SDK batch cannot revive an expired no-contact wait.
                     if (EcgWaitBudget.mustStop(deadline,clock(),ecgGate.measuring(),false)) {
-                        finish("ECG_IDLE_TIMEOUT_80S", true)
+                        noPresenceExit()
                         return@start
                     }
                     val batch = EcgBatchQuality.inspect(rows)
                     ecgTotalRows += rows.size
                     contact = batch.contactValid()
                     lastContactMs = clock()
+                    if (contact) engage("ECG_LEAD_OFF_0")
                     val update = ecgGate.observe(batch)
                     ecgUpdate = update
                     when (update.status()) {
                         EcgContinuityGate.Status.STARTED -> {
-                            // The 80-second guard is "no contact", not "seconds since the phase
-                            // began". Contact just arrived, so the retry/idle budget restarts.
-                            shortBudgetStartMs = clock()
-                            deadline = clock() + 45_000
+                            // The guard is "no contact", not "seconds since the phase began".
+                            // Contact just arrived, so the attempt clock starts now.
+                            deadline = clock() + ECG_ATTEMPT_MS
                             notice = "接触有效，正在连续采集；中途断开会从头开始。"
                             event("ECG_CONTINUOUS_SEGMENT_STARTED", "segment=${update.segment()}; firstSdkTimestampMs=${update.firstTimestampMs()}")
                         }
                         EcgContinuityGate.Status.RESET -> {
                             val failures = retryPolicy(phase.startsWith("PRE")).recordFailure()
                             // A reset is not "no contact"; the user is still holding the
-                            // electrode and may be retrying. Renew both idle timers.
-                            shortBudgetStartMs = clock()
-                            deadline = clock() + 80_000
+                            // electrode and may be retrying. Keep the stage clock, renew the
+                            // attempt clock only.
+                            deadline = clock() + ECG_ATTEMPT_MS
                             notice = "接触或数据连续性中断（第${failures}次），本次已作废。重新放好后从30秒开始。" +
-                                if (failures >= 2) "你也可以选择跳过 ECG，继续本次活动。" else ""
+                                "长时间没有结果会自动继续下一项。"
                             event("ECG_CONTINUITY_RESET", "segment=${update.segment()}; failures=$failures; reason=${update.reason()}; retainedRawRows=$ecgTotalRows")
                         }
                         EcgContinuityGate.Status.WAITING -> {
@@ -1014,10 +1248,9 @@ class ActivityRecordingService : Service() {
             val failures = policy.recordFailure()
             event("ECG_FAILED", "failures=$failures; rawRows=$ecgTotalRows; failureReason=$ecgFailureReason; lastBatchReason=${update?.reason()}; incomplete=$ecgFailed")
             phase = next.name
-            notice = "没有取得连续有效的30秒 ECG（累计失败${failures}次）。\n" +
-                if (policy.skipAllowed()) "可以不限次数继续重测，也可以跳过 ECG 后继续活动；80秒无选择则停止。"
-                else "请继续重测；连续失败两次后才会提供跳过选项。80秒无选择则停止。"
-            deadline = clock() + 80_000
+            notice = "没关系，这不是你的错，ECG 需要连续 30 秒稳定接触，本次没有取得完整记录。\n" +
+                "已记录的片段会保存，但不作为有效 ECG。可以不限次数重测，也可以直接跳过 ECG 继续。"
+            deadline = if (coopEngaged) coopResultDeadlineMs else coopNoPresenceDeadlineMs
             if (ecgFailureReason == "ECG_CALLBACK_SILENCE_15S") notice = "ECG 已连续15秒没有新数据，本次未完成；已有片段已保存。\n$notice"
             holdDecisionWindow()
             // Keep only this bounded decision window awake; finish() releases the lock.
@@ -1026,25 +1259,22 @@ class ActivityRecordingService : Service() {
             if (update != null && ecgTotalRows > update.continuousSamples())
                 event("ECG_RAW_INCLUDES_INVALID_SEGMENTS", "rawRows=$ecgTotalRows; acceptedContinuousSamples=${update.continuousSamples()}; all rows retained")
             publishSuccess("ECG", "已取得连续 30 秒记录")
-            if (!wasPre) continueAfterPostEcg { beginPostShorts() }
+            if (!wasPre) afterPostEcg()
             else if (next == CapturePhasePolicy.Next.CORE) {
-                if (prePpg && !skipPrePpgForVendorLed) beginPpg(true) else beginCore()
+                if (prePpg && !skipPrePpgForVendorLed) preparePpg(true) else beginCore()
             } else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
         }
     }
     private fun publishSuccess(kind: String, text: String) {
         main.post { successObserver?.invoke(kind, text.ifBlank { "已成功" }) }
     }
+    private fun publishAutoAdvance(kind: String, text: String) {
+        main.post { autoAdvanceObserver?.invoke(kind, text) }
+    }
     private fun retryPolicy(pre: Boolean) = if (pre) preRetryPolicy else postRetryPolicy
     private fun skipEcg() {
         val wasPre = phase.startsWith("PRE") || phase == "REVIEW_PRE" || ecgPhase.startsWith("PRE")
         val policy = retryPolicy(wasPre)
-        if (!policy.skipAllowed()) {
-            notice = "连续失败两次后才可跳过；你仍可继续重测。"
-            event("USER_SKIP_ECG_REJECTED", "failures=${policy.failures()}")
-            publish()
-            return
-        }
         if (phase.startsWith("PRE") || phase.startsWith("POST")) {
             // Keep a held core PPG alive until the post-ECG skip path releases it last.
             drainSources(keep = setOf("PPG")) { completeSkip(wasPre, policy.failures()) }
@@ -1065,18 +1295,33 @@ class ActivityRecordingService : Service() {
         shortFailure = true
         beginCore()
     }
-    private fun completeSkip(wasPre: Boolean, failures: Int) {
+    private fun completeSkip(wasPre: Boolean, failures: Int, auto: Boolean = false) {
         if (phase.startsWith("PRE") || phase.startsWith("POST")) {
             deadline = 0
-            event("ECG_ATTEMPT_END", "userSkipped=true; rawRows=$ecgTotalRows; failures=$failures; invalid fragments retained")
+            event("ECG_ATTEMPT_END", "userSkipped=${!auto}; rawRows=$ecgTotalRows; failures=$failures; invalid fragments retained; auto=$auto")
         }
-        event("USER_SKIPPED_FAILED_ECG", "$ecgPhase; failures=$failures")
+        event(if (auto) "AUTO_ADVANCED_ECG" else "USER_SKIPPED_FAILED_ECG", "$ecgPhase; failures=$failures; auto=$auto")
         shortFailure = true
-        if (wasPre) beginCore() else continueAfterPostEcg { beginPostShorts() }
+        if (wasPre) beginCore() else afterPostEcg()
     }
-    /** Release a core PPG held through post ECG before starting the remaining post shorts. */
-    private fun continueAfterPostEcg(next: () -> Unit) {
-        if (running.contains("PPG")) drainSources { next() } else next()
+    /**
+     * The stage cap is a bound on cooperation, not a user decision. Go to the next item even
+     * when the manual skip is still gated by the two-failure rule.
+     */
+    private fun autoSkipEcg() {
+        val wasPre = coopPre
+        event("COOPERATION_AUTO_ADVANCE_ECG",
+            "phase=$phase; rawRows=$ecgTotalRows; failures=${retryPolicy(wasPre).failures()}; contact=$contact")
+        if (running.contains("ECG")) {
+            drainSources(keep = setOf("PPG")) { completeSkip(wasPre, retryPolicy(wasPre).failures(), auto = true) }
+        } else completeSkip(wasPre, retryPolicy(wasPre).failures(), auto = true)
+    }
+    /** Post ECG is followed by the final SpO2 placement; release a held CORE PPG first. */
+    private fun afterPostEcg() {
+        if (running.contains("PPG")) drainSources { afterPostEcgNext() } else afterPostEcgNext()
+    }
+    private fun afterPostEcgNext() {
+        if (postSpo2) prepareSpo2(false) else finish("USER_COMPLETED_SEE_SENSOR_EVENTS")
     }
     private fun restartTick() {
         renewCaptureLock()
@@ -1226,6 +1471,7 @@ class ActivityRecordingService : Service() {
     private fun streamPhase() = when (phase) {
         "CONNECTING", "WAIT_BIA_PRE", "READY_SPO2_PRE", "READY_PPG_PRE" -> "PRE-1"
         "WAIT_BIA_POST", "READY_SPO2_POST", "READY_PPG_POST" -> "POST-1"
+        "SPO2_DONE" -> "POST-1"
         "REVIEW_PRE", "REVIEW_POST" -> ecgPhase
         "REVIEW_BIA_PRE", "REVIEW_BIA_POST" -> biaPhase
         "REVIEW_SPO2_PRE", "REVIEW_SPO2_POST" -> spo2Phase
@@ -1248,11 +1494,58 @@ class ActivityRecordingService : Service() {
             persistence?.journalEvent(journal,"CAPTURE_$kind",fields) ?: journal.event("CAPTURE_$kind",fields)
         }
     }
+    /**
+     * Real progress for the pre/post short measurements. BIA/MF-BIA use the SDK PROGRESS value;
+     * SpO2/PPG have no SDK progress, so the percent is the actual collection window elapsed.
+     * ECG keeps its own 30-second continuous countdown and is intentionally excluded.
+     * Review pages keep the last value so the user can see where the attempt stopped.
+     */
+    private fun shortProgress(): Pair<Int, String> {
+        if (phase == "CORE-1" || phase == "CONNECTING" || phase == "DRAINING") return -1 to ""
+        return when (shortSensor) {
+            "BIA" -> {
+                if (phase.startsWith("REVIEW_BIA")) {
+                    if (biaResultSuccess) 100 to "已完成 · $biaSummary"
+                    else {
+                        val hint = biaHint.ifBlank { "未取得完整有效结果" }
+                        if (biaProgress > 0) biaProgress to "中断 · $hint" else -1 to "未检测到接触"
+                    }
+                } else if (phase.startsWith("WAIT_BIA")) {
+                    val retry = ((deadline - clock()).coerceAtLeast(0L) + 999L) / 1000L
+                    biaProgress to "测量中断 · ${retry} 秒后自动重试"
+                } else {
+                    val percent = if (biaContactDetected && biaProgress < 0) 0 else biaProgress
+                    percent to if (biaContactDetected) "保持双指接触" else ""
+                }
+            }
+            "SPO2" -> {
+                if (phase.startsWith("REVIEW_SPO2")) lastProgressPercent to lastProgressDetail
+                else if (spo2StartedMs > 0L) {
+                    val elapsed = ((clock() - spo2StartedMs).coerceAtLeast(0L) / 1000L).coerceAtMost(30L)
+                    val status = if (spo2Results[spo2Phase]?.contains("计算中") == true) "计算中" else "等待有效结果"
+                    windowPercent(spo2StartedMs, SPO2_ATTEMPT_MS) to "采集 $elapsed/30 秒 · $status"
+                } else -1 to ""
+            }
+            "PPG_ON_DEMAND" -> {
+                if (phase.startsWith("REVIEW_PPG")) lastProgressPercent to lastProgressDetail
+                else if (ppgStartedMs > 0L) {
+                    val elapsed = ((clock() - ppgStartedMs).coerceAtLeast(0L) / 1000L).coerceAtMost(30L)
+                    windowPercent(ppgStartedMs, PPG_ATTEMPT_MS) to "不要乱动 · 采集 $elapsed/30 秒 · 已收 $ppgRows 条"
+                } else -1 to ""
+            }
+            else -> -1 to ""
+        }
+    }
+
     private fun publish() {
         val count = countText()
         val title = when {
             shortSensor == "BIA" -> if(biaPre) "活动前 ${biaModeLabel()}" else "活动后 ${biaModeLabel()}"
-            shortSensor == "SPO2" -> if(spo2Pre) "活动前血氧 SpO₂" else "活动后血氧 SpO₂"
+            shortSensor == "SPO2" -> when {
+                phase == "SPO2_DONE" -> "活动后血氧 SpO₂ 已完成"
+                spo2Pre -> "活动前血氧 SpO₂"
+                else -> "活动后血氧 SpO₂"
+            }
             shortSensor == "PPG_ON_DEMAND" -> if(ppgPre) "活动前 PPG 100Hz" else "活动后 PPG 100Hz"
             phase == "CONNECTING" -> "正在连接三星传感器"
             phase.startsWith("PRE") -> "活动前 ECG"
@@ -1280,16 +1573,24 @@ class ActivityRecordingService : Service() {
             else -> ((clock() - coreStartedMs).coerceAtLeast(0L)) / 1000L
         }
         val phaseRemainingSeconds = ((deadline - clock()).coerceAtLeast(0L) / 1000L).toInt()
+        val cooperationRemainingSeconds = when {
+            coopStage.isEmpty() || phase == "CORE-1" -> 0
+            coopEngaged -> ((coopResultDeadlineMs - clock()).coerceAtLeast(0L) / 1000L).toInt()
+            else -> ((coopNoPresenceDeadlineMs - clock()).coerceAtLeast(0L) / 1000L).toInt()
+        }
+        val (progressPercent, progressDetail) = shortProgress()
+        if (progressPercent >= 0 && !phase.startsWith("REVIEW_")) lastProgressPercent = progressPercent
         val next = State(true, if (draining != null) "DRAINING" else phase,
             if (draining != null) "正在收尾并保存各传感器数据，请稍候（最多5秒收尾等待）\n$count"
-            else "$title\n$notice$idleHint$postLedHint" + (if(shortSensor == "BIA" || shortSensor == "SPO2" || shortSensor == "PPG_ON_DEMAND" || placementWaiting()) "\n${when { shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") && biaRetrying -> "测量中断，正在重试"; shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") -> "等待双指接触"; shortSensor == "BIA" && !phase.startsWith("REVIEW_") -> "测量中，请保持接触"; placementWaiting() || phase.startsWith("REVIEW_") -> "等待操作 $remaining 秒"; else -> "最多等待 $remaining 秒" }}" else "") +
+            else "$title\n$notice$idleHint$postLedHint" + (if((shortSensor == "BIA" || shortSensor == "SPO2" || shortSensor == "PPG_ON_DEMAND" || placementWaiting()) && phase != "SPO2_DONE") "\n${when { shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") && biaRetrying -> "测量中断，正在重试"; shortSensor == "BIA" && phase.startsWith("WAIT_BIA_") -> "等待双指接触"; shortSensor == "BIA" && !phase.startsWith("REVIEW_") -> "测量中，请保持接触"; placementWaiting() || phase.startsWith("REVIEW_") -> "等待操作 $remaining 秒"; else -> "最多等待 $remaining 秒" }}" else "") +
                 (if (incompleteTail.isEmpty()) "" else "\n部分活动传感器尾部未确认，已收数据已保存；继续活动后短测。") + "\n采集记录：\n$count", remaining,
             contact && clock() - lastContactMs < 2000,
             policy.skipAllowed(), policy.failures(), shortSensor,
             if(shortSensor == "BIA") biaModeLabel() else "", biaModeIndex + 1 < biaModes.size, biaContactDetected,
             biaRetrying && shortSensor == "BIA" && phase.startsWith("WAIT_BIA_"), biaAttempt, biaProgress,
             if(shortSensor == "BIA") biaHint else "", coreElapsedSeconds,
-            phaseRemainingSeconds, if (biaModes.isEmpty()) 0 else biaModeIndex + 1, biaModes.size)
+            phaseRemainingSeconds, if (biaModes.isEmpty()) 0 else biaModeIndex + 1, biaModes.size,
+            worn, coopEngaged, cooperationRemainingSeconds, progressPercent, progressDetail, biaResultSuccess)
         state = next; main.post { observer?.invoke(next) }
     }
     private fun countText(): String {
@@ -1499,8 +1800,11 @@ class ActivityRecordingService : Service() {
         if (stopping) return
         finishDraining = false
         finishPhase = 0
-        stopping = true; shortBudgetStartMs = 0L; writer.removeCallbacks(tick)
-        if (reason.startsWith("SHORT_") || reason.contains("CONTACT_TIMEOUT") || reason.contains("PLACEMENT_IDLE_TIMEOUT_80S")) {
+        stopping = true; writer.removeCallbacks(tick)
+        try { presence.stop() } catch (_: Exception) {}
+        coopStage = ""; coopEngaged = false
+        coopNoPresenceDeadlineMs = 0L; coopResultDeadlineMs = 0L
+        if (reason.startsWith("SHORT_") || reason.contains("CONTACT_TIMEOUT") || reason.contains("PLACEMENT_IDLE_TIMEOUT_80S") || reason == "NO_PRESENCE_TIMEOUT") {
             val stage = when(shortSensor) {
                 "BIA" -> "体成分"
                 "SPO2" -> "血氧"
@@ -1510,7 +1814,7 @@ class ActivityRecordingService : Service() {
             }
             try {
                 getSharedPreferences("capture-notice",MODE_PRIVATE).edit()
-                    .putString("last","上次活动在${stage}阶段未检测到有效数据，已保存并退出。").commit()
+                    .putString("last","上次活动已保存，但本次没有${stage}数据（未检测到佩戴或接触）。").commit()
             } catch (_: Exception) {}
         }
         biaResults.replaceAll { _,result ->
@@ -1557,7 +1861,8 @@ class ActivityRecordingService : Service() {
         if (destroyed) writer.close()
         if (idleExit) {
             val text = if (reason.startsWith("CORE_NO_DATA_TIMEOUT"))
-                "没有收到活动数据，已停止并退出；本次不会自动同步。" else
+                "没有收到活动数据，已停止并退出；本次不会自动同步。" else if (reason == "NO_PRESENCE_TIMEOUT")
+                "没有检测到佩戴或手指接触，已停止；已有数据保留，下次打开可同步。" else
                 "短测等待或选择超时，已停止；已有数据保留，下次打开可同步。"
             val next = State(false, "DONE", text)
             state = next
@@ -1575,6 +1880,8 @@ class ActivityRecordingService : Service() {
         val outcome = when {
             result.contains("NOT_SEALED") -> "保存未完整完成，已有块保留；请发送问题报告"
             result == "USER_INTERRUPTED" -> "你已中断，已有数据保留"
+            result.startsWith("USER_COMPLETED_NO_POST_DATA") ->
+                "记录已结束并封存；活动后短测没有检测到佩戴或接触，已自动跳过"
             result.startsWith("USER_COMPLETED") -> if (incompleteTail.isEmpty()) "记录已结束并封存；传感器失败/无效数据会单独注明" else "记录已保存，但部分活动传感器尾部未确认；详情见问题报告"
             else -> "记录因异常停止，请发送问题报告\n$result"
         }
@@ -1607,6 +1914,7 @@ class ActivityRecordingService : Service() {
     }
     override fun onDestroy() {
         destroyed = true
+        try { presence.stop() } catch (_: Exception) {}
         writer.post {
             if (!stopping) guarded { finish("SERVICE_DESTROYED_INTERRUPTION") }
             else writer.close()

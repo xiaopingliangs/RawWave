@@ -30,6 +30,9 @@ data class RwColors(
     val success: Int,
     val warning: Int,
     val ripple: Int,
+    /** Code-drawn guidance only: a warm skin tone and a dark ink that stays readable on it. */
+    val illustrationSkin: Int,
+    val illustrationInk: Int,
 )
 
 object RwTheme {
@@ -80,6 +83,8 @@ object RwTheme {
         success = Color.rgb(27, 122, 67),
         warning = Color.rgb(138, 90, 0),
         ripple = Color.argb(51, 12, 122, 72),
+        illustrationSkin = Color.rgb(242, 197, 155),
+        illustrationInk = Color.rgb(6, 58, 34),
     )
 
     private fun dark(): RwColors = RwColors(
@@ -106,6 +111,8 @@ object RwTheme {
         success = Color.rgb(123, 224, 165),
         warning = Color.rgb(255, 196, 107),
         ripple = Color.argb(64, 255, 255, 255),
+        illustrationSkin = Color.rgb(242, 197, 155),
+        illustrationInk = Color.rgb(6, 58, 34),
     )
 }
 

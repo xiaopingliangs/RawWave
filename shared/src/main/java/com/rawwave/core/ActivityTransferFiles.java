@@ -38,11 +38,19 @@ public final class ActivityTransferFiles {
     public static File commit(File folder, String id, String hash, long expected, InputStream input,
                               long resumeFrom) throws IOException {
         validate(id, hash, expected);
-        if (resumeFrom < 0L || resumeFrom >= expected) throw new IOException("INVALID_ACTIVITY_RESUME_OFFSET");
+        if (resumeFrom < 0L || resumeFrom > expected) throw new IOException("INVALID_ACTIVITY_RESUME_OFFSET");
         Files.createDirectories(folder.toPath());
-        if (folder.getUsableSpace() < expected + 100L * 1024 * 1024) throw new IOException("LOW_PHONE_STORAGE");
         File target = new File(folder, id + ".zip");
         File part = new File(folder, id + ".part");
+        if (resumeFrom == expected) {
+            // The receiver already holds this exact archive. No stream is read; rewrite the
+            // receipt so the commit exchange can complete without re-sending the payload.
+            if (!target.isFile() || target.length() != expected || !hashFile(target).equals(hash))
+                throw new IOException("ACTIVITY_RESUME_TARGET_MISSING");
+            writeReceipt(folder, id, hash, expected);
+            return target;
+        }
+        if (folder.getUsableSpace() < expected + 100L * 1024 * 1024) throw new IOException("LOW_PHONE_STORAGE");
         MessageDigest incoming = digest();
         OutputStream sink = null;
         boolean existing = target.isFile();
@@ -92,10 +100,14 @@ public final class ActivityTransferFiles {
             Files.deleteIfExists(target.toPath());
             throw new IOException("ACTIVITY_DISK_READBACK_FAILED");
         }
+        writeReceipt(folder, id, hash, expected);
+        return target;
+    }
+
+    private static void writeReceipt(File folder, String id, String hash, long expected) throws IOException {
         byte[] receipt = ("{\"kind\":\"ACTIVITY_ARCHIVE_BYTES_COMMITTED_PENDING_DEEP_VERIFY\",\"id\":\"" + id
             + "\",\"sha256\":\"" + hash + "\",\"bytes\":" + expected + "}").getBytes(StandardCharsets.UTF_8);
         atomic(new File(folder, id + ".receipt.part"), new File(folder, id + ".receipt.json"), receipt);
-        return target;
     }
 
     public static void markVerified(File folder, String id, String hash, long bytes, java.util.List<String> sessionIds) throws IOException {

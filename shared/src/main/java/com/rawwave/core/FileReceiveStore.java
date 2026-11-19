@@ -22,9 +22,15 @@ public final class FileReceiveStore implements ReceiveStore {
         if (request.kind() != Kind.RAW_ACTIVITY) return 0L;
         ActivityTransferFiles.validate(request.id(), request.sha256(), request.bytes());
         File folder = new File(root, "activity-inbox");
-        // If the final archive already exists, the receiver consumes the full stream and
-        // discards it; telling the sender to skip a stale .part would break the hash check.
-        if (new File(folder, request.id() + ".zip").isFile()) return 0L;
+        // A committed archive with the same identity needs no bytes. Returning the full
+        // length lets the sender skip the whole payload and repeat only the handshake; the
+        // old behavior re-sent 20 MB whenever the final watch echo was lost.
+        File target = new File(folder, request.id() + ".zip");
+        if (target.isFile()) {
+            if (target.length() == request.bytes()
+                && ActivityTransferFiles.hashFile(target).equals(request.sha256())) return request.bytes();
+            return 0L;
+        }
         File part = new File(folder, request.id() + ".part");
         long length = part.isFile() ? part.length() : 0L;
         // A full or oversized part cannot be resumed safely; let commit truncate and restart.

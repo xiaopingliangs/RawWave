@@ -80,6 +80,24 @@ public class ActivityArchiveTest {
         assertEquals(batch.sha256(),ActivityTransferFiles.hashFile(target));
     }
 
+    @Test public void alreadyCommittedArchiveResumesAtFullLengthWithoutReadingBytes() throws Exception {
+        File root=temp.newFolder(),out=temp.newFolder(),phone=temp.newFolder();
+        session(root,true);
+        var batch=ActivityArchive.preparePending(root,out);
+        var request=new ReceiveStore.Request(ReceiveStore.Kind.RAW_ACTIVITY,batch.id(),batch.sha256(),batch.bytes());
+        File folder=new File(phone,"activity-inbox");
+        Files.createDirectories(folder.toPath());
+        Files.copy(batch.file().toPath(),new File(folder,batch.id()+".zip").toPath());
+        ReceiveStore port=new FileReceiveStore(phone,dir -> {});
+        // A lost final watch echo must not force the whole archive to be sent again.
+        assertEquals(batch.bytes(),port.resumeOffset(request));
+        try(InputStream empty=new ByteArrayInputStream(new byte[0])) {
+            port.commit(request,empty,() -> {},batch.bytes());
+        }
+        assertTrue(new File(folder,batch.id()+".receipt.json").isFile());
+        assertEquals(batch.sha256(),ActivityTransferFiles.hashFile(new File(folder,batch.id()+".zip")));
+    }
+
     @Test public void hashMismatchDeletesResumePartial() throws Exception {
         File root=temp.newFolder(),out=temp.newFolder(),phone=temp.newFolder();
         session(root,true);

@@ -436,6 +436,7 @@ class ActivityTransferWindow(
     private fun receive(opened: TransportPort.Channel) {
         stage("ACTIVITY_FILE_RECEIVE_STARTED","正在接收活动原始数据…")
         val input=ProgressInput(await(transport.input(opened)),resumeOffset)
+        var watchConfirmed=false
         val verified = CommitExchange.receiver({
             val saved=receiveStore.commit(ReceiveStore.Request(ReceiveStore.Kind.RAW_ACTIVITY,id,hash,expected),input,{
                 // Byte transfer is over; deep verification may take longer than the stall
@@ -449,9 +450,22 @@ class ActivityTransferWindow(
                 mapOf("sessions" to saved.sessionIds().size,"rawFiles" to saved.rawFiles(),"rawBytes" to saved.rawBytes()))
             check(attemptState.receiptSaved(monotonicMs())) { "ACTIVITY_RECEIPT_OUTSIDE_WINDOW" }
             saved
-        }, { await(message("COMMITTED")); Unit }, { waitSignal(confirmed,"ACTIVITY_WATCH_CONFIRM",15_000) }, { await(message("FINISHED")); Unit })
-        stage("ACTIVITY_WATCH_CONFIRM_RECEIVED","双端均已确认，正在停止同步。")
-        complete(true,"已接收并校验 ${verified.sessionIds().size} 次活动的原始数据。")
+        }, { await(message("COMMITTED")); Unit }, {
+            // The archive is durable and deep-verified before this point. A missing watch
+            // CONFIRM must not report a saved activity as failed; the next retry now
+            // resumes at the full length and only repeats the handshake.
+            watchConfirmed = try {
+                waitSignal(confirmed,"ACTIVITY_WATCH_CONFIRM",30_000); true
+            } catch (timeout: Exception) {
+                if (timeout.message != "ACTIVITY_WATCH_CONFIRM_TIMEOUT") throw timeout
+                try { log("ACTIVITY_WATCH_CONFIRM_MISSING",mapOf("note" to
+                    "archive committed and verified; watch CONFIRM not received")) } catch (_: Exception) {}
+                false
+            }
+        }, { await(message("FINISHED")); Unit })
+        if (watchConfirmed) stage("ACTIVITY_WATCH_CONFIRM_RECEIVED","双端均已确认，正在停止同步。")
+        complete(true, if (watchConfirmed) "已接收并校验 ${verified.sessionIds().size} 次活动的原始数据。"
+            else "手机已保存并校验 ${verified.sessionIds().size} 次活动的原始数据；未收到手表最终回执，下次重试会自动跳过已保存文件。")
     }
 
     private fun syncDirectory(folder: File) {

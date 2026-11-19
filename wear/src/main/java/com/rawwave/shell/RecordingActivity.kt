@@ -12,11 +12,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import com.rawwave.core.ActivityArchive
 import com.rawwave.core.ActivityOrder
+import com.rawwave.core.ActivityRetention
 import com.rawwave.core.ActivityStore
 import com.rawwave.core.ActivitySyncPolicy
 import com.rawwave.core.AutoSyncGate
 import com.rawwave.core.SensorCatalog
 import com.rawwave.core.SyncStopScope
+import com.rawwave.core.WatchLayoutPolicy
+import com.rawwave.core.WorkBudget
 import com.rawwave.designsystem.RwBodyText
 import com.rawwave.designsystem.RwCard
 import com.rawwave.designsystem.RwCheckBox
@@ -42,11 +45,30 @@ class RecordingActivity : ComponentActivity() {
     private lateinit var activityTimer: TextView
     private lateinit var successBanner: RwStatusPill
     private lateinit var stepCountdown: TextView
-    private lateinit var stepInstruction: TextView
+    private lateinit var progressDetail: TextView
+    private lateinit var measurementText: TextView
+    private lateinit var contentSlot: FrameLayout
+    private lateinit var progressBox: LinearLayout
+    private lateinit var bottomFooter: LinearLayout
+    private lateinit var footerStart: RwPrimaryButton
+    private lateinit var footerSkip: RwSecondaryButton
     private lateinit var topPane: ScrollView
+    private lateinit var detailsPane: LinearLayout
+    private var adaptive: WatchLayoutPolicy.Metrics? = null
+    private var pagerPages: List<String> = emptyList()
+    private var pagerIndex = 0
+    private var pagerKey = ""
+    /** The top title alternates the item name and the cooperation status until contact. */
+    private var headerName = ""
+    private var headerStatus = ""
+    private var headerShowStatus = false
+    private var headerAltRunning = false
+    private var syncExitHold = false
+    private var syncExitRunnable: Runnable? = null
+    private var reviewDialog: android.app.Dialog? = null
+    private var reviewDialogPhase = ""
     
     private lateinit var controls: LinearLayout
-    private lateinit var guide: HomeKeyGuide
     private var pending: ActivityStore.Template? = null
     private var stopDialog: android.app.Dialog? = null
     private var idle: DeadlineRuntime? = null
@@ -56,6 +78,8 @@ class RecordingActivity : ComponentActivity() {
     private var lastRenderedPhase = ""
     private var lastRenderedActive = false
     private var syncCycleSeen = false
+    private var noticeChecked = false
+    private var bannerIsNotice = false
     private val main = Handler(Looper.getMainLooper())
     private val app get() = application as ProbeApplication
     private val autoSyncGate = AutoSyncGate()
@@ -91,10 +115,15 @@ class RecordingActivity : ComponentActivity() {
     }
     private val syncListener: (ProbeApplication.ActivitySyncStatus) -> Unit = syncListener@{ sync ->
         if (sync.running) armSyncWatchdog() else cancelSyncWatchdog()
-        // A capture-finished/manual sync owns a one-shot exit. Consume it before the generic
-        // page branches: the old SYNC_STATUS branch dropped the signal, which left the watch
-        // on the sync page even though the phone had already committed the data.
-        if (!sync.running && sync.success && autoExitAfterSync("SYNC_LISTENER")) return@syncListener
+        val blocking = !ActivitySyncPolicy.isNonBlockingHomeSync(sync.trigger)
+        // A capture-finished/manual sync owns the page. On success show a short confirmation
+        // and then close; on failure stay on the status page and let the bounded idle exit.
+        if (!sync.running && blocking && sync.success && app.pendingActivitySyncExit.get()) {
+            app.pendingActivitySyncExit.set(false)
+            syncCycleSeen = false
+            if (resumed) showSyncSuccessThenExit() else closeWatchTask()
+            return@syncListener
+        }
         if (inWatchPage() && !ActivityRecordingService.state.active) {
             if (!sync.running) {
                 releaseIdleAfterSync()
@@ -105,10 +134,11 @@ class RecordingActivity : ComponentActivity() {
         syncCycleSeen = true
         if (!resumed) {
             // The screen may be off while the bounded sync finishes. Do not touch views here;
-            // the one-shot exit was handled above.
+            // a failed blocking sync still gets its 80 s idle exit when the page returns.
+            if (!sync.running && blocking && !sync.success) releaseIdleAfterSync()
             return@syncListener
         }
-        if (ActivitySyncPolicy.isNonBlockingHomeSync(sync.trigger)) {
+        if (!blocking) {
             if (sync.running) holdIdleForSync() else releaseIdleAfterSync()
             if (sync.running) {
                 status.text = "正在后台补同步上次活动；你仍可直接选择活动开始采集。\n${sync.text}"
@@ -119,20 +149,13 @@ class RecordingActivity : ComponentActivity() {
                     "上次活动已经同步完成。现在可以开始新的活动。"
                 else "上次活动本轮未同步成功，数据仍保留；现在仍可开始新的活动。"
             }
-        } else if (sync.running && !ActivitySyncPolicy.isNonBlockingHomeSync(sync.trigger)) {
-            renderSync(sync)
         } else if (sync.running) {
-            // Background sync owns no page. Keep the home startable; progress stays in the
-            // sync button/status and never replaces capture.
-            if (!ActivityRecordingService.state.active) {
-                status.text = "正在后台同步：${sync.text}\n可以先开始新的活动。"
-            }
+            // Capture-finished/manual sync: show the sync page and keep it lit while bytes move.
+            renderSync(sync)
+        } else if (sync.success) {
+            showSyncSuccessThenExit()
         } else {
-            releaseIdleAfterSync()
-            mode = ""
-            render(ActivityRecordingService.state)
-            if (!ActivityRecordingService.state.active) status.text =
-                "本轮同步未完成，数据仍保留。你可以开始活动；无操作满80秒后停止所有工作。"
+            renderSyncFailure(sync)
         }
     }
     /**
@@ -156,6 +179,7 @@ class RecordingActivity : ComponentActivity() {
             successBanner.text = "✓ $kind 成功 · $text"
             successBanner.setTone(RwTheme.colors(this).primaryGradientEnd, Color.WHITE)
             successBanner.visibility = View.VISIBLE
+            bannerIsNotice = false
             main.removeCallbacks(hideSuccess)
             // Keep the result visible long enough after the final short measurement.
             main.postDelayed(hideSuccess, 4500)
@@ -163,12 +187,100 @@ class RecordingActivity : ComponentActivity() {
     }
     private val hideSuccess = Runnable {
         if (::successBanner.isInitialized) successBanner.visibility = View.GONE
+        bannerIsNotice = false
+    }
+    /**
+     * Instruction pages replace each other every 5 seconds. This is deliberately a page
+     * replacement, not a scrolling animation: the watch stays still and the text changes.
+     */
+    private val pagerTick = object : Runnable {
+        override fun run() {
+            if (pagerPages.isEmpty() || !::measurementText.isInitialized ||
+                measurementText.visibility != View.VISIBLE) return
+            pagerIndex = (pagerIndex + 1) % pagerPages.size
+            measurementText.text = pagerPages[pagerIndex]
+            main.postDelayed(this, PAGE_MS)        }
+    }
+    /**
+     * The top title is the only status position: it alternates the item name and the
+     * cooperation state every 3 seconds. Once contact/wear is proven, it freezes on the
+     * status so the confirmation stays visible.
+     */
+    private val headerAltTick = object : Runnable {
+        override fun run() {
+            if (!headerAltRunning) return
+            headerShowStatus = !headerShowStatus
+            paintHeaderAlt()
+            main.postDelayed(this, ALT_MS)
+        }
+    }
+    private fun showPager(pages: List<String>, key: String) {
+        if (pages.isEmpty()) { stopPager(); return }
+        if (key == pagerKey && measurementText.visibility == View.VISIBLE) return
+        pagerKey = key
+        pagerPages = pages
+        pagerIndex = 0
+        main.removeCallbacks(pagerTick)
+        measurementText.text = pages[0]
+        measurementText.visibility = View.VISIBLE
+        if (pages.size > 1) main.postDelayed(pagerTick, PAGE_FIRST_MS)
+    }
+    private fun stopPager() {
+        main.removeCallbacks(pagerTick)
+        pagerPages = emptyList()
+        pagerKey = ""
+        pagerIndex = 0
+        if (::measurementText.isInitialized) measurementText.visibility = View.GONE
+    }
+    private fun updateHeaderAlt(name: String, status: String, freeze: Boolean) {
+        headerName = name
+        headerStatus = status
+        if (status.isEmpty() || name.isEmpty()) {
+            stopHeaderAlt()
+            if (::measurementHeader.isInitialized) measurementHeader.text = name
+            return
+        }
+        if (freeze) {
+            main.removeCallbacks(headerAltTick)
+            headerAltRunning = false
+            headerShowStatus = true
+            paintHeaderAlt()
+            return
+        }
+        if (!headerAltRunning) {
+            headerAltRunning = true
+            headerShowStatus = false
+            main.removeCallbacks(headerAltTick)
+            main.postDelayed(headerAltTick, ALT_MS)
+        }
+        paintHeaderAlt()
+    }
+    private fun paintHeaderAlt() {
+        if (!::measurementHeader.isInitialized) return
+        measurementHeader.text = if (headerShowStatus) headerStatus else headerName
+    }
+    private fun stopHeaderAlt() {
+        main.removeCallbacks(headerAltTick)
+        headerAltRunning = false
+        headerShowStatus = false
+    }
+    /** A cooperating stage timed out without a value and moved on by itself. Not an error. */
+    private val autoAdvanceListener: (String, String) -> Unit = { kind, text ->
+        if (resumed && ::successBanner.isInitialized) {
+            val colors = RwTheme.colors(this)
+            successBanner.text = "↷ $kind · " +
+                (if (text.contains("没有")) "没关系，$text" else text)
+            successBanner.setTone(colors.surfaceVariant, colors.warning)
+            successBanner.visibility = View.VISIBLE
+            bannerIsNotice = false
+            main.removeCallbacks(hideSuccess)
+            main.postDelayed(hideSuccess, 6000)
+        }
     }
     private val idleExitListener: () -> Unit = { finishIdle("ECG_IDLE_STOP") }
     private fun finishIdle(reason: String) {
         cancelAutoSync(reason)
         idle?.close(); idle = null
-        guide.animateContact = false
         closeWatchTask()
     }
     /** The UI countdown is never allowed to stop a bounded transfer that already owns the app. */
@@ -205,7 +317,7 @@ class RecordingActivity : ComponentActivity() {
         val inset = (resources.displayMetrics.widthPixels * .16f).toInt()
         body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(inset, dp(32), inset, dp(48)); setBackgroundColor(colors.background)
+            setPadding(inset, 0, inset, 0); setBackgroundColor(colors.background)
         }
         successBanner = RwStatusPill(this).apply {
             visibility = View.GONE
@@ -213,10 +325,71 @@ class RecordingActivity : ComponentActivity() {
             setPadding(dp(8), dp(4), dp(8), dp(4))
             gravity = Gravity.CENTER
         }
-        body.addView(successBanner, LinearLayout.LayoutParams(
+        // Title first: on the measurement pages the user must know which item is running.
+        measurementHeader = label("")
+        measurementHeader.setTextColor(colors.onSurface)
+        measurementHeader.typeface = RwTheme.displayTypeface()
+        measurementHeader.setPadding(0, 0, 0, 0)
+        // A long title must shrink rather than run under the round bezel. The policy also
+        // supplies a chord-safe width; auto-size is the second safety net.
+        measurementHeader.setAutoSizeTextTypeUniformWithConfiguration(
+            11, 26, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+        // One fixed content slot: instruction pages before contact, progress/result after.
+        // Keeping both in the same slot prevents the page from jumping when the pager stops.
+        contentSlot = FrameLayout(this)
+        body.addView(contentSlot, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(168),
+        ))
+        measurementText = RwBodyText(this).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 24f)
+            typeface = RwTheme.boldTypeface()
+            gravity = Gravity.CENTER
+            setTextColor(colors.onSurface)
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(dp(2), 0, dp(2), 0)
+            visibility = View.GONE
+        }
+        contentSlot.addView(measurementText, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER,
+        ))
+        progressBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        contentSlot.addView(progressBox, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER,
+        ))
+        stepCountdown = RwBodyText(this).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 38f)
+            typeface = RwTheme.displayTypeface()
+            fontFeatureSettings = "tnum"
+            gravity = Gravity.CENTER
+            setTextColor(colors.primary)
+            setPadding(0, 0, 0, dp(2))
+            visibility = View.GONE
+        }
+        progressBox.addView(stepCountdown, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(4) })
+        ))
+        progressDetail = RwBodyText(this).apply {
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
+            setTextColor(colors.onSurfaceVariant)
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(0, dp(4), 0, 0)
+            visibility = View.GONE
+        }
+        progressBox.addView(progressDetail, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ))
         timerLabel = RwBodyText(this).apply {
             text = "活动时长"
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 11f)
@@ -233,50 +406,86 @@ class RecordingActivity : ComponentActivity() {
             visibility = View.GONE
         }
         body.addView(activityTimer)
-        stepCountdown = RwBodyText(this).apply {
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 19f)
-            typeface = RwTheme.displayTypeface()
-            gravity = Gravity.CENTER
-            setTextColor(colors.primary)
-            setPadding(0, dp(2), 0, dp(2))
-            visibility = View.GONE
-        }
-        body.addView(stepCountdown, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-        ))
-        guide = HomeKeyGuide(this)
-        // 84 dp leaves room for the two-line instruction below it on the 480 px round screen;
-        // 120 dp pushed the last instruction line off-screen on the SpO2/BIA placement pages.
-        body.addView(guide, LinearLayout.LayoutParams(-1, dp(84)))
-        stepInstruction = RwBodyText(this).apply {
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
-            gravity = Gravity.CENTER
-            setTextColor(colors.onSurface)
-            setLineSpacing(dp(2).toFloat(), 1f)
-            setPadding(0, dp(2), 0, dp(4))
-            visibility = View.GONE
-        }
-        body.addView(stepInstruction, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-        ))
-        measurementHeader = label("")
-        measurementHeader.setTextColor(colors.onSurface)
-        measurementHeader.typeface = RwTheme.displayTypeface()
         controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         body.addView(controls)
-        val details = LinearLayout(this).apply {
+        detailsPane = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(inset, dp(4), inset, dp(32))
+            // The body already owns the round-safe horizontal inset. Adding it again here made
+            // the home and sync pages half-width, which is what cut their text.
+            setPadding(0, dp(4), 0, 0)
         }
-        status = label("原波 · 活动采集", details)
+        status = label("原波 · 活动采集", detailsPane)
         topPane = ScrollView(this).apply {
             setBackgroundColor(colors.background)
+            isVerticalScrollBarEnabled = false
+            clipToPadding = true
             addView(body)
         }
-        body.addView(details)
-        setContentView(topPane)
+        body.addView(detailsPane)
+        // A fixed footer keeps the escape/start action near the bottom edge, where it is
+        // always reachable without scrolling through the instruction text.
+        val root = FrameLayout(this)
+        root.addView(topPane, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+        ))
+        bottomFooter = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(inset, 0, inset, dp(10))
+            setBackgroundColor(colors.background)
+            visibility = View.GONE
+        }
+        footerStart = RwPrimaryButton(this).apply {
+            text = "开始测量"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+            minHeight = dp(40)
+            setPadding(dp(2), 0, dp(2), 0)
+            visibility = View.GONE
+            setOnClickListener {
+                cancelAutoSync("BUTTON_START_SPO2")
+                command("START_SPO2")
+            }
+        }
+        bottomFooter.addView(footerStart, LinearLayout.LayoutParams(dp(78), dp(40)).apply {
+            marginEnd = dp(6)
+        })
+        footerSkip = RwSecondaryButton(this).apply {
+            text = "跳过"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+            minHeight = dp(36)
+            setPadding(dp(2), 0, dp(2), 0)
+            visibility = View.GONE
+            setOnClickListener {
+                // A small, always-reachable escape for the current short measurement.
+                when (ActivityRecordingService.state.shortSensor) {
+                    "BIA" -> command("SKIP_BIA")
+                    "ECG" -> command("SKIP_ECG")
+                    "SPO2" -> command("SKIP_SPO2")
+                    "PPG_ON_DEMAND" -> command("SKIP_PPG")
+                }
+            }
+        }
+        bottomFooter.addView(footerSkip, LinearLayout.LayoutParams(dp(78), dp(36)))
+        root.addView(bottomFooter, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM,
+        ))
+        // The success pill overlays the top instead of consuming one of the percentage zones.
+        root.addView(successBanner, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+        ).apply { topMargin = dp(2) })
+        setContentView(root)
+        root.post {
+            if (isFinishing || isDestroyed) return@post
+            applyAdaptiveLayout(root.width, root.height)
+            // The first render can run before the window is measured. Re-render once the real
+            // 480x480 (or 438x438) size is known so the circle-safe zones are applied.
+            if (!inWatchPage()) render(ActivityRecordingService.state)
+        }
         ActivityRecordingService.idleExitObserver = idleExitListener
         // Keep the completion observer alive across onStop: a watch screen can turn off during
         // the bounded sync, and the success must still close the task instead of waiting for a
@@ -310,6 +519,10 @@ class RecordingActivity : ComponentActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         ActivityRecordingService.observer = listener
         ActivityRecordingService.successObserver = successListener
+        ActivityRecordingService.autoAdvanceObserver = autoAdvanceListener
+        // A fresh open explains an automatic no-presence exit; the terminal exit path also
+        // renders the home once, so it must not consume the notice itself.
+        showCaptureNoticeOnce()
         // A child screen (problem-report export, diagnostics) may have replaced the app-level
         // observer and cleared it on exit. Re-register before restoring the page.
         app.activitySyncObserver = syncListener
@@ -361,8 +574,11 @@ class RecordingActivity : ComponentActivity() {
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (ActivityRecordingService.observer === listener) ActivityRecordingService.observer = null
         if (ActivityRecordingService.successObserver === successListener) ActivityRecordingService.successObserver = null
+        if (ActivityRecordingService.autoAdvanceObserver === autoAdvanceListener) ActivityRecordingService.autoAdvanceObserver = null
         cancelAutoSync("ON_STOP")
-        guide.animateContact = false
+        stopPager()
+        stopHeaderAlt()
+        dismissReviewDialog()
         // Do not count screen-off time against the UI idle deadline. Closing the activity task
         // here made a screen-on land on the watch face instead of the activity screen.
         idle?.close(); idle = null
@@ -371,12 +587,22 @@ class RecordingActivity : ComponentActivity() {
     override fun onDestroy() {
         if (ActivityRecordingService.idleExitObserver === idleExitListener) ActivityRecordingService.idleExitObserver = null
         if (ActivityRecordingService.successObserver === successListener) ActivityRecordingService.successObserver = null
+        if (ActivityRecordingService.autoAdvanceObserver === autoAdvanceListener) ActivityRecordingService.autoAdvanceObserver = null
         if (app.activitySyncObserver === syncListener) app.activitySyncObserver = null
         stopDialog?.dismiss(); stopDialog = null
+        dismissReviewDialog()
+        stopPager()
         main.removeCallbacks(hideSuccess)
+        syncExitRunnable?.let { main.removeCallbacks(it) }
+        syncExitRunnable = null
         cancelSyncWatchdog()
         cancelAutoSync("ON_DESTROY"); idle?.close(); super.onDestroy()
     }
+    /**
+     * The SpO2 measurement is started from the on-screen button near the bottom; the watch's
+     * upper side key is deliberately not intercepted because it can lock the screen or close
+     * the app on this device.
+     */
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (event.action == MotionEvent.ACTION_DOWN) {
             idle?.touchIdle()
@@ -394,43 +620,151 @@ class RecordingActivity : ComponentActivity() {
         }
         return super.dispatchTouchEvent(event)
     }
+    /**
+     * Compute the round-safe zones from the actual window. The same fractions serve the 1.47"
+     * 480x480 Watch9 44mm, the 1.34" 438x438 40mm, a smaller legacy panel and a large font scale.
+     * Every band is additionally checked against the circle chord, so the round bezel never cuts
+     * a title, an instruction line or a button.
+     */
+    private fun applyAdaptiveLayout(width: Int, height: Int) {
+        val m = try {
+            WatchLayoutPolicy.measure(width, height, resources.displayMetrics.density,
+                resources.configuration.fontScale)
+        } catch (_: Exception) { return }
+        adaptive = m
+        val inset = (width * .16f).toInt()
+        body.setPadding(inset, 0, inset, 0)
+        measurementHeader.layoutParams = LinearLayout.LayoutParams(
+            m.headerWidthPx, LinearLayout.LayoutParams.WRAP_CONTENT)
+        measurementHeader.setPadding(0, 0, 0, 0)
+        measurementHeader.gravity = Gravity.CENTER
+        measurementHeader.includeFontPadding = false
+        contentSlot.layoutParams = LinearLayout.LayoutParams(
+            m.contentWidthPx, LinearLayout.LayoutParams.WRAP_CONTENT)
+        contentSlot.minimumHeight = 0
+        measurementText.includeFontPadding = false
+        (measurementText.layoutParams as? FrameLayout.LayoutParams)?.let {
+            it.height = FrameLayout.LayoutParams.MATCH_PARENT
+            measurementText.layoutParams = it
+        }
+        val minSp = m.instructionMinSp.toInt().coerceAtLeast(1)
+        val maxSp = m.instructionMaxSp.toInt().coerceAtLeast(minSp + 1)
+        measurementText.setAutoSizeTextTypeUniformWithConfiguration(
+            minSp, maxSp, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+        stepCountdown.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, m.percentSp)
+        progressDetail.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, m.detailSp)
+        footerStart.layoutParams = LinearLayout.LayoutParams(m.buttonWidthPx, m.buttonHeightPx)
+            .apply { marginEnd = m.buttonGapPx }
+        footerSkip.layoutParams = LinearLayout.LayoutParams(m.buttonWidthPx, m.buttonHeightPx)
+        footerStart.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, m.buttonSp)
+        footerSkip.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, m.buttonSp)
+        bottomFooter.setPadding(inset, 0, inset, m.bottomGapPx)
+        successBanner.maxWidth = m.contentWidthPx
+        (successBanner.layoutParams as? FrameLayout.LayoutParams)?.let {
+            it.width = m.contentWidthPx
+            it.topMargin = m.roundSafeInsetPx
+            successBanner.layoutParams = it
+        }
+        // Default to the scrollable-page layout; a measurement page switches to its own zones.
+        useRoundPageLayout()
+    }
+
+    /** Home, forms, sync and other scrollable pages: keep content inside the circle. */
+    private fun useRoundPageLayout() {
+        val m = adaptive ?: return
+        val inset = (resources.displayMetrics.widthPixels * .16f).toInt()
+        body.setPadding(inset, 0, inset, 0)
+        measurementHeader.layoutParams = LinearLayout.LayoutParams(
+            m.headerWidthPx, LinearLayout.LayoutParams.WRAP_CONTENT)
+        contentSlot.layoutParams = LinearLayout.LayoutParams(
+            m.contentWidthPx, LinearLayout.LayoutParams.WRAP_CONTENT)
+        topPane.setPadding(0, m.roundSafeInsetPx, 0, m.roundSafeInsetPx)
+        topPane.clipToPadding = true
+    }
+
+    /**
+     * The sync page has a wrap-content header above a fixed content slot. Subtract half the
+     * header band so the slot ends at the footer's top edge instead of sliding under it.
+     */
+    private fun roundContentHeight(): Int {
+        val m = adaptive ?: return dp(190)
+        return (m.contentPx - m.headerPx / 2).coerceAtLeast(dp(110))
+    }
+
+    /** Short pre/post measurement pages: fixed title, content and bottom-action bands. */
+    private fun useMeasurementLayout() {
+        val m = adaptive ?: return
+        val inset = (resources.displayMetrics.widthPixels * .16f).toInt()
+        body.setPadding(inset, m.topGapPx, inset, 0)
+        measurementHeader.layoutParams = LinearLayout.LayoutParams(m.headerWidthPx, m.headerPx)
+        contentSlot.layoutParams = LinearLayout.LayoutParams(m.contentWidthPx, m.contentPx)
+        topPane.setPadding(0, 0, 0, m.footerPx + m.betweenGapPx + m.bottomGapPx)
+        topPane.clipToPadding = true
+    }
+
+    /** Restore the measurement actions after a sync page reused the same footer buttons. */
+    private fun bindMeasurementFooter() {
+        footerStart.text = "开始测量"
+        footerStart.setOnClickListener {
+            cancelAutoSync("BUTTON_START_SPO2")
+            command("START_SPO2")
+        }
+        footerSkip.setOnClickListener {
+            when (ActivityRecordingService.state.shortSensor) {
+                "BIA" -> command("SKIP_BIA")
+                "ECG" -> command("SKIP_ECG")
+                "SPO2" -> command("SKIP_SPO2")
+                "PPG_ON_DEMAND" -> command("SKIP_PPG")
+            }
+        }
+    }
+
     private fun render(s: ActivityRecordingService.Companion.State) {
         if (inWatchPage() && !s.active) return
         // The vendor release hold is a bounded 60-second step: the process is about to
         // remove itself so no sensor handle survives the activity. It must always end;
         // a stale RELEASING state is cleared by resetStaleReleaseState() on a fresh open.
         if (!s.active && s.phase == "RELEASING") {
+            useRoundPageLayout()
             measurementHeader.visibility = View.VISIBLE
             measurementHeader.text = "正在释放传感器"
-            measurementHeader.textSize = 20f
+            detailsPane.visibility = View.VISIBLE
             status.visibility = View.VISIBLE
             status.text = s.text
             status.textSize = 14f
-            guide.visibility = View.GONE
-            stepCountdown.visibility = View.GONE
-            stepInstruction.visibility = View.GONE
+            contentSlot.visibility = View.GONE
+            stopPager()
+            stopHeaderAlt()
+            progressBox.visibility = View.GONE
             timerLabel.visibility = View.GONE
             activityTimer.visibility = View.GONE
             controls.removeAllViews()
+            bottomFooter.visibility = View.GONE
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             return
         }
         if (app.activitySyncStatus.running && !ActivitySyncPolicy.isNonBlockingHomeSync(app.activitySyncStatus.trigger)) {
             renderSync(app.activitySyncStatus); return
         }
+        if (s.active && s.phase == "DRAINING") {
+            showDrainingPage(); return
+        }
         measurementHeader.visibility = if (s.active) View.VISIBLE else View.GONE
-        status.visibility = if (s.active) View.VISIBLE else View.GONE
+        status.visibility = if (s.active) View.GONE else View.VISIBLE
+        // A one-shot "previous activity had no data" notice belongs to the home; do not let it
+        // push the measurement title and countdown down after the user starts a new activity.
+        if (s.active && bannerIsNotice) {
+            successBanner.visibility = View.GONE
+            bannerIsNotice = false
+            main.removeCallbacks(hideSuccess)
+        }
         if (s.active) { cancelAutoSync("RECORDING_ACTIVE"); idle?.close(); idle = null }
         else if (app.activitySyncStatus.running) holdIdleForSync()
         else ensureIdle()
-        val measuringEcg = s.shortSensor == "ECG" && (s.phase.startsWith("PRE") || s.phase.startsWith("POST"))
-        val waitingBiaContact = s.shortSensor == "BIA" && !s.biaContact &&
-            (s.phase.startsWith("PRE") || s.phase.startsWith("POST") || s.phase.startsWith("WAIT_BIA_"))
-        val waitingEcgContact = measuringEcg && (s.remaining < 0 || !s.contact)
-        val waitingContact = waitingBiaContact || waitingEcgContact
         val shortPhase = s.active && (
             s.phase.startsWith("PRE") || s.phase.startsWith("POST") ||
-                s.phase.startsWith("READY_") || s.phase.startsWith("WAIT_BIA_")
+                s.phase.startsWith("READY_") || s.phase.startsWith("WAIT_BIA_") ||
+                s.phase.startsWith("REVIEW_") || s.phase == "DRAINING" || s.phase == "SPO2_DONE"
             )
         val guideMode = when {
             s.shortSensor == "BIA" || s.phase.startsWith("WAIT_BIA_") -> "BIA"
@@ -441,76 +775,123 @@ class RecordingActivity : ComponentActivity() {
         val contactDetected = if (guideMode == "BIA") s.biaContact
             else if (guideMode == "ECG") s.contact
             else false
-        guide.visibility = if (shortPhase) View.VISIBLE else View.GONE
-        guide.mode = guideMode
-        guide.biaMode = guideMode == "BIA"
-        guide.contactDetected = contactDetected
-        guide.animateContact = shortPhase && !contactDetected && resumed && waitingContact
-        val countdown = if (shortPhase) countdownText(s, guideMode, contactDetected) else ""
-        stepCountdown.visibility = if (countdown.isNotEmpty()) View.VISIBLE else View.GONE
-        if (countdown.isNotEmpty()) stepCountdown.text = countdown
-        stepInstruction.visibility = if (shortPhase) View.VISIBLE else View.GONE
-        if (shortPhase) stepInstruction.text = instructionsFor(s, guideMode, contactDetected)
-        // Never override the watch's screen timeout. Capture and short measurements run in the
-        // foreground service and already support screen-off; holding the display awake through
-        // a 30-second ECG/BIA/SpO2 phase (or an open-ended contact wait) drained the battery and
-        // was reported as "屏幕在测量中/测量后不熄灭".
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val ppgStage = guideMode == "PPG" && !s.phase.startsWith("REVIEW_")
+        val m = adaptive
+        val instructionMode = shortPhase && s.phase != "DRAINING" && !ppgStage &&
+            !s.phase.startsWith("REVIEW_") && !instructionFinished(s, guideMode)
+        contentSlot.visibility = if (s.active && shortPhase) View.VISIBLE else View.GONE
+        if (shortPhase) {
+            if (instructionMode) {
+                showPager(instructionPagesFor(guideMode, s.phase.startsWith("PRE")),
+                    "$guideMode/${if (s.phase.startsWith("PRE")) "PRE" else "POST"}")
+                progressBox.visibility = View.GONE
+            } else {
+                stopPager()
+                progressBox.visibility = View.VISIBLE
+            }
+        } else {
+            stopPager()
+            progressBox.visibility = View.GONE
+        }
+        val donePhase = s.phase == "SPO2_DONE"
+        val showPercent = shortPhase && s.progressPercent >= 0
+        val countdown = if (shortPhase && !instructionMode) countdownText(s, guideMode, contactDetected) else ""
+        val primaryText = when {
+            donePhase -> "测量成功"
+            showPercent -> "${s.progressPercent}%"
+            instructionMode -> ""
+            else -> countdown
+        }
+        stepCountdown.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.percentSp ?: 38f)
+        stepCountdown.visibility = if (primaryText.isNotEmpty()) View.VISIBLE else View.GONE
+        if (primaryText.isNotEmpty()) {
+            stepCountdown.text = primaryText
+            // Green = an active measurement; amber = this page is about to end the attempt.
+            stepCountdown.setTextColor(
+                if (!donePhase && (s.phase.startsWith("REVIEW_") || (!showPercent && !s.engaged)))
+                    RwTheme.colors(this).warning
+                else RwTheme.colors(this).primary,
+            )
+        }
+        val detailText = when {
+            donePhase -> "即将退出…"
+            shortPhase && s.phase.startsWith("REVIEW_") && guideMode == "ECG" ->
+                "本次未取得连续30秒，可重试或跳过"
+            shortPhase && !instructionMode -> s.progressDetail
+            else -> ""
+        }
+        progressDetail.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.detailSp ?: 14f)
+        progressDetail.text = detailText
+        progressDetail.visibility = if (detailText.isNotEmpty()) View.VISIBLE else View.GONE
+        val statusInfo = if (ppgStage) "" to RwTheme.colors(this).primary
+            else statusText(s, guideMode, contactDetected)
+        // A small, fixed escape while a short measurement is running. The failure review
+        // itself keeps retry first and skip below, without a duplicate fixed button.
+        val biaSkip = s.active && s.shortSensor == "BIA" && s.phase != "CORE-1" &&
+            !s.phase.startsWith("REVIEW_")
+        val ecgSkip = s.active && s.shortSensor == "ECG" &&
+            (s.phase.startsWith("PRE") || s.phase.startsWith("POST"))
+        val spo2Skip = s.active && s.shortSensor == "SPO2" &&
+            (s.phase.startsWith("PRE") || s.phase.startsWith("POST"))
+        val ppgSkip = s.active && s.shortSensor == "PPG_ON_DEMAND" &&
+            (s.phase.startsWith("PRE") || s.phase.startsWith("POST"))
+        val spo2Start = s.active && s.phase.startsWith("READY_SPO2") && guideMode == "SPO2"
+        val skip = biaSkip || ecgSkip || spo2Skip || ppgSkip
+        val showFooter = skip || spo2Start
+        bottomFooter.visibility = if (showFooter) View.VISIBLE else View.GONE
+        footerStart.visibility = if (spo2Start) View.VISIBLE else View.GONE
+        footerSkip.visibility = if (skip || spo2Start) View.VISIBLE else View.GONE
+        if (spo2Start) footerSkip.text = "跳过血氧"
+        else if (skip) footerSkip.text = when {
+            biaSkip -> if (s.biaHasNext) "跳过当前" else "跳过体成分"
+            ecgSkip -> "跳过 ECG"
+            spo2Skip -> "跳过血氧"
+            else -> "跳过 PPG"
+        }
+        // Round-safe measurement zones: title 3-19%, content 19-69%, bottom action 71-85%.
+        // The title and buttons sit where the circle is still wide enough; the bottom 15% is
+        // deliberately left empty because that is where the bezel closes in.
+        val measuringShort = s.active && shortPhase
+        if (measuringShort && m != null) {
+            useMeasurementLayout()
+            detailsPane.visibility = View.GONE
+            bindMeasurementFooter()
+        } else {
+            useRoundPageLayout()
+            detailsPane.visibility = if (s.active) View.GONE else View.VISIBLE
+        }
+        // Pre/post measurements are short, countdown-driven and need the instructions visible.
+        // The activity itself keeps the old behaviour (system timeout, capture in the service).
+        if (s.active && s.phase != "CORE-1") {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         val showTimer = s.active && s.phase == "CORE-1"
         timerLabel.visibility = if (showTimer) View.VISIBLE else View.GONE
         activityTimer.visibility = if (showTimer) View.VISIBLE else View.GONE
         if (showTimer) activityTimer.text = formatElapsed(s.coreElapsedSeconds)
-        measurementHeader.textSize = if (s.active) {
-            if (shortPhase) 17f else 19f
-        } else 34f
-        measurementHeader.text = if (s.active) {
-            if (shortPhase) {
-                val title = when (guideMode) {
-                    "ECG" -> if (contactDetected) "ECG · 接触已确认" else if (measuringEcg) "ECG · 等待接触" else "ECG · 准备"
-                    "BIA" -> {
-                        val name = s.biaMode.ifBlank { "体成分" }
-                        if (s.biaModeCount > 0) "$name ${s.biaModeNumber}/${s.biaModeCount}" else name
-                    }
-                    "SPO2" -> if (s.phase.startsWith("READY_")) "血氧 · 准备" else "血氧 · 测量中"
-                    "PPG" -> "PPG · 测量中"
-                    else -> "测量"
-                }
-                "$title\n${if (contactDetected) "接触已确认，保持不动" else "按下方说明操作"}"
-            } else {
-                val timer = when {
-                    s.phase == "DRAINING" -> "正在保存…"
-                    s.phase.startsWith("REVIEW") -> "本次测量未完成"
-                    s.shortSensor == "BIA" && !s.biaContact && s.biaRetrying -> "测量中断 · 正在重试"
-                    s.shortSensor == "BIA" && !s.biaContact -> "等待检测接触"
-                    s.shortSensor == "BIA" -> "测量中 · 剩余 ${s.remaining} 秒"
-                    measuringEcg && (s.remaining < 0 || !s.contact) -> "等待检测接触"
-                    measuringEcg -> "ECG 测量中 · 剩余 ${s.remaining} 秒"
-                    s.remaining > 0 -> "${s.remaining} 秒"
-                    else -> "正在记录"
-                }
-                val instruction = when {
-                    s.phase == "DRAINING" -> "正在结束采集，请稍候"
-                    s.phase.startsWith("REVIEW") -> if (s.shortSensor == "PPG_ON_DEMAND")
-                        "可以调整手臂后重测，或跳过继续" else "可以松开手指后重测，或跳过继续"
-                    s.shortSensor == "SPO2" -> "手表上移到腕骨上方\n表带贴合，手肘放桌\n静止、不说话"
-                    s.shortSensor == "BIA" && !s.biaContact && s.biaRetrying ->
-                        "上次测量${if(s.biaProgress > 0) "在 ${s.biaProgress}% " else ""}中断（${s.biaHint}）\n请保持双指接触，稍后自动重试"
-                    s.shortSensor == "BIA" && !s.biaContact ->
-                        "先把手表戴回正常位置\n双臂抬到胸口，腋下张开\n两指轻触上下键，不要相碰"
-                    s.shortSensor == "BIA" ->
-                        "保持双指接触，双手不要相碰\n双臂抬到胸口，直至测量完成"
-                    s.shortSensor == "PPG_ON_DEMAND" -> "正常佩戴即可，不用调表带\n无倒数，手臂静止采集30秒"
-                    measuringEcg -> "前臂放桌上，指尖盖住上键，不要按\n保持不动，不要说话"
-                    s.phase == "CORE-1" -> "正常活动即可\n结束时点击下方按钮"
-                    else -> "请稍候"
-                }
-                "$timer\n$instruction"
+        if (s.active && shortPhase && s.phase != "DRAINING" && !ppgStage) {
+            // The top title is the only status position: name <-> wear/contact status every
+            // 3 s, frozen on the status once contact is proven.
+            updateHeaderAlt(itemName(s, guideMode), statusInfo.first,
+                freeze = contactDetected || s.engaged || donePhase)
+        } else {
+            stopHeaderAlt()
+            measurementHeader.text = when {
+                !s.active -> "原波"
+                ppgStage -> "PPG"
+                s.phase == "DRAINING" -> "正在保存"
+                else -> "活动记录中"
             }
-        } else "原波"
+        }
         status.text = if (s.active) "采集详情\n${s.text}" else s.text
         status.textSize = 14f
-        if (mode == "${s.active}/${s.phase}/${s.skipAllowed}") return
-        mode = "${s.active}/${s.phase}/${s.skipAllowed}"
+        maybeShowReviewDialog(s, guideMode)
+        if (mode == "${s.active}/${s.phase}/${s.skipAllowed}/${s.biaSucceeded}") return
+        mode = "${s.active}/${s.phase}/${s.skipAllowed}/${s.biaSucceeded}"
         val previousPhase = lastRenderedPhase
         val phaseChanged = s.phase != previousPhase
         val wasActive = lastRenderedActive
@@ -526,29 +907,24 @@ class RecordingActivity : ComponentActivity() {
         if (keepBiaRetryControls && controls.childCount > 0) return
         val previousScroll = topPane.scrollY
         controls.removeAllViews()
-        if (s.active) {
+        if (s.active && !donePhase) {
             if (s.phase.startsWith("REVIEW_BIA_")) {
-                val mode=if(s.biaMode.isEmpty()) "体成分" else s.biaMode
-                // Keep skip first: a failed second stage must never force a scroll hunt.
-                button(if(s.biaHasNext) "跳过当前，继续下一种" else "跳过体成分，继续", primary = true) { command("SKIP_BIA") }
-                button("重测$mode") { command("RETRY_BIA") }
-            } else if (s.shortSensor == "BIA") {
-                button("跳过体成分，继续") { command("SKIP_BIA") }
-            } else if (s.phase.startsWith("READY_SPO2_")) {
-                button("手已放好，开始血氧", primary = true) { command("START_SPO2") }
+                // Retry first; skip is the second action below it. A failed scan is not a
+                // reason to cancel the whole activity.
+                smallButton("重试${if (s.biaMode.isBlank()) "体成分" else s.biaMode}", primary = true) { command("RETRY_BIA") }
+                smallButton(if (s.biaHasNext) "跳过当前，继续下一种" else "跳过体成分，继续") { command("SKIP_BIA") }
             } else if (s.phase.startsWith("REVIEW_SPO2")) {
-                // Skip first: a failed retry must not trap the user in the review page.
-                button("跳过血氧，继续", primary = true) { command("SKIP_SPO2") }
-                button("重测血氧") { command("RETRY_SPO2") }
+                smallButton("重试血氧", primary = true) { command("RETRY_SPO2") }
+                smallButton("跳过血氧，继续") { command("SKIP_SPO2") }
             } else if (s.phase.startsWith("REVIEW_PPG_")) {
-                button("跳过 PPG，继续", primary = true) { command("SKIP_PPG") }
-                button("重测 PPG") { command("RETRY_PPG") }
+                smallButton("重试 PPG", primary = true) { command("RETRY_PPG") }
+                smallButton("跳过 PPG，继续") { command("SKIP_PPG") }
             } else if (s.phase.startsWith("REVIEW_")) {
-                button("继续重测 ECG（不限次数）") { command("RETRY_ECG") }
-                if (s.skipAllowed) button("跳过 ECG，继续本次活动") { command("SKIP_ECG") }
+                smallButton("重试 ECG", primary = true) { command("RETRY_ECG") }
+                smallButton("跳过 ECG，继续本次活动") { command("SKIP_ECG") }
             }
-            if (measuringEcg && s.skipAllowed)
-                button("跳过 ECG，继续本次活动") { command("SKIP_ECG") }
+            // During measurement the small fixed footer button is the only skip; the review
+            // page above owns the retry/skip pair.
             if (s.phase == "CORE-1") {
                 button("结束活动", primary = true) { command("END") }
             }
@@ -561,7 +937,7 @@ class RecordingActivity : ComponentActivity() {
                     cancelLabel = "继续记录",
                 ) { command("CANCEL") }
             }
-        } else showHome()
+        } else if (!s.active) showHome()
         // A progress tick or background sync update must not throw the user back to the top.
         // Entering a new capture page, entering home from capture, or the first home build
         // starts at the top; otherwise keep the user's scroll position.
@@ -572,10 +948,77 @@ class RecordingActivity : ComponentActivity() {
             topPane.post { topPane.scrollTo(0, previousScroll) }
         }
     }
+    /**
+     * Saving is a short, non-interactive step. Show it centered and large instead of the tiny
+     * title text; no buttons are offered while the sensors stop and the files are flushed.
+     */
+    private fun showDrainingPage() {
+        stopPager()
+        stopHeaderAlt()
+        useMeasurementLayout()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val m = adaptive
+        measurementHeader.visibility = View.VISIBLE
+        measurementHeader.text = "正在保存"
+        status.visibility = View.GONE
+        detailsPane.visibility = View.GONE
+        contentSlot.visibility = View.VISIBLE
+        contentSlot.minimumHeight = 0
+        contentSlot.layoutParams = LinearLayout.LayoutParams(
+            m?.contentWidthPx ?: ViewGroup.LayoutParams.MATCH_PARENT,
+            m?.contentPx ?: dp(150))
+        progressBox.visibility = View.VISIBLE
+        stepCountdown.visibility = View.VISIBLE
+        // "正在停止传感器" is seven characters wide; derive a size that fits the circle-safe
+        // content width instead of using the large percentage size.
+        val saveSp = (m?.contentWidthPx ?: dp(326)) / resources.displayMetrics.density / 7f * 0.95f
+        stepCountdown.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            saveSp.coerceIn(14f, 24f))
+        stepCountdown.text = "正在停止传感器\n并保存数据…"
+        stepCountdown.setTextColor(RwTheme.colors(this).primary)
+        progressDetail.visibility = View.VISIBLE
+        progressDetail.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, m?.detailSp ?: 14f)
+        progressDetail.text = "请稍候，完成后会自动同步。"
+        bottomFooter.visibility = View.GONE
+        footerStart.visibility = View.GONE
+        footerSkip.visibility = View.GONE
+        timerLabel.visibility = View.GONE
+        activityTimer.visibility = View.GONE
+        controls.removeAllViews()
+    }
+    private fun showCaptureNoticeOnce() {
+        if (noticeChecked) return
+        noticeChecked = true
+        try {
+            val prefs = getSharedPreferences("capture-notice", MODE_PRIVATE)
+            val last = prefs.getString("last", null) ?: return
+            prefs.edit().remove("last").apply()
+            if (!::successBanner.isInitialized) return
+            val colors = RwTheme.colors(this)
+            successBanner.text = last
+            successBanner.setTone(colors.surfaceVariant, colors.warning)
+            successBanner.visibility = View.VISIBLE
+            bannerIsNotice = true
+            main.removeCallbacks(hideSuccess)
+            main.postDelayed(hideSuccess, 8000)
+        } catch (_: Exception) {}
+    }
+
     private fun showHome() {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // showHome() is called from render() and from recovery paths. Always rebuild the
         // list here; appending to a previous list produced a duplicate exit button.
         mode = ""
+        useRoundPageLayout()
+        // A direct recovery path (for example "retry sync" after the last pending item
+        // disappeared) must not leave the sync page's big percent or footer buttons on the home.
+        stopPager()
+        progressBox.visibility = View.GONE
+        contentSlot.visibility = View.GONE
+        detailsPane.visibility = View.GONE
+        bottomFooter.visibility = View.GONE
+        timerLabel.visibility = View.GONE
+        activityTimer.visibility = View.GONE
         controls.removeAllViews()
         try {
             val store = ActivityRecordingService.store(this)
@@ -599,7 +1042,7 @@ class RecordingActivity : ComponentActivity() {
                     activityButton(template, primary = index == 0, reorderable = templates.size > 1)
                 }
             }
-            if (filesDir.usableSpace < 1_000_000_000L) label("存储不足1GB，请清理不需要的软件。原始数据尚未同步，请勿卸载原波。", controls)
+            if (filesDir.usableSpace < 1_000_000_000L) label("存储不足 1 GB：请先同步待同步活动。已同步的旧活动会在后台按“本地记录”页的规则自动清理，待同步数据不会删除。", controls)
             button("更多") { showMorePage() }
             button("发送问题报告到手机") { sendReportToPhone() }
             stackedButton("同步状态", syncButtonText(sync, pendingSync, latestUnsealed)) { showSyncStatus() }
@@ -715,13 +1158,16 @@ class RecordingActivity : ComponentActivity() {
         // close the task while the user is reading a page or filling in the activity form.
         idle?.close(); idle = null
         hideTimer()
+        useRoundPageLayout()
         val colors = RwTheme.colors(this)
         measurementHeader.visibility = View.VISIBLE
         measurementHeader.text = title
-        measurementHeader.textSize = 27f
         measurementHeader.setTextColor(colors.onSurface)
-        guide.visibility = View.GONE
-        guide.animateContact = false
+        detailsPane.visibility = View.GONE
+        contentSlot.visibility = View.GONE
+        stopPager()
+        stopHeaderAlt()
+        progressBox.visibility = View.GONE
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         status.visibility = View.GONE
         controls.removeAllViews()
@@ -761,7 +1207,7 @@ class RecordingActivity : ComponentActivity() {
                 pending > 0 -> "待同步 $pending 次"
                 latestUnsealed -> "上次未完整封存"
                 sync.text.isNotBlank() && !sync.success -> "上次同步未完成"
-                else -> "已全部同步"
+        else -> "已全部同步"
             })
             if (sync.text.isNotBlank()) append("\n${sync.text}")
         }
@@ -987,12 +1433,12 @@ class RecordingActivity : ComponentActivity() {
         idle?.close(); idle = null
         mode = "EDIT_TEMPLATE"
         hideTimer()
+        useRoundPageLayout()
         val colors = RwTheme.colors(this)
         measurementHeader.visibility = View.VISIBLE
         measurementHeader.text = if (existing == null) "新建活动" else "编辑活动"
-        measurementHeader.textSize = 26f
         measurementHeader.setTextColor(colors.onSurface)
-        status.visibility = View.GONE
+        detailsPane.visibility = View.GONE
         controls.removeAllViews()
         fun section(text: String) {
             controls.addView(RwSectionHeader(this).apply {
@@ -1284,7 +1730,6 @@ class RecordingActivity : ComponentActivity() {
         app.requestStopBackgroundSync("WATCH_FULL_EXIT")
         cancelAutoSync("FULL_EXIT")
         idle?.close(); idle = null
-        guide.animateContact = false
         closeWatchTask()
     }
 
@@ -1344,6 +1789,32 @@ class RecordingActivity : ComponentActivity() {
                 ).apply { topMargin = dp(8) })
             }
         }
+        // Say the watch-local retention rule where the user looks for old records. The phone
+        // keeps its received packages; only the watch copy is bounded.
+        val pending = ActivityArchive.pendingCount(File(filesDir, "activities"))
+        val rule = RwCard(this)
+        rule.addView(RwSectionHeader(this).apply {
+            text = "本地保存规则"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f)
+        })
+        rule.addView(RwBodyText(this).apply {
+            text = "手表最多保留最近 ${ActivityRetention.MAX_SYNCED_SESSIONS} 次已同步活动，" +
+                "本地原始数据总量上限 ${ActivityRetention.MAX_LOCAL_BYTES / (1024L * 1024L * 1024L)} GB，" +
+                "超过 ${ActivityRetention.MAX_AGE_MS / (24L * 60L * 60L * 1000L)} 天或超出的已同步活动会自动删除。\n" +
+                "手机已接收的数据不受影响；待同步的活动不会自动删除。"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+        })
+        rule.addView(RwBodyText(this).apply {
+            val sizeText = app.lastActivityRetention?.let { "约 ${formatStorage(it.totalBytes())}，" } ?: ""
+            text = "当前本地：$sizeText${records.size} 次活动（待同步 $pending 次）"
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(RwTheme.colors(this@RecordingActivity).primary)
+            setPadding(0, dp(6), 0, 0)
+        })
+        controls.addView(rule, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(12) })
         button("返回上一页") { showMorePage() }
     }
 
@@ -1358,25 +1829,185 @@ class RecordingActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * The success page is shown for 3 s before the task closes, so the user sees that the
+     * activity was committed instead of the app disappearing immediately.
+     */
+    private fun showSyncSuccessThenExit() {
+        if (syncExitHold) return
+        syncExitHold = true
+        stopHeaderAlt()
+        stopPager()
+        useRoundPageLayout()
+        val m = adaptive
+        measurementHeader.visibility = View.VISIBLE
+        measurementHeader.text = "同步完成"
+        status.visibility = View.GONE
+        detailsPane.visibility = View.GONE
+        contentSlot.visibility = View.VISIBLE
+        contentSlot.layoutParams = LinearLayout.LayoutParams(
+            m?.contentWidthPx ?: ViewGroup.LayoutParams.MATCH_PARENT,
+            roundContentHeight())
+        progressBox.visibility = View.VISIBLE
+        stepCountdown.visibility = View.VISIBLE
+        stepCountdown.text = "100%"
+        stepCountdown.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.percentSp ?: 32f)
+        stepCountdown.setTextColor(RwTheme.colors(this).primary)
+        progressDetail.visibility = View.VISIBLE
+        progressDetail.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.detailSp ?: 13f)
+        progressDetail.text = "已同步到手机并完成校验\n${SYNC_SUCCESS_HOLD_MS / 1000} 秒后自动退出"
+        controls.removeAllViews()
+        bottomFooter.visibility = View.GONE
+        footerStart.visibility = View.GONE
+        footerSkip.visibility = View.GONE
+        timerLabel.visibility = View.GONE
+        activityTimer.visibility = View.GONE
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        syncExitRunnable?.let { main.removeCallbacks(it) }
+        val exit = Runnable {
+            syncExitRunnable = null
+            if (!isFinishing && !isDestroyed) closeWatchTask()
+        }
+        syncExitRunnable = exit
+        main.postDelayed(exit, SYNC_SUCCESS_HOLD_MS)
+        try { app.journal?.event("ACTIVITY_SYNC_SUCCESS_PAGE", mapOf(
+            "holdMs" to SYNC_SUCCESS_HOLD_MS,
+            "trigger" to app.activitySyncStatus.trigger)) } catch (_: Exception) {}
+    }
+
+    /**
+     * Failed capture-finished/manual sync: keep the reason on screen, offer a retry, and let
+     * the watch idle budget (80 s, the existing design) close the task to avoid battery drain.
+     */
+    private fun renderSyncFailure(sync: ProbeApplication.ActivitySyncStatus) {
+        syncExitHold = false
+        syncExitRunnable?.let { main.removeCallbacks(it) }
+        syncExitRunnable = null
+        stopHeaderAlt()
+        stopPager()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        useRoundPageLayout()
+        val m = adaptive
+        measurementHeader.visibility = View.VISIBLE
+        measurementHeader.text = "同步未完成"
+        status.visibility = View.GONE
+        detailsPane.visibility = View.GONE
+        contentSlot.visibility = View.VISIBLE
+        contentSlot.layoutParams = LinearLayout.LayoutParams(
+            m?.contentWidthPx ?: ViewGroup.LayoutParams.MATCH_PARENT,
+            roundContentHeight())
+        progressBox.visibility = View.VISIBLE
+        stepCountdown.visibility = View.VISIBLE
+        stepCountdown.text = "未完成"
+        stepCountdown.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.percentSp ?: 30f)
+        stepCountdown.setTextColor(RwTheme.colors(this).warning)
+        progressDetail.visibility = View.VISIBLE
+        progressDetail.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.detailSp ?: 13f)
+        // The full transfer text includes a stage id and can be several screens long. The watch
+        // needs the reason, the fact that data is kept, and the auto-exit bound; the full log
+        // stays in the phone's problem report.
+        val reason = sync.text.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("原因：") }
+            ?.removePrefix("原因：")
+            ?.take(36)
+            ?.takeIf { it.isNotBlank() }
+            ?: "本次同步没有完成"
+        progressDetail.text = "$reason\n数据仍保留 · 约 ${WorkBudget.IDLE_MS / 1000} 秒后退出"
+        controls.removeAllViews()
+        timerLabel.visibility = View.GONE
+        activityTimer.visibility = View.GONE
+        bottomFooter.visibility = View.VISIBLE
+        footerStart.visibility = View.VISIBLE
+        footerStart.text = "重试同步"
+        footerStart.setOnClickListener {
+            cancelAutoSync("BUTTON_RETRY_SYNC")
+            startPendingSync(ActivitySyncPolicy.USER_MANUAL)
+        }
+        footerSkip.visibility = View.VISIBLE
+        footerSkip.text = "返回首页"
+        footerSkip.setOnClickListener {
+            cancelAutoSync("BUTTON_SYNC_HOME")
+            returnHome()
+        }
+        // Do not hold the screen on here: the idle timer is the battery bound.
+        releaseIdleAfterSync()
+        try { app.journal?.event("ACTIVITY_SYNC_FAILURE_PAGE", mapOf(
+            "trigger" to sync.trigger,
+            "exitSeconds" to (WorkBudget.IDLE_MS / 1000))) } catch (_: Exception) {}
+    }
+
     private fun renderSync(sync: ProbeApplication.ActivitySyncStatus) {
         if (inWatchPage()) return
+        stopHeaderAlt()
+        stopPager()
+        syncExitHold = false
+        syncExitRunnable?.let { main.removeCallbacks(it) }
+        syncExitRunnable = null
+        // A watch screen-off starves the bulk channel in practice (the 2026-11-19 transfer
+        // stalled ~10-15 s after the last touch). Keep the screen on only for the bounded
+        // transfer; the flag is cleared as soon as the sync stops.
+        if (sync.running) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (sync.running) armSyncWatchdog()
         cancelAutoSync("SYNC_RUNNING")
         if (sync.running) holdIdleForSync() else ensureIdle()
+        useRoundPageLayout()
+        val m = adaptive
         measurementHeader.visibility = View.VISIBLE
-        measurementHeader.text = "同步"
-        measurementHeader.textSize = 28f
-        status.visibility = View.VISIBLE
+        measurementHeader.text = "正在同步"
+        status.visibility = View.GONE
+        detailsPane.visibility = View.GONE
         timerLabel.visibility = View.GONE
         activityTimer.visibility = View.GONE
-        guide.visibility = View.GONE; guide.animateContact = false
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        status.text = "活动数据同步\n${sync.text}\n同步由前台服务保活，不依赖亮屏；完成或失败后立即释放。\n采集文件在手机完整校验前不会从手表标记为已同步。"
+        contentSlot.visibility = View.VISIBLE
+        contentSlot.layoutParams = LinearLayout.LayoutParams(
+            m?.contentWidthPx ?: ViewGroup.LayoutParams.MATCH_PARENT,
+            roundContentHeight())
+        progressBox.visibility = View.VISIBLE
+        stepCountdown.visibility = View.VISIBLE
+        val percent = syncPercent(sync.text)
+        stepCountdown.text = percent?.let { "$it%" } ?: "同步中"
+        stepCountdown.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.percentSp ?: 32f)
+        stepCountdown.setTextColor(RwTheme.colors(this).primary)
+        progressDetail.visibility = View.VISIBLE
+        progressDetail.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+            m?.detailSp ?: 13f)
+        progressDetail.text = syncDetailText(sync.text)
         controls.removeAllViews()
-        button("诊断详情（离线可拍照）") { DiagnosticViewer.show(this, app) }
-        if (sync.running) button("停止同步（数据仍保留）") {
-            app.requestStopBackgroundSync("WATCH_SYNC_STOP_BUTTON")
+        // The top of the page answers "am I syncing?" and "how far?"; the only button is the
+        // meaningful one. Diagnostics stay under 更多 instead of competing with this action.
+        bottomFooter.visibility = if (sync.running) View.VISIBLE else View.GONE
+        footerStart.visibility = View.GONE
+        footerSkip.visibility = if (sync.running) View.VISIBLE else View.GONE
+        if (sync.running) {
+            footerSkip.text = "停止同步"
+            footerSkip.contentDescription = "停止同步，已经采集的数据仍保留"
+            footerSkip.setOnClickListener {
+                cancelAutoSync("BUTTON_STOP_SYNC")
+                app.requestStopBackgroundSync("WATCH_SYNC_STOP_BUTTON")
+            }
         }
+    }
+
+    /** Last percentage in the transfer text, e.g. "正在发送原始数据：42%" -> 42. */
+    private fun syncPercent(text: String): Int? {
+        val match = Regex("(\\d{1,3})\\s*%").findAll(text).lastOrNull() ?: return null
+        return match.groupValues[1].toIntOrNull()?.coerceIn(0, 100)
+    }
+
+    /** Keep the stage line, drop the duplicate percentage, and add the screen-on promise. */
+    private fun syncDetailText(text: String): String {
+        val stage = text.replace(Regex("\\s*\\d{1,3}\\s*%"), "")
+            .trim()
+            .trimEnd('：', ':', '，', ',', '。', '.')
+        val head = stage.ifBlank { "正在与手机传输数据" }
+        return "$head\n保持亮屏，完成后会自动退出"
     }
     private fun startPendingSync(trigger: String, retry: Int = 0) {
         cancelAutoSync("START_$trigger")
@@ -1594,8 +2225,8 @@ class RecordingActivity : ComponentActivity() {
         if (stopDialog?.isShowing == true) return
         val dialog = RwDialogs.confirm(
             this,
-            "结束并保存",
-            "结束并保存已有数据？\n提前结束不会继续活动后短测。若要按模板完成，请选“继续记录”，再点“结束活动”。",
+                "没有开始活动",
+                "未获得所需权限，本次没有开始。\n允许权限后可以重新点这个活动；如果不再弹出授权，请到系统设置里允许原波。",
             confirmLabel = "结束并保存",
             cancelLabel = "继续记录",
         ) { command("CANCEL") }
@@ -1653,41 +2284,181 @@ class RecordingActivity : ComponentActivity() {
         if (::timerLabel.isInitialized) timerLabel.visibility = View.GONE
         if (::activityTimer.isInitialized) activityTimer.visibility = View.GONE
         if (::stepCountdown.isInitialized) stepCountdown.visibility = View.GONE
-        if (::stepInstruction.isInitialized) stepInstruction.visibility = View.GONE
+        if (::progressDetail.isInitialized) progressDetail.visibility = View.GONE
+        if (::contentSlot.isInitialized) contentSlot.visibility = View.GONE
+        if (::progressBox.isInitialized) progressBox.visibility = View.GONE
+        stopPager()
+        stopHeaderAlt()
         // The success banner has its own timeout; render() must not erase a final result.
     }
+    /**
+     * The big line owns progress/auto-advance; the pill above owns "is the user here".
+     * This keeps both readable without a paragraph on a 480 px round screen.
+     */
+    /**
+     * The big line only appears after the instruction phase. It shows real progress (percent)
+     * or the ECG/retry/auto-advance countdown; the instruction pages own the "before" state.
+     */
     private fun countdownText(s: ActivityRecordingService.Companion.State, mode: String, contact: Boolean): String {
-        val seconds = if (mode == "ECG" && contact && s.remaining > 0) s.remaining else s.phaseRemainingSeconds
-        if (seconds <= 0) return ""
+        if (!s.engaged) return ""
         return when {
-            s.phase.startsWith("READY_SPO2") -> "准备血氧 · ${seconds} 秒后自动开始"
-            s.phase.startsWith("WAIT_BIA") -> "接触中断 · ${seconds} 秒后自动重试"
-            mode == "ECG" && !contact -> "等待接触 · ${seconds} 秒后停止"
-            else -> "剩余 ${seconds} 秒"
+            mode == "ECG" && contact && s.remaining > 0 -> "剩余 ${s.remaining} 秒"
+            s.phase.startsWith("WAIT_BIA") && s.phaseRemainingSeconds > 0 -> "${s.phaseRemainingSeconds} 秒后自动重试"
+            s.phase.startsWith("REVIEW_") && s.cooperationRemainingSeconds > 0 ->
+                "${s.cooperationRemainingSeconds} 秒后自动继续"
+            else -> ""
         }
     }
 
-    // Keep every guide instruction to two short lines: on the 480 px screen the countdown and
-    // the 84 dp animation leave room for exactly two lines before the round edge cuts text.
-    private fun instructionsFor(s: ActivityRecordingService.Companion.State, mode: String, contact: Boolean): String =
-        when (mode) {
-            "ECG" -> if (contact)
-                "已检测到接触\n手臂放稳，不要说话"
-            else
-                "前臂放桌，指尖盖住上键\n手指不要碰表框，保持不动"
-            "BIA" -> {
-                // Two modes add an item line above; keep the instruction to one line then, so the
-                // guide still fits inside the round screen (the finger hint is the canvas caption).
-                val item = if (s.biaModeCount > 1) "第 ${s.biaModeNumber}/${s.biaModeCount} 项：${s.biaMode.ifBlank { "体成分" }}\n" else ""
-                item + if (contact)
-                    if (s.biaModeCount > 1) "双指已接触，保持不动" else "双指接触已确认\n保持不动，不要说话"
-                else
-                    if (s.biaModeCount > 1) "戴回正常位置，双臂抬到胸口" else "手表戴回正常位置\n双臂抬到胸口，两指触键"
-            }
-            "SPO2" -> "手表上移到腕骨上方\n表带贴合，手肘放桌"
-            "PPG" -> "正常佩戴，手臂放稳\n无倒数，采集30秒后继续"
-            else -> ""
+    /** One concise top line: the item being measured, never a long status paragraph. */
+    private fun itemName(s: ActivityRecordingService.Companion.State, mode: String): String = when (mode) {
+        "BIA" -> {
+            val name = s.biaMode.ifBlank { "体成分" }
+            if (s.biaModeCount > 1) "$name ${s.biaModeNumber}/${s.biaModeCount}" else name
         }
+        "SPO2" -> "血氧"
+        "ECG" -> "ECG"
+        "PPG" -> "PPG"
+        else -> "测量"
+    }
+
+    /**
+     * The instruction phase ends as soon as the sensor proves contact/data. After that the
+     * pager is replaced by progress and a short detail; no instruction text remains.
+     */
+    private fun instructionFinished(s: ActivityRecordingService.Companion.State, mode: String): Boolean {
+        if (s.phase.startsWith("REVIEW_") || s.phase == "DRAINING" || s.phase == "SPO2_DONE") return true
+        if (s.progressPercent >= 0) return true
+        if (mode == "ECG" && s.contact) return true
+        if (mode == "BIA" && s.biaContact) return true
+        return false
+    }
+
+    /** Large, short pages; the pager replaces one page with the next every 7 seconds. */
+    private fun instructionPagesFor(mode: String, pre: Boolean): List<String> = when (mode) {
+        "SPO2" -> listOf(
+            "请把手表调整到距离腕关节五指的位置",
+            "手放到桌上，手表位置与心脏差不多高度",
+            "保持静止。准备好后点下方开始测量",
+        )
+        "BIA" -> listOf(
+            "请将中指和无名指分别放到右侧两个按键",
+            "保持接触即可，不用按键",
+            "保持两个手指分开，两只手不要接触",
+        )
+        // Post ECG runs on the already-correct normal position, so it must not ask the
+        // user to move the strap again; only the pre ECG follows the raised SpO2 position.
+        "ECG" -> if (pre) listOf(
+            "请将手表调整到距离腕关节大概两指的位置",
+            "就是你平常佩戴位置",
+            "请将手指放到右上角按键",
+            "保持接触即可，不用按键",
+        ) else listOf(
+            "手表保持现在的佩戴位置，不用移动表带",
+            "请将手指放到右上角按键",
+            "保持接触即可，不用按键",
+        )
+        "PPG" -> listOf(
+            "正常佩戴，手臂放稳",
+            "不要乱动，马上开始",
+        )
+        else -> emptyList()
+    }
+
+    /** Small wear/contact + exit countdown line; no pill, no color-block chrome. */
+    private fun statusText(s: ActivityRecordingService.Companion.State, mode: String, contact: Boolean): Pair<String, Int> {
+        val c = RwTheme.colors(this)
+        if (s.phase == "SPO2_DONE" || mode == "PPG") return "" to c.primary
+        if (s.engaged) {
+            // Only the real evidence is named here; no "N seconds to continue" countdown,
+            // which made the wear state look like an app-generated reassurance.
+            val text = when {
+                mode == "BIA" && contact -> "✓ 已检测到接触"
+                mode == "ECG" && contact -> "✓ 手指接触已确认"
+                s.worn == true -> "✓ 已戴在手腕上"
+                else -> "✓ 已确认配合"
+            }
+            return text to c.primary
+        }
+        val base = when {
+            s.worn == false -> "未检测到佩戴"
+            mode == "BIA" || mode == "ECG" -> "等待接触"
+            s.worn == true -> "已检测到佩戴"
+                else -> "✓ 已确认配合"
+        }
+        val exit = if (s.cooperationRemainingSeconds > 0) " · ${s.cooperationRemainingSeconds}秒后退出" else ""
+        return (base + exit) to c.warning
+    }
+
+    /**
+     * One stage-specific explanation for a failed measurement. The first line is always the
+     * same reassurance; the rest explains what this sensor actually needs, what the visible
+     * percent means, and whether the partial data counts as a result.
+     */
+    private fun failureCopy(s: ActivityRecordingService.Companion.State, mode: String): String {
+        val head = "没关系，这不是你的错。这类测量本身就可能中断，不代表你哪里做得不对。\n\n"
+        val reason = s.progressDetail.ifBlank { "本次没有取得有效结果" }
+        val progressText = if (s.progressPercent >= 0)
+            "你看到的 ${s.progressPercent}% 只是采集/扫描进度，不是最终有效结果。\n" else ""
+        return when (mode) {
+            "BIA" -> {
+                val name = if (s.biaMode == "MF_BIA") "多频阻抗" else "体成分"
+                head + reason + "\n\n" + progressText +
+                    "${name}需要完成到 100% 且双指接触稳定，才算一次有效结果。本次已收的原始数据会保存，但不作为有效${name}。"
+            }
+            "SPO2" -> head + reason + "\n\n" + progressText +
+                "血氧依靠稳定的光学信号；本次没有取得稳定读数，原始记录会保存，但不作为有效血氧。"
+            "ECG" -> head + reason + "\n\n" +
+                "ECG 需要连续 30 秒稳定的电极接触；本次不足 30 秒或接触中断。已记录的片段会保存，但不作为有效 ECG。"
+            "PPG" -> head + reason + "\n\n" + progressText +
+                "PPG 需要稳定的光学信号和完整采集窗口；本次原始记录会保存，但不作为一次完整 PPG。"
+            else -> head + reason
+        }
+    }
+
+    /**
+     * Every failed measurement shows one explanation first, then retry (primary) and skip
+     * (secondary). The skip is intentionally below the retry, as the second action.
+     */
+    private fun maybeShowReviewDialog(s: ActivityRecordingService.Companion.State, mode: String) {
+        val failureReview = s.active && s.phase.startsWith("REVIEW_") && !s.biaSucceeded
+        if (!failureReview) {
+            dismissReviewDialog()
+            return
+        }
+        if (reviewDialogPhase == s.phase) return
+        dismissReviewDialog()
+        reviewDialogPhase = s.phase
+        val (retry, skip) = when (mode) {
+            "BIA" -> "RETRY_BIA" to "SKIP_BIA"
+            "SPO2" -> "RETRY_SPO2" to "SKIP_SPO2"
+            "PPG" -> "RETRY_PPG" to "SKIP_PPG"
+            "ECG" -> "RETRY_ECG" to "SKIP_ECG"
+            else -> return
+        }
+        reviewDialog = RwDialogs.actions(
+            this,
+            "没关系，这次没测出有效结果",
+            failureCopy(s, mode),
+            listOf(
+                RwDialogs.Action("重试", primary = true) { command(retry) },
+                RwDialogs.Action("跳过") { command(skip) },
+            ),
+            cancelLabel = null,
+        )
+    }
+
+    private fun dismissReviewDialog() {
+        reviewDialog?.dismiss()
+        reviewDialog = null
+        reviewDialogPhase = ""
+    }
+
+    private fun formatStorage(bytes: Long): String {
+        val safe = bytes.coerceAtLeast(0L)
+        return if (safe >= 1_000_000_000L) "%.1f GB".format(safe / 1_000_000_000.0)
+        else "%.0f MB".format(safe / 1_000_000.0)
+    }
 
     private fun formatElapsed(seconds: Long): String {
         val safe = seconds.coerceAtLeast(0L)
@@ -1710,6 +2481,23 @@ class RecordingActivity : ComponentActivity() {
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(6) },
+        )
+    }
+    /** Compact action for the review pages: less chrome, more room for the explanation. */
+    private fun smallButton(text: String, primary: Boolean = false, action: () -> Unit) {
+        val view = if (primary) RwPrimaryButton(this) else RwSecondaryButton(this)
+        val height = adaptive?.buttonHeightPx ?: dp(38)
+        view.text = text
+        view.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, adaptive?.buttonSp ?: 13f)
+        view.minHeight = height
+        view.setPadding(dp(8), 0, dp(8), 0)
+        view.setOnClickListener { cancelAutoSync("BUTTON_${text.take(24)}"); action() }
+        controls.addView(
+            view,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                height,
             ).apply { topMargin = dp(6) },
         )
     }
@@ -1759,143 +2547,14 @@ class RecordingActivity : ComponentActivity() {
 
     private companion object {
         const val SYNC_WATCHDOG_MS = 5_000L
+        /** First instruction page stays a little longer; a first-time reader needs it. */
+        const val PAGE_FIRST_MS = 9_000L
+        /** Later instruction page replacement interval. */
+        const val PAGE_MS = 7_000L
+        /** Top item name / cooperation status alternation interval. */
+        const val ALT_MS = 3_000L
+        /** Keep the successful sync confirmation visible before closing the task. */
+        const val SYNC_SUCCESS_HOLD_MS = 3_000L
     }
 }
 
-/** Code-drawn measurement guidance: schematic watch, contact state and concise captions. */
-private class HomeKeyGuide(context: android.content.Context) : View(context) {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = RwTheme.boldTypeface() }
-    private val colors = RwTheme.colors(context)
-    private val skin = Color.rgb(242, 197, 155)
-    var animateContact = false
-        set(value) { field = value; if (value) invalidate() }
-    var biaMode = false
-    var mode = "ECG"
-        set(value) { if (field != value) { field = value; invalidate() } }
-    var contactDetected = false
-        set(value) { if (field != value) { field = value; invalidate() } }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        when (mode) {
-            "BIA" -> drawBia(canvas)
-            "SPO2" -> drawSpo2(canvas)
-            "PPG" -> drawPpg(canvas)
-            else -> drawEcg(canvas)
-        }
-        if ((animateContact || contactDetected) && isShown) postInvalidateDelayed(90)
-    }
-
-    private fun caption(canvas: Canvas, text: String, color: Int = colors.onSurface) {
-        paint.style = Paint.Style.FILL
-        paint.color = color
-        paint.textSize = height * .125f
-        paint.textAlign = Paint.Align.CENTER
-        canvas.drawText(text, width * .5f, height * .96f, paint)
-    }
-
-    private fun contactBadge(canvas: Canvas) {
-        if (!contactDetected) return
-        paint.style = Paint.Style.FILL
-        paint.color = colors.success
-        paint.textSize = height * .105f
-        paint.textAlign = Paint.Align.CENTER
-        canvas.drawText("✓ 已检测到接触", width * .5f, height * .15f, paint)
-    }
-
-    private fun drawEcg(canvas: Canvas) {
-        val x = width * .42f; val y = height * .48f; val r = height * .26f
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = 4f; paint.color = colors.outline
-        canvas.drawCircle(x, y, r, paint)
-        paint.style = Paint.Style.FILL; paint.color = colors.primary
-        canvas.drawRoundRect(x+r, y-r*.6f, x+r+12, y-r*.15f, 4f, 4f, paint)
-        val pulse = if (animateContact) ((SystemClock.uptimeMillis() % 1200) / 1200f) else 0f
-        paint.color = skin
-        canvas.drawRoundRect(x+r+15+pulse*15, y-r*.6f, width*.94f, y-r*.1f, 12f, 12f, paint)
-        if (contactDetected) {
-            paint.style = Paint.Style.STROKE; paint.strokeWidth = 3f; paint.color = colors.success
-            canvas.drawCircle(x, y, r + 7f, paint)
-            paint.style = Paint.Style.FILL
-        }
-        contactBadge(canvas)
-        caption(canvas, if (contactDetected) "保持接触，不要说话" else "指尖盖住上键，不要按",
-            if (contactDetected) colors.success else colors.onSurface)
-    }
-
-    /** Watch body, two side keys and two pulsing fingertips: middle finger upper, ring finger lower. */
-    private fun drawBia(canvas: Canvas) {
-        val w = width.toFloat(); val h = height.toFloat()
-        val bodyLeft = w*.05f; val bodyRight = w*.33f
-        val bodyTop = h*.22f; val bodyBottom = h*.84f
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = 3f; paint.color = colors.outline
-        canvas.drawRoundRect(bodyLeft, bodyTop, bodyRight, bodyBottom, 12f, 12f, paint)
-        canvas.drawLine(0f, h*.5f, bodyLeft, h*.5f, paint)
-        canvas.drawLine(bodyRight, h*.5f, bodyRight + w*.02f, h*.5f, paint)
-        paint.style = Paint.Style.FILL; paint.color = colors.primary
-        val keyTop = h*.36f; val keyBottom = h*.67f; val keyHalf = h*.09f
-        val keyRight = bodyRight + w*.03f
-        canvas.drawRoundRect(bodyRight, keyTop-keyHalf, keyRight, keyTop+keyHalf, 4f, 4f, paint)
-        canvas.drawRoundRect(bodyRight, keyBottom-keyHalf, keyRight, keyBottom+keyHalf, 4f, 4f, paint)
-        val pulse = if (animateContact) ((SystemClock.uptimeMillis() % 1200) / 1200f) else 0f
-        val fingerX = keyRight + w*.075f + pulse*w*.018f
-        paint.color = skin
-        canvas.drawOval(fingerX-w*.055f, keyTop-h*.13f, fingerX+w*.055f, keyTop+h*.13f, paint)
-        canvas.drawOval(fingerX-w*.045f, keyBottom-h*.12f, fingerX+w*.065f, keyBottom+h*.12f, paint)
-        if (animateContact || contactDetected) {
-            paint.style = Paint.Style.STROKE; paint.strokeWidth = 2f
-            paint.color = if (contactDetected) colors.success else Color.argb(
-                (210*(1f-pulse)).toInt().coerceIn(0,255),
-                Color.red(colors.primary), Color.green(colors.primary), Color.blue(colors.primary),
-            )
-            canvas.drawCircle(keyRight, keyTop, h*.11f + pulse*h*.12f, paint)
-            canvas.drawCircle(keyRight, keyBottom, h*.11f + pulse*h*.12f, paint)
-            paint.style = Paint.Style.FILL
-        }
-        contactBadge(canvas)
-        caption(canvas, if (contactDetected) "双指接触已确认，保持不动" else "中指上键 · 无名指下键，两指不相触",
-            if (contactDetected) colors.success else colors.onSurfaceVariant)
-    }
-
-    private fun drawSpo2(canvas: Canvas) {
-        val w = width.toFloat(); val h = height.toFloat()
-        // Arm resting at heart height.
-        paint.style = Paint.Style.FILL; paint.color = skin
-        canvas.drawRoundRect(w*.16f, h*.28f, w*.48f, h*.86f, 26f, 26f, paint)
-        canvas.drawCircle(w*.32f, h*.52f, h*.13f, paint)
-        paint.color = colors.primary
-        canvas.drawCircle(w*.32f, h*.52f, h*.085f, paint)
-        paint.color = colors.surface
-        canvas.drawCircle(w*.32f, h*.52f, h*.045f, paint)
-        // Heart symbol.
-        paint.color = colors.primary
-        canvas.drawCircle(w*.69f, h*.36f, h*.075f, paint)
-        canvas.drawCircle(w*.80f, h*.36f, h*.075f, paint)
-        val path = android.graphics.Path()
-        path.moveTo(w*.615f, h*.40f); path.lineTo(w*.745f, h*.62f); path.lineTo(w*.875f, h*.40f); path.close()
-        canvas.drawPath(path, paint)
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = 4f; paint.color = colors.success
-        canvas.drawLine(w*.47f, h*.55f, w*.63f, h*.55f, paint)
-        canvas.drawLine(w*.60f, h*.50f, w*.63f, h*.55f, paint)
-        canvas.drawLine(w*.60f, h*.60f, w*.63f, h*.55f, paint)
-        caption(canvas, "手臂放稳，与心脏同高")
-    }
-
-    private fun drawPpg(canvas: Canvas) {
-        val w = width.toFloat(); val h = height.toFloat()
-        paint.style = Paint.Style.FILL; paint.color = skin
-        canvas.drawRoundRect(w*.20f, h*.28f, w*.48f, h*.86f, 26f, 26f, paint)
-        paint.color = colors.primary
-        canvas.drawCircle(w*.34f, h*.53f, h*.14f, paint)
-        paint.color = colors.surface
-        canvas.drawCircle(w*.34f, h*.53f, h*.075f, paint)
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = 3f
-        for (i in 0..3) {
-            val y = h * (.40f + i * .08f)
-            paint.color = Color.argb(190 - i*25, Color.red(colors.success), Color.green(colors.success), Color.blue(colors.success))
-            canvas.drawCircle(w*.58f, y, h*.07f, paint)
-            canvas.drawCircle(w*.70f, y, h*.07f, paint)
-        }
-        paint.style = Paint.Style.FILL
-        caption(canvas, "正常佩戴即可，不用调表带")
-    }
-}

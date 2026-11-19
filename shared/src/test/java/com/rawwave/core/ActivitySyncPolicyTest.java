@@ -11,12 +11,13 @@ public class ActivitySyncPolicyTest {
     }
 
     @Test public void syncNeverOwnsTheHomeAndCompletedCaptureStillExits() {
-        assertTrue(ActivitySyncPolicy.isNonBlockingHomeSync(ActivitySyncPolicy.CAPTURE_FINISHED));
+        assertFalse(ActivitySyncPolicy.isNonBlockingHomeSync(ActivitySyncPolicy.CAPTURE_FINISHED));
         assertTrue(ActivitySyncPolicy.exitAfterSuccessfulSync(ActivitySyncPolicy.CAPTURE_FINISHED));
         assertTrue(ActivitySyncPolicy.captureMayPreempt(ActivitySyncPolicy.CAPTURE_FINISHED));
     }
 
-    @Test public void explicitManualSyncMayExitAfterSuccess() {
+    @Test public void manualSyncOwnsTheSyncPageAndMayExitAfterSuccess() {
+        assertFalse(ActivitySyncPolicy.isNonBlockingHomeSync(ActivitySyncPolicy.USER_MANUAL));
         assertTrue(ActivitySyncPolicy.exitAfterSuccessfulSync(ActivitySyncPolicy.USER_MANUAL));
     }
 

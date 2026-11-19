@@ -9,8 +9,8 @@ android {
         applicationId = "com.rawwave.rebuild"
         minSdk = 30
         targetSdk = 36
-        versionCode = 120
-        versionName = "0.12.46-step"
+        versionCode = 130
+        versionName = "0.13"
         buildConfigField("String", "DEVICE_ROLE", "\"phone\"")
         val runId = providers.gradleProperty("buildRun").getOrElse("local-unpackaged")
         require(runId.matches(Regex("[A-Za-z0-9._-]+")))

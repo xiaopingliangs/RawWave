@@ -41,6 +41,8 @@ class ProbeApplication : Application() {
     var lastStopReason: String? = null
     var journal: Journal? = null
         private set
+    /** Latest watch-local retention result; shown on the local-records page. */
+    @Volatile var lastActivityRetention: com.rawwave.core.ActivityRetention.Summary? = null
     var journalFailure: String? = null
         private set
 
@@ -149,6 +151,9 @@ class ProbeApplication : Application() {
             if (original != null) original.uncaughtException(thread, error)
             else Process.killProcess(Process.myPid())
         }
+        // Watch-only: bound local raw sessions (30 newest synced, 30 days, ~4 GB). It runs in
+        // the background and never touches the active/pending session. The phone keeps its copies.
+        ActivityRetentionRunner.schedule(this, "APP_START")
     }
 }
 

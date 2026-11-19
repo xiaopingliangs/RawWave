@@ -75,8 +75,11 @@ class ProbeActivity : ComponentActivity() {
             status.text = currentSyncText()
             updateConnectionStatus()
         }
-        // The bounded lease owns a CPU wake lock; receiving must not depend on this page being lit.
-        window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // The bounded lease owns a CPU wake lock. While a watch transfer is actually moving
+        // data, also keep this page lit: the 2026-11-19 log shows the bulk channel stalling
+        // 8-15 s after the page left the foreground. The flag drops with the sync.
+        if (sync.running) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (!exiting && transfer == null) {
             if (sync.running) holdIdleForActivitySync() else releaseIdleForActivitySync()
         }
@@ -104,6 +107,10 @@ class ProbeActivity : ComponentActivity() {
             // is not used to hide RawWave; the page has no sensitive history beyond the data
             // the user explicitly asked to export.
             setShowWhenLocked(true)
+            // A watch-initiated transfer needs the page visible and the link active. Turning
+            // the screen on only happens for an explicit launch of this page, never silently
+            // from the background.
+            setTurnScreenOn(true)
         }
         app.syncFinished = syncObserver
         app.activitySyncObserver = activitySyncObserver
@@ -376,7 +383,7 @@ class ProbeActivity : ComponentActivity() {
     private fun currentSyncText(): String {
         val sync = app.activitySyncStatus
         return when {
-            sync.running -> "正在同步：${sync.text}"
+            sync.running -> "正在同步：${sync.text}\n接收期间保持亮屏，完成后自动恢复。"
             sync.text.isNotBlank() -> "上次同步：${sync.text}"
             // The phone has no watch-owned sync status in memory after a restart. The inbox
             // summary below is the durable truth; say we are checking instead of claiming
